@@ -9,8 +9,11 @@
   <a href="https://github.com/xit-vcs/xitdb-ts">TypeScript</a>
 </p>
 
-* Each transaction efficiently creates a new "copy" of the database, and past copies can still be read from.
-* It supports writing to a file as well as purely in-memory use.
+* Each transaction efficiently creates a new "copy" of the database, and past copies can still be read from and reverted to.
+* Supports storing in a single file as well as purely in-memory use.
+* Runs as a library (embedded in process).
+* Incrementally reads and writes, so file-based databases can contain larger-than-memory datasets.
+* Reads never block writes, and a database can be read from multiple threads/processes without locks.
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
 * No dependencies besides the Zig standard library (requires version 0.15.1).
 
