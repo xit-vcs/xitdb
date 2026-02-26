@@ -26,6 +26,7 @@ This database was originally made for the [xit version control system](https://g
 * [Large Byte Arrays](#large-byte-arrays)
 * [Iterators](#iterators)
 * [Hashing](#hashing)
+* [Compaction](#compaction)
 * [Thread Safety](#thread-safety)
 
 ## Example
@@ -429,6 +430,28 @@ const hash_algo: HashAlgo = switch (header.hash_id.id) {
     else => return error.InvalidHashAlgo,
 };
 try std.testing.expectEqual(.sha1, hash_algo);
+```
+
+## Compaction
+
+Normally, an immutable database grows forever, because old data is never deleted. To reclaim disk space and clear the history, xitdb supports compaction. This involves completely rebuilding the database file to only contain the data accessible from the latest copy (i.e., "moment") of the database.
+
+```zig
+// create the buffer and file for the new database
+var compact_buffer = std.Io.Writer.Allocating.init(allocator);
+defer compact_buffer.deinit();
+const compact_file = try std.fs.cwd().createFile("compact.db", .{ .read = true });
+defer compact_file.close();
+
+// cache of offsets to make the compaction much more efficient
+var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+defer offset_map.deinit();
+
+var compact_db = try db.compact(.{ .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+
+// read from the new compacted db
+const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());
+try std.testing.expectEqual(1, try history.count());
 ```
 
 ## Thread Safety
