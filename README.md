@@ -448,7 +448,7 @@ defer compact_file.close();
 var offset_map = std.AutoHashMap(u64, u64).init(allocator);
 defer offset_map.deinit();
 
-var compact_db = try db.compact(.{ .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+var compact_db = try db.compact(.buffered_file, .{ .io = io, .file = compact_file, .buffer = &compact_buffer }, &offset_map);
 
 // read from the new compacted db
 const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());

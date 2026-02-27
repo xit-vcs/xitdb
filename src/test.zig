@@ -163,7 +163,7 @@ fn takeInt(reader: *std.Io.Reader, comptime T: type, endian: std.builtin.Endian)
     return std.mem.readInt(T, &buffer, endian);
 }
 
-fn clearStorage(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts) !void {
+fn clearStorage(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
     switch (db_kind) {
         .memory => {
             init_opts.buffer.shrinkRetainingCapacity(0);
@@ -178,7 +178,7 @@ fn clearStorage(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(
     }
 }
 
-fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts) !void {
+fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
     // init the db
     const DB = xitdb.Database(db_kind, HashInt);
     var db = try DB.init(init_opts);
@@ -774,7 +774,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
     }
 }
 
-fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts, comptime original_size: usize, comptime slice_offset: u64, comptime slice_size: u64) !void {
+fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime slice_offset: u64, comptime slice_size: u64) !void {
     try clearStorage(db_kind, init_opts);
     var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
     var root_cursor = db.rootCursor();
@@ -880,7 +880,7 @@ fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind,
     });
 }
 
-fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts, comptime list_a_size: usize, comptime list_b_size: usize) !void {
+fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime list_a_size: usize, comptime list_b_size: usize) !void {
     try clearStorage(db_kind, init_opts);
     var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
     var root_cursor = db.rootCursor();
@@ -997,7 +997,7 @@ fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind
     }
 }
 
-fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts, comptime original_size: usize, comptime insert_index: u64) !void {
+fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime insert_index: u64) !void {
     try clearStorage(db_kind, init_opts);
     var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
     var root_cursor = db.rootCursor();
@@ -1129,7 +1129,7 @@ fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.Dat
     });
 }
 
-fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.Database(db_kind, HashInt).InitOpts) !void {
+fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
     // open and re-open empty database
     {
         // make empty database
@@ -2568,7 +2568,13 @@ test "compaction" {
         defer source_buffer.deinit();
         var target_buffer = std.Io.Writer.Allocating.init(allocator);
         defer target_buffer.deinit();
-        try testCompaction(allocator, .memory, .{ .buffer = &source_buffer, .max_size = 5_000_000 }, .{ .buffer = &target_buffer, .max_size = 5_000_000 });
+        try testCompaction(
+            allocator,
+            .memory,
+            .{ .buffer = &source_buffer, .max_size = 5_000_000 },
+            .memory,
+            .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+        );
     }
 
     // file
@@ -2583,7 +2589,13 @@ test "compaction" {
             target_file.close(io);
             std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
         }
-        try testCompaction(allocator, .file, .{ .io = io, .file = source_file }, .{ .io = io, .file = target_file });
+        try testCompaction(
+            allocator,
+            .file,
+            .{ .io = io, .file = source_file },
+            .file,
+            .{ .io = io, .file = target_file },
+        );
     }
 
     // buffered_file
@@ -2602,28 +2614,61 @@ test "compaction" {
             target_file.close(io);
             std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
         }
-        try testCompaction(allocator, .buffered_file, .{ .io = io, .file = source_file, .buffer = &source_buffer }, .{ .io = io, .file = target_file, .buffer = &target_buffer });
+        try testCompaction(
+            allocator,
+            .buffered_file,
+            .{ .io = io, .file = source_file, .buffer = &source_buffer },
+            .buffered_file,
+            .{ .io = io, .file = target_file, .buffer = &target_buffer },
+        );
+    }
+
+    // buffered_file to memory
+    {
+        var source_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer source_buffer.deinit();
+        var target_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer target_buffer.deinit();
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+        defer {
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+        }
+        try testCompaction(
+            allocator,
+            .buffered_file,
+            .{ .io = io, .file = source_file, .buffer = &source_buffer },
+            .memory,
+            .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+        );
     }
 }
 
-fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, source_opts: xitdb.Database(db_kind, HashInt).InitOpts, target_opts: xitdb.Database(db_kind, HashInt).InitOpts) !void {
+fn testCompaction(
+    allocator: std.mem.Allocator,
+    comptime db_kind: xitdb.DatabaseKind,
+    source_opts: xitdb.InitOpts(db_kind),
+    comptime target_db_kind: xitdb.DatabaseKind,
+    target_opts: xitdb.InitOpts(target_db_kind),
+) !void {
     const DB = xitdb.Database(db_kind, HashInt);
+    const TargetDB = xitdb.Database(target_db_kind, HashInt);
 
     // empty DB compaction
     {
         try clearStorage(db_kind, source_opts);
-        try clearStorage(db_kind, target_opts);
+        try clearStorage(target_db_kind, target_opts);
         var source = try DB.init(source_opts);
         var offset_map = std.AutoHashMap(u64, u64).init(allocator);
         defer offset_map.deinit();
-        const compacted = try source.compact(target_opts, &offset_map);
+        const compacted = try source.compact(target_db_kind, target_opts, &offset_map);
         try std.testing.expectEqual(.none, compacted.header.tag);
     }
 
     // basic compaction with various data types
     {
         try clearStorage(db_kind, source_opts);
-        try clearStorage(db_kind, target_opts);
+        try clearStorage(target_db_kind, target_opts);
         var source = try DB.init(source_opts);
 
         // moment 1
@@ -2709,7 +2754,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
         // compact
         var offset_map = std.AutoHashMap(u64, u64).init(allocator);
         defer offset_map.deinit();
-        var compacted = try source.compact(target_opts, &offset_map);
+        var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
 
         const target_size = try compacted.core.length();
 
@@ -2717,12 +2762,12 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
         try std.testing.expect(target_size < source_size);
 
         // target should have exactly 1 moment
-        const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+        const history = try TargetDB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
         try std.testing.expectEqual(1, try history.count());
 
         // verify all data from latest moment is correct
         const moment_cursor = (try history.getCursor(0)).?;
-        const moment = try DB.HashMap(.read_only).init(moment_cursor);
+        const moment = try TargetDB.HashMap(.read_only).init(moment_cursor);
 
         // key1 should have the final value
         const key1_val = try (try moment.getCursor(hashInt("key1"))).?.readBytesAlloc(allocator, 1024);
@@ -2751,7 +2796,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
 
         // ArrayList
         const fruits_cursor = (try moment.getCursor(hashInt("fruits"))).?;
-        const fruits = try DB.ArrayList(.read_only).init(fruits_cursor);
+        const fruits = try TargetDB.ArrayList(.read_only).init(fruits_cursor);
         try std.testing.expectEqual(3, try fruits.count());
         const apple = try (try fruits.getCursor(0)).?.readBytesAlloc(allocator, 1024);
         defer allocator.free(apple);
@@ -2762,7 +2807,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
 
         // LinkedArrayList
         const todos_cursor = (try moment.getCursor(hashInt("todos"))).?;
-        const todos = try DB.LinkedArrayList(.read_only).init(todos_cursor);
+        const todos = try TargetDB.LinkedArrayList(.read_only).init(todos_cursor);
         try std.testing.expectEqual(3, try todos.count());
         const task1 = try (try todos.getCursor(0)).?.readBytesAlloc(allocator, 1024);
         defer allocator.free(task1);
@@ -2773,21 +2818,21 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
 
         // CountedHashMap
         const counted_cursor = (try moment.getCursor(hashInt("counted"))).?;
-        const counted = try DB.CountedHashMap(.read_only).init(counted_cursor);
+        const counted = try TargetDB.CountedHashMap(.read_only).init(counted_cursor);
         try std.testing.expectEqual(2, try counted.count());
         try std.testing.expectEqual(1, try (try counted.getCursor(hashInt("a"))).?.readUint());
         try std.testing.expectEqual(2, try (try counted.getCursor(hashInt("b"))).?.readUint());
 
         // HashSet
         const set_cursor = (try moment.getCursor(hashInt("myset"))).?;
-        const set = try DB.HashSet(.read_only).init(set_cursor);
+        const set = try TargetDB.HashSet(.read_only).init(set_cursor);
         const x_val = try (try set.getCursor(hashInt("x"))).?.readBytesAlloc(allocator, 1024);
         defer allocator.free(x_val);
         try std.testing.expectEqualStrings("x", x_val);
 
         // CountedHashSet
         const cset_cursor = (try moment.getCursor(hashInt("mycset"))).?;
-        const cset = try DB.CountedHashSet(.read_only).init(cset_cursor);
+        const cset = try TargetDB.CountedHashSet(.read_only).init(cset_cursor);
         try std.testing.expectEqual(2, try cset.count());
         const p_val = try (try cset.getCursor(hashInt("p"))).?.readBytesAlloc(allocator, 1024);
         defer allocator.free(p_val);
@@ -2797,7 +2842,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
     // structural sharing (most data shared, only 1 key changes per moment)
     {
         try clearStorage(db_kind, source_opts);
-        try clearStorage(db_kind, target_opts);
+        try clearStorage(target_db_kind, target_opts);
         var source = try DB.init(source_opts);
 
         // moment 1: create many keys
@@ -2831,13 +2876,13 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
 
         var offset_map = std.AutoHashMap(u64, u64).init(allocator);
         defer offset_map.deinit();
-        var compacted = try source.compact(target_opts, &offset_map);
+        var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
 
-        const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+        const history = try TargetDB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
         try std.testing.expectEqual(1, try history.count());
 
         const moment_cursor = (try history.getCursor(0)).?;
-        const moment = try DB.HashMap(.read_only).init(moment_cursor);
+        const moment = try TargetDB.HashMap(.read_only).init(moment_cursor);
 
         // verify shared keys are intact
         for (0..20) |i| {
@@ -2856,7 +2901,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
         // re-open after compact
         {
             try clearStorage(db_kind, source_opts);
-            try clearStorage(db_kind, target_opts);
+            try clearStorage(target_db_kind, target_opts);
             var source = try DB.init(source_opts);
 
             // write some data
@@ -2875,17 +2920,17 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
             // compact
             var offset_map = std.AutoHashMap(u64, u64).init(allocator);
             defer offset_map.deinit();
-            var compacted = try source.compact(target_opts, &offset_map);
+            var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
             _ = &compacted;
 
             // re-open the target
-            var reopened = try DB.init(target_opts);
+            var reopened = try TargetDB.init(target_opts);
 
-            const history = try DB.ArrayList(.read_only).init(reopened.rootCursor().readOnly());
+            const history = try TargetDB.ArrayList(.read_only).init(reopened.rootCursor().readOnly());
             try std.testing.expectEqual(1, try history.count());
 
             const moment_cursor = (try history.getCursor(0)).?;
-            const moment = try DB.HashMap(.read_only).init(moment_cursor);
+            const moment = try TargetDB.HashMap(.read_only).init(moment_cursor);
             const val = try (try moment.getCursor(hashInt("persist"))).?.readBytesAlloc(allocator, 1024);
             defer allocator.free(val);
             try std.testing.expectEqualStrings("persistent_value", val);
@@ -2895,7 +2940,7 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
         // compact then continue writing
         {
             try clearStorage(db_kind, source_opts);
-            try clearStorage(db_kind, target_opts);
+            try clearStorage(target_db_kind, target_opts);
             var source = try DB.init(source_opts);
 
             // write initial data
@@ -2913,14 +2958,14 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
             // compact
             var offset_map = std.AutoHashMap(u64, u64).init(allocator);
             defer offset_map.deinit();
-            var compacted = try source.compact(target_opts, &offset_map);
+            var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
 
             // add new moment to compacted DB
             {
-                const history = try DB.ArrayList(.read_write).init(compacted.rootCursor());
+                const history = try TargetDB.ArrayList(.read_write).init(compacted.rootCursor());
                 const Ctx = struct {
-                    pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
-                        const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    pub fn run(_: @This(), cursor: *TargetDB.Cursor(.read_write)) !void {
+                        const moment = try TargetDB.HashMap(.read_write).init(cursor.*);
                         try moment.put(hashInt("new_key"), .{ .bytes = "new_data" });
                     }
                 };
@@ -2928,19 +2973,19 @@ fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.Database
             }
 
             // verify both old and new data
-            const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+            const history = try TargetDB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
             try std.testing.expectEqual(2, try history.count());
 
             // moment 0 (compacted original)
             const m0_cursor = (try history.getCursor(0)).?;
-            const m0 = try DB.HashMap(.read_only).init(m0_cursor);
+            const m0 = try TargetDB.HashMap(.read_only).init(m0_cursor);
             const orig_val = try (try m0.getCursor(hashInt("original"))).?.readBytesAlloc(allocator, 1024);
             defer allocator.free(orig_val);
             try std.testing.expectEqualStrings("original_data", orig_val);
 
             // moment 1 (new data added after compact)
             const m1_cursor = (try history.getCursor(1)).?;
-            const m1 = try DB.HashMap(.read_only).init(m1_cursor);
+            const m1 = try TargetDB.HashMap(.read_only).init(m1_cursor);
             const new_val = try (try m1.getCursor(hashInt("new_key"))).?.readBytesAlloc(allocator, 1024);
             defer allocator.free(new_val);
             try std.testing.expectEqualStrings("new_data", new_val);
