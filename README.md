@@ -1,12 +1,33 @@
-xitdb is an immutable database written in Zig.
+<p align="center">
+  xitdb is an immutable database written in Zig
+  <br/>
+  <br/>
+  <b>Choose your flavor:</b>
+  <a href="https://github.com/xit-vcs/xitdb">Zig</a> |
+  <a href="https://github.com/xit-vcs/xitdb-java">Java</a> |
+  <a href="https://github.com/codeboost/xitdb-clj">Clojure</a> |
+  <a href="https://github.com/xit-vcs/xitdb-ts">TypeScript</a>
+</p>
 
-* Each transaction efficiently creates a new "copy" of the database, and past copies can still be read from.
-* It supports writing to a file as well as purely in-memory use.
+* Each transaction efficiently creates a new "copy" of the database, and past copies can still be read from and reverted to.
+* Supports storing in a single file as well as purely in-memory use.
+* Runs as a library (embedded in process).
+* Incrementally reads and writes, so file-based databases can contain larger-than-memory datasets.
+* Reads never block writes, and a database can be read from multiple threads/processes without locks.
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
 * No dependencies besides the Zig standard library (requires version 0.15.1).
-* There is also a [Java port](https://github.com/radarroark/xitdb-java) of this library.
 
-This database was originally made for the [xit version control system](https://github.com/radarroark/xit), but I bet it has a lot of potential for other projects. The combination of being immutable and having an API similar to in-memory data structures is pretty powerful. Consider using it instead of SQLite for your Zig projects: it's simpler, it's pure Zig, and it creates no impedence mismatch with your program the way SQL databases do.
+This database was originally made for the [xit version control system](https://github.com/xit-vcs/xit), but I bet it has a lot of potential for other projects. The combination of being immutable and having an API similar to in-memory data structures is pretty powerful. Consider using it [instead of SQLite](https://gist.github.com/radarroark/03a0724484e1111ef4c05d72a935c42c) for your Zig projects: it's simpler, it's pure Zig, and it creates no impedance mismatch with your program the way SQL databases do.
+
+* [Example](#example)
+* [Initializing a Database](#initializing-a-database)
+* [Types](#types)
+* [Cloning and Undoing](#cloning-and-undoing)
+* [Large Byte Arrays](#large-byte-arrays)
+* [Iterators](#iterators)
+* [Hashing](#hashing)
+* [Compaction](#compaction)
+* [Thread Safety](#thread-safety)
 
 ## Example
 
@@ -137,7 +158,8 @@ In xitdb, you can optionally store a format tag with a byte array. A format tag 
 
 ```zig
 var random_number_buffer: [32]u8 = undefined;
-std.mem.writeInt(u256, &random_number_buffer, std.crypto.random.int(u256), .big);
+var prng = std.Random.DefaultPrng.init(12345);
+std.mem.writeInt(u256, &random_number_buffer, prng.random().int(u256), .big);
 try moment.put(hashInt("random-number"), .{ .bytes_object = .{ .value = &random_number_buffer, .format_tag = "bi".* } });
 ```
 
@@ -192,7 +214,13 @@ const fruits = try DB.ArrayList(.read_only).init(fruits_cursor);
 try std.testing.expectEqual(3, try fruits.count());
 ```
 
-There's one catch, though. If we try cloning a data structure that was created in the same transaction, it doesn't seem to work:
+Before we continue, let's save the latest history index, so we can revert back to this moment of the database later:
+
+```zig
+const history_index = try history.count() - 1;
+```
+
+There's one catch you'll run into when cloning. If we try cloning a data structure that was created in the same transaction, it doesn't seem to work:
 
 ```zig
 const Ctx = struct {
@@ -232,10 +260,10 @@ try std.testing.expectEqual(4, try big_cities.count());
 
 The reason that `big-cities` was mutated is because all data in a given transaction is temporarily mutable. This is a very important optimization, but in this case, it's not what we want.
 
-To show how to fix this, let's first undo the transaction we just made. Here we add a new value to the history that uses the slot from two transactions ago, which effectively reverts the last transaction:
+To show how to fix this, let's first undo the transaction we just made. Here we use the `history_index` we saved before to revert back to the older database moment:
 
 ```zig
-try history.append(.{ .slot = try history.getSlot(-2) });
+try history.append(.{ .slot = try history.getSlot(history_index) });
 ```
 
 This time, after making the "big cities" list, we call `freeze`, which tells xitdb to consider all data made so far in the transaction to be immutable. After that, we can clone it into the "cities" list and it will work the way we wanted:
@@ -277,6 +305,154 @@ try std.testing.expectEqual(4, try cities.count());
 const big_cities_cursor = (try moment.getCursor(hashInt("big-cities"))).?;
 const big_cities = try DB.ArrayList(.read_only).init(big_cities_cursor);
 try std.testing.expectEqual(2, try big_cities.count());
+```
+
+## Large Byte Arrays
+
+When reading and writing large byte arrays, you probably don't want to have all of their contents in memory at once. To incrementally write to a byte array, just get a writer from a cursor:
+
+```zig
+var long_text_cursor = try moment.putCursor(hashInt("long-text"));
+var write_buffer: [1024]u8 = undefined;
+var writer = try long_text_cursor.writer(&write_buffer);
+for (0..50) |_| {
+    try writer.interface.writeAll("hello, world!\n");
+}
+try writer.finish(); // remember to call this!
+```
+
+If you need to set a format tag for the byte array, put it in the `format_tag` field of the writer before you call `finish`.
+
+To read a byte array incrementally, get a reader from a cursor:
+
+```zig
+var long_text_cursor = (try moment.getCursor(hashInt("long-text"))).?;
+var read_buffer: [1024]u8 = undefined;
+var reader = try long_text_cursor.reader(&read_buffer);
+var count: usize = 0;
+while (try reader.interface.takeDelimiter('\n')) |_| {
+    count += 1;
+}
+try std.testing.expectEqual(50, count);
+```
+
+## Iterators
+
+All data structures support iteration. Here's an example of iterating over an `ArrayList` and printing all of the keys and values of each `HashMap` contained in it:
+
+```zig
+const people_cursor = (try moment.getCursor(hashInt("people"))).?;
+const people = try DB.ArrayList(.read_only).init(people_cursor);
+
+var people_iter = try people.iterator();
+while (try people_iter.next()) |person_cursor| {
+    const person = try DB.HashMap(.read_only).init(person_cursor);
+    var person_iter = try person.iterator();
+    while (try person_iter.next()) |kv_pair_cursor| {
+        const kv_pair = try kv_pair_cursor.readKeyValuePair();
+
+        var key_buffer: [100]u8 = undefined;
+        const key = try kv_pair.key_cursor.readBytes(&key_buffer);
+
+        switch (kv_pair.value_cursor.slot().tag) {
+            .short_bytes, .bytes => {
+                var val_buffer: [100]u8 = undefined;
+                const val = try kv_pair.value_cursor.readBytes(&val_buffer);
+                std.debug.print("{s}: {s}\n", .{ key, val });
+            },
+            .uint => std.debug.print("{s}: {}\n", .{ key, try kv_pair.value_cursor.readUint() }),
+            .int => std.debug.print("{s}: {}\n", .{ key, _ = try kv_pair.value_cursor.readInt() }),
+            .float => std.debug.print("{s}: {}\n", .{ key, _ = try kv_pair.value_cursor.readFloat() }),
+            else => return error.UnexpectedTagType,
+        }
+    }
+}
+```
+
+The above code iterates over `people`, which is an `ArrayList`, and for each person (which is a `HashMap`), it iterates over each of its key-value pairs.
+
+The iteration of the `HashMap` looks the same with `HashSet`, `CountedHashMap`, and `CountedHashSet`. When iterating, you call `readKeyValuePair` on the cursor and can read the `key_cursor` and `value_cursor` from it. In maps, `put` sets the value `putKey` sets the key (see the tests for examples). In sets, there is only `put` and it sets the key; the value will always have a tag type of `.none`.
+
+## Hashing
+
+Hashing is never done by xitdb itself. The `hashInt` function you see in the above examples is not part of the library. You can define it yourself like this:
+
+```zig
+fn hashInt(buffer: []const u8) u160 {
+    var hash: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(buffer, &hash, .{});
+    return std.mem.readInt(u160, &hash, .big);
+}
+```
+
+When initializing a database, you only tell xitdb the size of the hash via the `HashInt` parameter. If you're using SHA-1, this will be 160 bits:
+
+```zig
+const file = try std.fs.cwd().createFile("main.db", .{ .read = true });
+defer file.close();
+
+const db = try xitdb.Database(.file, u160).init(.{ .file = file });
+```
+
+The size of the hash in bytes will be stored in the database's header. If you try opening it later with the wrong hash size, it will return an error. If you are unsure what hash size the database uses, this creates a chicken-and-egg problem. You can read the header before initializing the database like this:
+
+```zig
+var reader = file.reader(&.{});
+const header = try xitdb.DatabaseHeader.read(&reader.interface);
+try std.testing.expectEqual(20, header.hash_size);
+```
+
+The hash size alone does not disambiguate hashing algorithms, though. In addition, xitdb reserves four bytes in the header that you can use to put the name of the algorithm. You must provide it in the init options:
+
+```zig
+const db = try xitdb.Database(.file, u160).init(.{ .file = file, .hash_id = .fromBytes("sha1") });
+```
+
+The hash id is only written to the database header when it is first initialized. When you open it later, that init option is ignored. You can read the hash id of an existing database like this:
+
+```zig
+var reader = file.reader(&.{});
+const header = try xitdb.DatabaseHeader.read(&reader.interface);
+try std.testing.expectEqualStrings("sha1", &header.hash_id.toBytes());
+```
+
+If you want to use SHA-256, I recommend using `sha2` as the hash id. You can then distinguish between SHA-256 and SHA-512 using the hash size, like this:
+
+```zig
+const HashAlgo = enum { sha1, sha256, sha512 };
+
+const hash_algo: HashAlgo = switch (header.hash_id.id) {
+    xitdb.HashId.fromBytes("sha1").id => .sha1,
+    xitdb.HashId.fromBytes("sha2").id => switch (header.hash_size) {
+        32 => .sha256,
+        64 => .sha512,
+        else => return error.InvalidHashSize,
+    },
+    else => return error.InvalidHashAlgo,
+};
+try std.testing.expectEqual(.sha1, hash_algo);
+```
+
+## Compaction
+
+Normally, an immutable database grows forever, because old data is never deleted. To reclaim disk space and clear the history, xitdb supports compaction. This involves completely rebuilding the database file to only contain the data accessible from the latest copy (i.e., "moment") of the database.
+
+```zig
+// create the buffer and file for the new database
+var compact_buffer = std.Io.Writer.Allocating.init(allocator);
+defer compact_buffer.deinit();
+const compact_file = try std.fs.cwd().createFile("compact.db", .{ .read = true });
+defer compact_file.close();
+
+// cache of offsets to make the compaction much more efficient
+var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+defer offset_map.deinit();
+
+var compact_db = try db.compact(.{ .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+
+// read from the new compacted db
+const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());
+try std.testing.expectEqual(1, try history.count());
 ```
 
 ## Thread Safety

@@ -370,6 +370,61 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
+        pub fn compact(self: *Database(db_kind, HashInt), target_opts: InitOpts, offset_map: *std.AutoHashMap(u64, u64)) !Database(db_kind, HashInt) {
+            var target = try Database(db_kind, HashInt).init(target_opts);
+
+            if (self.header.tag == .none) return target;
+            if (self.header.tag != .array_list) return error.UnexpectedTag;
+
+            // read source's top-level ArrayListHeader
+            var source_reader = self.core.reader();
+            try source_reader.seekTo(DATABASE_START);
+            const source_header: ArrayListHeader = @bitCast(try takeInt(&source_reader.interface, ArrayListHeaderInt, .big));
+
+            if (source_header.size == 0) return target;
+
+            // read the last moment's slot
+            const last_key = source_header.size - 1;
+            const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
+            const last_slot_ptr = try self.readArrayListSlot(source_header.ptr, last_key, shift, .read_only, true);
+            const moment_slot = last_slot_ptr.slot;
+
+            // write TopLevelArrayListHeader + root index block to target
+            var target_writer = target.core.writer();
+            try target_writer.seekTo(DATABASE_START);
+            const target_array_list_ptr = DATABASE_START + byteSizeOf(TopLevelArrayListHeader);
+            try target_writer.interface.writeInt(TopLevelArrayListHeaderInt, @bitCast(TopLevelArrayListHeader{
+                .file_size = 0,
+                .parent = .{
+                    .ptr = target_array_list_ptr,
+                    .size = 1,
+                },
+            }), .big);
+            const index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+            try target_writer.interface.writeAll(&index_block);
+
+            // recursively remap the moment slot
+            const remapped_moment = try remapSlot(&self.core, &target.core, offset_map, moment_slot);
+
+            // write remapped moment slot into position 0 of target's root index block
+            try target_writer.seekTo(target_array_list_ptr);
+            try target_writer.interface.writeInt(SlotInt, @bitCast(remapped_moment), .big);
+
+            // update target's DatabaseHeader tag
+            target.header.tag = .array_list;
+            try target_writer.seekTo(0);
+            try target.header.write(&target_writer.interface);
+
+            // flush, update file_size, flush again
+            try target.core.flush();
+            const file_size = try target.core.length();
+            try target_writer.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
+            try target_writer.interface.writeInt(u64, file_size, .big);
+            try target.core.flush();
+
+            return target;
+        }
+
         // private
 
         fn truncate(self: *Database(db_kind, HashInt)) !void {
@@ -3150,6 +3205,282 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     });
                 }
             };
+        }
+
+        // compaction helpers
+
+        fn remapSlot(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) anyerror!Slot {
+            switch (slot.tag) {
+                .none, .uint, .int, .float, .short_bytes => return slot,
+                .bytes => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapBytes(source_core, target_core, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .index => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapIndex(source_core, target_core, offset_map, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .array_list => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapArrayList(source_core, target_core, offset_map, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .linked_array_list => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapLinkedArrayList(source_core, target_core, offset_map, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .hash_map, .hash_set => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapHashMapOrSet(source_core, target_core, offset_map, slot, false);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .counted_hash_map, .counted_hash_set => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapHashMapOrSet(source_core, target_core, offset_map, slot, true);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+                .kv_pair => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapKvPair(source_core, target_core, offset_map, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
+            }
+        }
+
+        fn remapBytes(source_core: *Core, target_core: *Core, slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            try reader.seekTo(slot.value);
+            const length = try takeInt(&reader.interface, u64, .big);
+
+            // total size: u64 length + bytes + optional 2-byte format_tag
+            const format_tag_size: u64 = if (slot.full) 2 else 0;
+            const total_payload = length + format_tag_size;
+
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            try writer.interface.writeInt(u64, length, .big);
+
+            // copy bytes in chunks
+            var remaining = total_payload;
+            var buf: [4096]u8 = undefined;
+            while (remaining > 0) {
+                const chunk = @min(remaining, buf.len);
+                try reader.interface.readSliceAll(buf[0..chunk]);
+                try writer.interface.writeAll(buf[0..chunk]);
+                remaining -= chunk;
+            }
+
+            return new_offset;
+        }
+
+        fn remapIndex(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            // read 144-byte block (16 slots)
+            try reader.seekTo(slot.value);
+            var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+            try reader.interface.readSliceAll(&block_bytes);
+
+            // remap each slot
+            var block_reader = std.Io.Reader.fixed(&block_bytes);
+            var remapped_slots: [SLOT_COUNT]Slot = undefined;
+            for (&remapped_slots) |*s| {
+                const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                s.* = try remapSlot(source_core, target_core, offset_map, child_slot);
+            }
+
+            // write remapped block to target
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            for (remapped_slots) |s| {
+                try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+            }
+
+            return new_offset;
+        }
+
+        fn remapArrayList(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            // read ArrayListHeader (16 bytes)
+            try reader.seekTo(slot.value);
+            const header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
+
+            // remap root index block pointer via remapSlot as an .index slot
+            const index_slot = Slot{ .value = header.ptr, .tag = .index };
+            const remapped_index = try remapSlot(source_core, target_core, offset_map, index_slot);
+
+            // write new ArrayListHeader with remapped ptr
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(ArrayListHeader{
+                .ptr = remapped_index.value,
+                .size = header.size,
+            }), .big);
+
+            return new_offset;
+        }
+
+        fn remapLinkedArrayList(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            // read LinkedArrayListHeader (17 bytes)
+            try reader.seekTo(slot.value);
+            const header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+
+            // remap root block
+            const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_core, offset_map, header.ptr);
+
+            // write new header
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(LinkedArrayListHeader{
+                .shift = header.shift,
+                .ptr = remapped_ptr,
+                .size = header.size,
+            }), .big);
+
+            return new_offset;
+        }
+
+        fn remapLinkedArrayListBlock(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), block_offset: u64) !u64 {
+            // dedup check
+            if (offset_map.get(block_offset)) |mapped| {
+                return mapped;
+            }
+
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            // read 272-byte block (16 x LinkedArrayListSlot of 17 bytes)
+            try reader.seekTo(block_offset);
+            var block_bytes = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
+            try reader.interface.readSliceAll(&block_bytes);
+
+            // parse slots
+            var block_reader = std.Io.Reader.fixed(&block_bytes);
+            var slots: [SLOT_COUNT]LinkedArrayListSlot = undefined;
+            for (&slots) |*s| {
+                s.* = @bitCast(try takeInt(&block_reader, LinkedArrayListSlotInt, .big));
+            }
+
+            // remap each slot
+            var remapped_slots: [SLOT_COUNT]LinkedArrayListSlot = undefined;
+            for (&remapped_slots, slots) |*rs, s| {
+                if (s.slot.tag == .index) {
+                    // index slots point to other 272-byte blocks, recurse on ourselves
+                    const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_core, offset_map, s.slot.value);
+                    rs.* = .{
+                        .size = s.size,
+                        .slot = .{ .value = remapped_ptr, .tag = .index, .full = s.slot.full },
+                    };
+                } else if (s.slot.empty()) {
+                    rs.* = s;
+                } else {
+                    // leaf slot - remap via remapSlot
+                    const remapped = try remapSlot(source_core, target_core, offset_map, s.slot);
+                    rs.* = .{
+                        .size = s.size,
+                        .slot = remapped,
+                    };
+                }
+            }
+
+            // write remapped block to target
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            for (remapped_slots) |s| {
+                try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(s), .big);
+            }
+
+            try offset_map.put(block_offset, new_offset);
+            return new_offset;
+        }
+
+        fn remapHashMapOrSet(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot, counted: bool) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            try reader.seekTo(slot.value);
+
+            const count_value: ?u64 = if (counted) try takeInt(&reader.interface, u64, .big) else null;
+
+            // read 144-byte root index block
+            var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+            try reader.interface.readSliceAll(&block_bytes);
+
+            // remap each child slot in the block
+            var block_reader = std.Io.Reader.fixed(&block_bytes);
+            var remapped_slots: [SLOT_COUNT]Slot = undefined;
+            for (&remapped_slots) |*s| {
+                const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                s.* = try remapSlot(source_core, target_core, offset_map, child_slot);
+            }
+
+            // write [optional count][remapped block] contiguously to target
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            if (count_value) |c| {
+                try writer.interface.writeInt(u64, c, .big);
+            }
+            for (remapped_slots) |s| {
+                try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+            }
+
+            return new_offset;
+        }
+
+        fn remapKvPair(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            // read KeyValuePair
+            try reader.seekTo(slot.value);
+            const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
+
+            // remap key_slot and value_slot
+            const remapped_key = try remapSlot(source_core, target_core, offset_map, kv_pair.key_slot);
+            const remapped_value = try remapSlot(source_core, target_core, offset_map, kv_pair.value_slot);
+
+            // write remapped KV pair (hash stays unchanged)
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            try writer.interface.writeInt(KeyValuePairInt, @bitCast(KeyValuePair{
+                .value_slot = remapped_value,
+                .key_slot = remapped_key,
+                .hash = kv_pair.hash,
+            }), .big);
+
+            return new_offset;
         }
     };
 }

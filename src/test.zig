@@ -152,10 +152,8 @@ test "validate tag" {
 }
 
 fn hashInt(buffer: []const u8) HashInt {
-    var hash = [_]u8{0} ** (@bitSizeOf(HashInt) / 8);
-    var h = std.crypto.hash.Sha1.init(.{});
-    h.update(buffer);
-    h.final(&hash);
+    var hash: [@bitSizeOf(HashInt) / 8]u8 = undefined;
+    std.crypto.hash.Sha1.hash(buffer, &hash, .{});
     return std.mem.readInt(HashInt, &hash, .big);
 }
 
@@ -214,12 +212,16 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
                 const alice_cursor = try people.appendCursor();
                 const alice = try DB.HashMap(.read_write).init(alice_cursor);
+                try alice.putKey(hashInt("name"), .{ .bytes = "name" });
                 try alice.put(hashInt("name"), .{ .bytes = "Alice" });
+                try alice.putKey(hashInt("age"), .{ .bytes = "age" });
                 try alice.put(hashInt("age"), .{ .uint = 25 });
 
                 const bob_cursor = try people.appendCursor();
                 const bob = try DB.HashMap(.read_write).init(bob_cursor);
+                try bob.putKey(hashInt("name"), .{ .bytes = "name" });
                 try bob.put(hashInt("name"), .{ .bytes = "Bob" });
+                try bob.putKey(hashInt("age"), .{ .bytes = "age" });
                 try bob.put(hashInt("age"), .{ .uint = 42 });
 
                 const todos_cursor = try moment.putCursor(hashInt("todos"));
@@ -255,8 +257,17 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 try letters_counted_set.put(hashInt("c"), .{ .bytes = "c" });
 
                 var random_number_buffer: [32]u8 = undefined;
-                std.mem.writeInt(u256, &random_number_buffer, std.crypto.random.int(u256), .big);
+                var prng = std.Random.DefaultPrng.init(12345);
+                std.mem.writeInt(u256, &random_number_buffer, prng.random().int(u256), .big);
                 try moment.put(hashInt("random-number"), .{ .bytes_object = .{ .value = &random_number_buffer, .format_tag = "bi".* } });
+
+                var long_text_cursor = try moment.putCursor(hashInt("long-text"));
+                var write_buffer: [1024]u8 = undefined;
+                var writer = try long_text_cursor.writer(&write_buffer);
+                for (0..50) |_| {
+                    try writer.interface.writeAll("hello, world!\n");
+                }
+                try writer.finish();
             }
         };
         try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
@@ -306,12 +317,31 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         defer allocator.free(todo_value);
         try std.testing.expectEqualStrings("Pay the bills", todo_value);
 
+        var fruits_iter = try fruits.iterator();
+        while (try fruits_iter.next()) |fruit_cursor| {
+            var buffer: [100]u8 = undefined;
+            _ = try fruit_cursor.readBytes(&buffer);
+        }
+
         var people_iter = try people.iterator();
         while (try people_iter.next()) |person_cursor| {
             const person = try DB.HashMap(.read_only).init(person_cursor);
             var person_iter = try person.iterator();
             while (try person_iter.next()) |kv_pair_cursor| {
-                _ = try kv_pair_cursor.readKeyValuePair();
+                const kv_pair = try kv_pair_cursor.readKeyValuePair();
+                var key_buffer: [100]u8 = undefined;
+                _ = try kv_pair.key_cursor.readBytes(&key_buffer);
+
+                switch (kv_pair.value_cursor.slot().tag) {
+                    .short_bytes, .bytes => {
+                        var val_buffer: [100]u8 = undefined;
+                        _ = try kv_pair.value_cursor.readBytes(&val_buffer);
+                    },
+                    .uint => _ = try kv_pair.value_cursor.readUint(),
+                    .int => _ = try kv_pair.value_cursor.readInt(),
+                    .float => _ = try kv_pair.value_cursor.readFloat(),
+                    else => return error.UnexpectedTagType,
+                }
             }
         }
 
@@ -364,10 +394,23 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             try std.testing.expectEqual(2, count);
         }
 
-        const random_number_cursor = (try moment.getCursor(hashInt("random-number"))).?;
-        var random_number_buffer: [32]u8 = undefined;
-        const random_number = try random_number_cursor.readBytesObject(&random_number_buffer);
-        try std.testing.expectEqualStrings("bi", &random_number.format_tag.?);
+        {
+            const random_number_cursor = (try moment.getCursor(hashInt("random-number"))).?;
+            var random_number_buffer: [32]u8 = undefined;
+            const random_number = try random_number_cursor.readBytesObject(&random_number_buffer);
+            try std.testing.expectEqualStrings("bi", &random_number.format_tag.?);
+        }
+
+        {
+            var long_text_cursor = (try moment.getCursor(hashInt("long-text"))).?;
+            var read_buffer: [1024]u8 = undefined;
+            var reader = try long_text_cursor.reader(&read_buffer);
+            var count: usize = 0;
+            while (try reader.interface.takeDelimiter('\n')) |_| {
+                count += 1;
+            }
+            try std.testing.expectEqual(50, count);
+        }
     }
 
     // make a new transaction and change the data
@@ -648,6 +691,8 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
     {
         const history = try DB.ArrayList(.read_write).init(db.rootCursor());
 
+        const history_index = try history.count() - 1;
+
         const Ctx = struct {
             pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
                 const moment = try DB.HashMap(.read_write).init(cursor.*);
@@ -683,7 +728,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         try std.testing.expectEqual(4, try big_cities.count());
 
         // revert that change
-        try history.append(.{ .slot = try history.getSlot(-2) });
+        try history.append(.{ .slot = try history.getSlot(history_index) });
     }
 
     // preventing accidental mutation with freezing
@@ -1131,14 +1176,38 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // save hash id in header
     {
         var init_opts_with_hash_id = init_opts;
-        init_opts_with_hash_id.hash_id = xitdb.HashId.fromBytes("sha1");
+        init_opts_with_hash_id.hash_id = .fromBytes("sha1");
 
         // make empty database
         try clearStorage(db_kind, init_opts);
-        const db = try xitdb.Database(db_kind, HashInt).init(init_opts_with_hash_id);
+        _ = try xitdb.Database(db_kind, HashInt).init(init_opts_with_hash_id);
 
-        try std.testing.expectEqual(xitdb.HashId.fromBytes("sha1").id, db.header.hash_id.id);
-        try std.testing.expectEqualStrings("sha1", &db.header.hash_id.toBytes());
+        // read header without initializing database
+        const header = blk: switch (db_kind) {
+            .memory => {
+                var reader = std.Io.Reader.fixed(init_opts.buffer.written());
+                break :blk try xitdb.DatabaseHeader.read(&reader);
+            },
+            .file, .buffered_file => {
+                var reader = init_opts.file.reader(init_opts.io, &.{});
+                break :blk try xitdb.DatabaseHeader.read(&reader.interface);
+            },
+        };
+        try std.testing.expectEqual(20, header.hash_size);
+        try std.testing.expectEqualStrings("sha1", &header.hash_id.toBytes());
+
+        // determine the hashing algorithm
+        const HashAlgo = enum { sha1, sha256, sha512 };
+        const hash_algo: HashAlgo = switch (header.hash_id.id) {
+            xitdb.HashId.fromBytes("sha1").id => .sha1,
+            xitdb.HashId.fromBytes("sha2").id => switch (header.hash_size) {
+                32 => .sha256,
+                64 => .sha512,
+                else => return error.InvalidHashSize,
+            },
+            else => return error.InvalidHashAlgo,
+        };
+        try std.testing.expectEqual(.sha1, hash_algo);
     }
 
     // array_list of hash_maps
@@ -2485,6 +2554,401 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 .{ .linked_array_list_insert = i },
                 .{ .write = .{ .uint = i } },
             });
+        }
+    }
+}
+
+test "compaction" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // memory
+    {
+        var source_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer source_buffer.deinit();
+        var target_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer target_buffer.deinit();
+        try testCompaction(allocator, .memory, .{ .buffer = &source_buffer, .max_size = 5_000_000 }, .{ .buffer = &target_buffer, .max_size = 5_000_000 });
+    }
+
+    // file
+    {
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+        defer {
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+        }
+        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
+        defer {
+            target_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
+        }
+        try testCompaction(allocator, .file, .{ .io = io, .file = source_file }, .{ .io = io, .file = target_file });
+    }
+
+    // buffered_file
+    {
+        var source_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer source_buffer.deinit();
+        var target_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer target_buffer.deinit();
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+        defer {
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+        }
+        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
+        defer {
+            target_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
+        }
+        try testCompaction(allocator, .buffered_file, .{ .io = io, .file = source_file, .buffer = &source_buffer }, .{ .io = io, .file = target_file, .buffer = &target_buffer });
+    }
+}
+
+fn testCompaction(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, source_opts: xitdb.Database(db_kind, HashInt).InitOpts, target_opts: xitdb.Database(db_kind, HashInt).InitOpts) !void {
+    const DB = xitdb.Database(db_kind, HashInt);
+
+    // empty DB compaction
+    {
+        try clearStorage(db_kind, source_opts);
+        try clearStorage(db_kind, target_opts);
+        var source = try DB.init(source_opts);
+        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+        defer offset_map.deinit();
+        const compacted = try source.compact(target_opts, &offset_map);
+        try std.testing.expectEqual(.none, compacted.header.tag);
+    }
+
+    // basic compaction with various data types
+    {
+        try clearStorage(db_kind, source_opts);
+        try clearStorage(db_kind, target_opts);
+        var source = try DB.init(source_opts);
+
+        // moment 1
+        {
+            const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+            const Ctx1 = struct {
+                pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    try moment.put(hashInt("key1"), .{ .bytes = "value1" });
+                    try moment.put(hashInt("key2"), .{ .uint = 100 });
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx1{});
+        }
+
+        // moment 2
+        {
+            const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+            const Ctx2 = struct {
+                pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    try moment.put(hashInt("key1"), .{ .bytes = "updated_value1" });
+                    try moment.put(hashInt("key2"), .{ .uint = 200 });
+                    try moment.put(hashInt("key3"), .{ .int = -42 });
+                    try moment.put(hashInt("key4"), .{ .float = 3.14 });
+                    try moment.put(hashInt("short"), .{ .bytes = "hi" });
+
+                    // long bytes with format_tag
+                    try moment.put(hashInt("tagged"), .{ .bytes_object = .{ .value = "this is a long tagged string!!", .format_tag = "bi".* } });
+
+                    // ArrayList
+                    const fruits_cursor = try moment.putCursor(hashInt("fruits"));
+                    const fruits = try DB.ArrayList(.read_write).init(fruits_cursor);
+                    try fruits.append(.{ .bytes = "apple" });
+                    try fruits.append(.{ .bytes = "banana" });
+                    try fruits.append(.{ .bytes = "cherry" });
+
+                    // LinkedArrayList
+                    const todos_cursor = try moment.putCursor(hashInt("todos"));
+                    const todos = try DB.LinkedArrayList(.read_write).init(todos_cursor);
+                    try todos.append(.{ .bytes = "task1" });
+                    try todos.append(.{ .bytes = "task2" });
+                    try todos.append(.{ .bytes = "task3" });
+
+                    // CountedHashMap
+                    const counted_cursor = try moment.putCursor(hashInt("counted"));
+                    const counted = try DB.CountedHashMap(.read_write).init(counted_cursor);
+                    try counted.put(hashInt("a"), .{ .uint = 1 });
+                    try counted.putKey(hashInt("a"), .{ .bytes = "a" });
+                    try counted.put(hashInt("b"), .{ .uint = 2 });
+                    try counted.putKey(hashInt("b"), .{ .bytes = "b" });
+
+                    // HashSet
+                    const set_cursor = try moment.putCursor(hashInt("myset"));
+                    const set = try DB.HashSet(.read_write).init(set_cursor);
+                    try set.put(hashInt("x"), .{ .bytes = "x" });
+                    try set.put(hashInt("y"), .{ .bytes = "y" });
+
+                    // CountedHashSet
+                    const cset_cursor = try moment.putCursor(hashInt("mycset"));
+                    const cset = try DB.CountedHashSet(.read_write).init(cset_cursor);
+                    try cset.put(hashInt("p"), .{ .bytes = "p" });
+                    try cset.put(hashInt("q"), .{ .bytes = "q" });
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx2{});
+        }
+
+        // moment 3
+        {
+            const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+            const Ctx3 = struct {
+                pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    try moment.put(hashInt("key1"), .{ .bytes = "final_value" });
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx3{});
+        }
+
+        const source_size = try source.core.length();
+
+        // compact
+        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+        defer offset_map.deinit();
+        var compacted = try source.compact(target_opts, &offset_map);
+
+        const target_size = try compacted.core.length();
+
+        // target should be smaller than source (3 moments vs 1)
+        try std.testing.expect(target_size < source_size);
+
+        // target should have exactly 1 moment
+        const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+        try std.testing.expectEqual(1, try history.count());
+
+        // verify all data from latest moment is correct
+        const moment_cursor = (try history.getCursor(0)).?;
+        const moment = try DB.HashMap(.read_only).init(moment_cursor);
+
+        // key1 should have the final value
+        const key1_val = try (try moment.getCursor(hashInt("key1"))).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(key1_val);
+        try std.testing.expectEqualStrings("final_value", key1_val);
+
+        // key2 from moment 2
+        try std.testing.expectEqual(200, try (try moment.getCursor(hashInt("key2"))).?.readUint());
+
+        // key3 - int
+        try std.testing.expectEqual(@as(i64, -42), try (try moment.getCursor(hashInt("key3"))).?.readInt());
+
+        // key4 - float
+        try std.testing.expectEqual(@as(f64, 3.14), try (try moment.getCursor(hashInt("key4"))).?.readFloat());
+
+        // short bytes
+        const short_val = try (try moment.getCursor(hashInt("short"))).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(short_val);
+        try std.testing.expectEqualStrings("hi", short_val);
+
+        // tagged bytes
+        const tagged_obj = try (try moment.getCursor(hashInt("tagged"))).?.readBytesObjectAlloc(allocator, 1024);
+        defer allocator.free(tagged_obj.value);
+        try std.testing.expectEqualStrings("this is a long tagged string!!", tagged_obj.value);
+        try std.testing.expectEqual("bi".*, tagged_obj.format_tag.?);
+
+        // ArrayList
+        const fruits_cursor = (try moment.getCursor(hashInt("fruits"))).?;
+        const fruits = try DB.ArrayList(.read_only).init(fruits_cursor);
+        try std.testing.expectEqual(3, try fruits.count());
+        const apple = try (try fruits.getCursor(0)).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(apple);
+        try std.testing.expectEqualStrings("apple", apple);
+        const cherry = try (try fruits.getCursor(2)).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(cherry);
+        try std.testing.expectEqualStrings("cherry", cherry);
+
+        // LinkedArrayList
+        const todos_cursor = (try moment.getCursor(hashInt("todos"))).?;
+        const todos = try DB.LinkedArrayList(.read_only).init(todos_cursor);
+        try std.testing.expectEqual(3, try todos.count());
+        const task1 = try (try todos.getCursor(0)).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(task1);
+        try std.testing.expectEqualStrings("task1", task1);
+        const task3 = try (try todos.getCursor(2)).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(task3);
+        try std.testing.expectEqualStrings("task3", task3);
+
+        // CountedHashMap
+        const counted_cursor = (try moment.getCursor(hashInt("counted"))).?;
+        const counted = try DB.CountedHashMap(.read_only).init(counted_cursor);
+        try std.testing.expectEqual(2, try counted.count());
+        try std.testing.expectEqual(1, try (try counted.getCursor(hashInt("a"))).?.readUint());
+        try std.testing.expectEqual(2, try (try counted.getCursor(hashInt("b"))).?.readUint());
+
+        // HashSet
+        const set_cursor = (try moment.getCursor(hashInt("myset"))).?;
+        const set = try DB.HashSet(.read_only).init(set_cursor);
+        const x_val = try (try set.getCursor(hashInt("x"))).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(x_val);
+        try std.testing.expectEqualStrings("x", x_val);
+
+        // CountedHashSet
+        const cset_cursor = (try moment.getCursor(hashInt("mycset"))).?;
+        const cset = try DB.CountedHashSet(.read_only).init(cset_cursor);
+        try std.testing.expectEqual(2, try cset.count());
+        const p_val = try (try cset.getCursor(hashInt("p"))).?.readBytesAlloc(allocator, 1024);
+        defer allocator.free(p_val);
+        try std.testing.expectEqualStrings("p", p_val);
+    }
+
+    // structural sharing (most data shared, only 1 key changes per moment)
+    {
+        try clearStorage(db_kind, source_opts);
+        try clearStorage(db_kind, target_opts);
+        var source = try DB.init(source_opts);
+
+        // moment 1: create many keys
+        {
+            const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+            const Ctx = struct {
+                pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    for (0..20) |i| {
+                        var key_buf: [32]u8 = undefined;
+                        const key = std.fmt.bufPrint(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
+                        try moment.put(hashInt(key), .{ .uint = i });
+                    }
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+        }
+
+        // moments 2-5: change only one key each time
+        for (0..4) |round| {
+            const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+            const Ctx = struct {
+                round_val: u64,
+                pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const moment = try DB.HashMap(.read_write).init(cursor.*);
+                    try moment.put(hashInt("changing_key"), .{ .uint = self.round_val + 100 });
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .round_val = round });
+        }
+
+        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+        defer offset_map.deinit();
+        var compacted = try source.compact(target_opts, &offset_map);
+
+        const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+        try std.testing.expectEqual(1, try history.count());
+
+        const moment_cursor = (try history.getCursor(0)).?;
+        const moment = try DB.HashMap(.read_only).init(moment_cursor);
+
+        // verify shared keys are intact
+        for (0..20) |i| {
+            var key_buf: [32]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
+            try std.testing.expectEqual(i, try (try moment.getCursor(hashInt(key))).?.readUint());
+        }
+
+        // verify changing key has latest value
+        try std.testing.expectEqual(103, try (try moment.getCursor(hashInt("changing_key"))).?.readUint());
+    }
+
+    // re-open after compact and compact-then-continue-writing
+    // (only meaningful for file and buffered_file modes)
+    if (db_kind != .memory) {
+        // re-open after compact
+        {
+            try clearStorage(db_kind, source_opts);
+            try clearStorage(db_kind, target_opts);
+            var source = try DB.init(source_opts);
+
+            // write some data
+            {
+                const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+                const Ctx = struct {
+                    pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                        const moment = try DB.HashMap(.read_write).init(cursor.*);
+                        try moment.put(hashInt("persist"), .{ .bytes = "persistent_value" });
+                        try moment.put(hashInt("number"), .{ .uint = 999 });
+                    }
+                };
+                try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+            }
+
+            // compact
+            var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+            defer offset_map.deinit();
+            var compacted = try source.compact(target_opts, &offset_map);
+            _ = &compacted;
+
+            // re-open the target
+            var reopened = try DB.init(target_opts);
+
+            const history = try DB.ArrayList(.read_only).init(reopened.rootCursor().readOnly());
+            try std.testing.expectEqual(1, try history.count());
+
+            const moment_cursor = (try history.getCursor(0)).?;
+            const moment = try DB.HashMap(.read_only).init(moment_cursor);
+            const val = try (try moment.getCursor(hashInt("persist"))).?.readBytesAlloc(allocator, 1024);
+            defer allocator.free(val);
+            try std.testing.expectEqualStrings("persistent_value", val);
+            try std.testing.expectEqual(999, try (try moment.getCursor(hashInt("number"))).?.readUint());
+        }
+
+        // compact then continue writing
+        {
+            try clearStorage(db_kind, source_opts);
+            try clearStorage(db_kind, target_opts);
+            var source = try DB.init(source_opts);
+
+            // write initial data
+            {
+                const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+                const Ctx = struct {
+                    pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                        const moment = try DB.HashMap(.read_write).init(cursor.*);
+                        try moment.put(hashInt("original"), .{ .bytes = "original_data" });
+                    }
+                };
+                try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+            }
+
+            // compact
+            var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+            defer offset_map.deinit();
+            var compacted = try source.compact(target_opts, &offset_map);
+
+            // add new moment to compacted DB
+            {
+                const history = try DB.ArrayList(.read_write).init(compacted.rootCursor());
+                const Ctx = struct {
+                    pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                        const moment = try DB.HashMap(.read_write).init(cursor.*);
+                        try moment.put(hashInt("new_key"), .{ .bytes = "new_data" });
+                    }
+                };
+                try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+            }
+
+            // verify both old and new data
+            const history = try DB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
+            try std.testing.expectEqual(2, try history.count());
+
+            // moment 0 (compacted original)
+            const m0_cursor = (try history.getCursor(0)).?;
+            const m0 = try DB.HashMap(.read_only).init(m0_cursor);
+            const orig_val = try (try m0.getCursor(hashInt("original"))).?.readBytesAlloc(allocator, 1024);
+            defer allocator.free(orig_val);
+            try std.testing.expectEqualStrings("original_data", orig_val);
+
+            // moment 1 (new data added after compact)
+            const m1_cursor = (try history.getCursor(1)).?;
+            const m1 = try DB.HashMap(.read_only).init(m1_cursor);
+            const new_val = try (try m1.getCursor(hashInt("new_key"))).?.readBytesAlloc(allocator, 1024);
+            defer allocator.free(new_val);
+            try std.testing.expectEqualStrings("new_data", new_val);
+
+            // original data should still be in moment 1 (inherited)
+            const orig_in_m1 = try (try m1.getCursor(hashInt("original"))).?.readBytesAlloc(allocator, 1024);
+            defer allocator.free(orig_in_m1);
+            try std.testing.expectEqualStrings("original_data", orig_in_m1);
         }
     }
 }
