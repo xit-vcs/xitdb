@@ -35,7 +35,7 @@ In this example, we create a new database, write some data in a transaction, and
 
 ```zig
 // create db file
-const file = try std.fs.cwd().createFile(io, "main.db", .{ .read = true });
+const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
 defer file.close(io);
 
 // init the buffer (optional, but better for performance)
@@ -388,10 +388,10 @@ fn hashInt(buffer: []const u8) u160 {
 When initializing a database, you only tell xitdb the size of the hash via the `HashInt` parameter. If you're using SHA-1, this will be 160 bits:
 
 ```zig
-const file = try std.fs.cwd().createFile("main.db", .{ .read = true });
-defer file.close();
+const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
+defer file.close(io);
 
-const db = try xitdb.Database(.file, u160).init(.{ .file = file });
+const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file });
 ```
 
 The size of the hash in bytes will be stored in the database's header. If you try opening it later with the wrong hash size, it will return an error. If you are unsure what hash size the database uses, this creates a chicken-and-egg problem. You can read the header before initializing the database like this:
@@ -405,7 +405,7 @@ try std.testing.expectEqual(20, header.hash_size);
 The hash size alone does not disambiguate hashing algorithms, though. In addition, xitdb reserves four bytes in the header that you can use to put the name of the algorithm. You must provide it in the init options:
 
 ```zig
-const db = try xitdb.Database(.file, u160).init(.{ .file = file, .hash_id = .fromBytes("sha1") });
+const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file, .hash_id = .fromBytes("sha1") });
 ```
 
 The hash id is only written to the database header when it is first initialized. When you open it later, that init option is ignored. You can read the hash id of an existing database like this:
@@ -441,8 +441,8 @@ Normally, an immutable database grows forever, because old data is never deleted
 // create the buffer and file for the new database
 var compact_buffer = std.Io.Writer.Allocating.init(allocator);
 defer compact_buffer.deinit();
-const compact_file = try std.fs.cwd().createFile("compact.db", .{ .read = true });
-defer compact_file.close();
+const compact_file = try std.Io.Dir.cwd().createFile(io, "compact.db", .{ .read = true });
+defer compact_file.close(io);
 
 // cache of offsets to make the compaction much more efficient
 var offset_map = std.AutoHashMap(u64, u64).init(allocator);
