@@ -141,17 +141,45 @@ pub const DatabaseKind = enum {
     buffered_file,
 };
 
+pub const InitOptsMemory = struct {
+    buffer: *std.Io.Writer.Allocating,
+    max_size: ?u64 = null,
+    hash_id: HashId = .{ .id = 0 },
+};
+
+pub const InitOptsFile = struct {
+    file: std.fs.File,
+    hash_id: HashId = .{ .id = 0 },
+};
+
+pub const InitOptsBufferedFile = struct {
+    file: std.fs.File,
+    buffer: *std.Io.Writer.Allocating,
+    max_size: u64 = 2 * 1024 * 1024, // flushes when the memory is >= this size
+    hash_id: HashId = .{ .id = 0 },
+};
+
+pub fn InitOpts(comptime db_kind: DatabaseKind) type {
+    return switch (db_kind) {
+        .memory => InitOptsMemory,
+        .file => InitOptsFile,
+        .buffered_file => InitOptsBufferedFile,
+    };
+}
+
+pub fn Core(comptime db_kind: DatabaseKind) type {
+    return switch (db_kind) {
+        .memory => CoreMemory,
+        .file => CoreFile,
+        .buffered_file => CoreBufferedFile,
+    };
+}
+
 pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
     return struct {
-        core: Core,
+        core: Core(db_kind),
         header: DatabaseHeader,
         tx_start: ?u64,
-
-        pub const Core = switch (db_kind) {
-            .memory => CoreMemory,
-            .file => CoreFile,
-            .buffered_file => CoreBufferedFile,
-        };
 
         // internal constants
 
@@ -275,25 +303,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // init
 
-        pub const InitOpts = switch (db_kind) {
-            .memory => struct {
-                buffer: *std.Io.Writer.Allocating,
-                max_size: ?u64 = null,
-                hash_id: HashId = .{ .id = 0 },
-            },
-            .file => struct {
-                file: std.fs.File,
-                hash_id: HashId = .{ .id = 0 },
-            },
-            .buffered_file => struct {
-                file: std.fs.File,
-                buffer: *std.Io.Writer.Allocating,
-                max_size: u64 = 2 * 1024 * 1024, // flushes when the memory is >= this size
-                hash_id: HashId = .{ .id = 0 },
-            },
-        };
-
-        pub fn init(opts: InitOpts) !Database(db_kind, HashInt) {
+        pub fn init(opts: InitOpts(db_kind)) !Database(db_kind, HashInt) {
             var self: Database(db_kind, HashInt) = switch (db_kind) {
                 .memory => .{
                     .core = .{
@@ -364,8 +374,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        pub fn compact(self: *Database(db_kind, HashInt), target_opts: InitOpts, offset_map: *std.AutoHashMap(u64, u64)) !Database(db_kind, HashInt) {
-            var target = try Database(db_kind, HashInt).init(target_opts);
+        pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: *std.AutoHashMap(u64, u64)) !Database(target_db_kind, HashInt) {
+            var target = try Database(target_db_kind, HashInt).init(target_opts);
 
             if (self.header.tag == .none) return target;
             if (self.header.tag != .array_list) return error.UnexpectedTag;
@@ -398,7 +408,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try target_writer.interface.writeAll(&index_block);
 
             // recursively remap the moment slot
-            const remapped_moment = try remapSlot(&self.core, &target.core, offset_map, moment_slot);
+            const remapped_moment = try remapSlot(&self.core, target_db_kind, &target.core, offset_map, moment_slot);
 
             // write remapped moment slot into position 0 of target's root index block
             try target_writer.seekTo(target_array_list_ptr);
@@ -3203,14 +3213,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // compaction helpers
 
-        fn remapSlot(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) anyerror!Slot {
+        fn remapSlot(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) anyerror!Slot {
             switch (slot.tag) {
                 .none, .uint, .int, .float, .short_bytes => return slot,
                 .bytes => {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapBytes(source_core, target_core, slot);
+                    const new_offset = try remapBytes(source_core, target_db_kind, target_core, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3218,7 +3228,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapIndex(source_core, target_core, offset_map, slot);
+                    const new_offset = try remapIndex(source_core, target_db_kind, target_core, offset_map, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3226,7 +3236,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapArrayList(source_core, target_core, offset_map, slot);
+                    const new_offset = try remapArrayList(source_core, target_db_kind, target_core, offset_map, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3234,7 +3244,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapLinkedArrayList(source_core, target_core, offset_map, slot);
+                    const new_offset = try remapLinkedArrayList(source_core, target_db_kind, target_core, offset_map, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3242,7 +3252,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapHashMapOrSet(source_core, target_core, offset_map, slot, false);
+                    const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, false);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3250,7 +3260,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapHashMapOrSet(source_core, target_core, offset_map, slot, true);
+                    const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, true);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3258,14 +3268,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapKvPair(source_core, target_core, offset_map, slot);
+                    const new_offset = try remapKvPair(source_core, target_db_kind, target_core, offset_map, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
             }
         }
 
-        fn remapBytes(source_core: *Core, target_core: *Core, slot: Slot) !u64 {
+        fn remapBytes(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3293,7 +3303,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapIndex(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+        fn remapIndex(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3307,7 +3317,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
             for (&remapped_slots) |*s| {
                 const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                s.* = try remapSlot(source_core, target_core, offset_map, child_slot);
+                s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
             }
 
             // write remapped block to target
@@ -3320,7 +3330,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapArrayList(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+        fn remapArrayList(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3330,7 +3340,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             // remap root index block pointer via remapSlot as an .index slot
             const index_slot = Slot{ .value = header.ptr, .tag = .index };
-            const remapped_index = try remapSlot(source_core, target_core, offset_map, index_slot);
+            const remapped_index = try remapSlot(source_core, target_db_kind, target_core, offset_map, index_slot);
 
             // write new ArrayListHeader with remapped ptr
             const new_offset = try target_core.length();
@@ -3343,7 +3353,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapLinkedArrayList(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+        fn remapLinkedArrayList(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3352,7 +3362,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
 
             // remap root block
-            const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_core, offset_map, header.ptr);
+            const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_db_kind, target_core, offset_map, header.ptr);
 
             // write new header
             const new_offset = try target_core.length();
@@ -3366,7 +3376,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapLinkedArrayListBlock(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), block_offset: u64) !u64 {
+        fn remapLinkedArrayListBlock(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), block_offset: u64) !u64 {
             // dedup check
             if (offset_map.get(block_offset)) |mapped| {
                 return mapped;
@@ -3392,7 +3402,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             for (&remapped_slots, slots) |*rs, s| {
                 if (s.slot.tag == .index) {
                     // index slots point to other 272-byte blocks, recurse on ourselves
-                    const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_core, offset_map, s.slot.value);
+                    const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_db_kind, target_core, offset_map, s.slot.value);
                     rs.* = .{
                         .size = s.size,
                         .slot = .{ .value = remapped_ptr, .tag = .index, .full = s.slot.full },
@@ -3401,7 +3411,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     rs.* = s;
                 } else {
                     // leaf slot - remap via remapSlot
-                    const remapped = try remapSlot(source_core, target_core, offset_map, s.slot);
+                    const remapped = try remapSlot(source_core, target_db_kind, target_core, offset_map, s.slot);
                     rs.* = .{
                         .size = s.size,
                         .slot = remapped,
@@ -3420,7 +3430,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapHashMapOrSet(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot, counted: bool) !u64 {
+        fn remapHashMapOrSet(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot, counted: bool) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3437,7 +3447,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
             for (&remapped_slots) |*s| {
                 const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                s.* = try remapSlot(source_core, target_core, offset_map, child_slot);
+                s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
             }
 
             // write [optional count][remapped block] contiguously to target
@@ -3453,7 +3463,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapKvPair(source_core: *Core, target_core: *Core, offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+        fn remapKvPair(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -3462,8 +3472,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
 
             // remap key_slot and value_slot
-            const remapped_key = try remapSlot(source_core, target_core, offset_map, kv_pair.key_slot);
-            const remapped_value = try remapSlot(source_core, target_core, offset_map, kv_pair.value_slot);
+            const remapped_key = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.key_slot);
+            const remapped_value = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.value_slot);
 
             // write remapped KV pair (hash stays unchanged)
             const new_offset = try target_core.length();
