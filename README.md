@@ -455,6 +455,8 @@ const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());
 try std.testing.expectEqual(1, try history.count());
 ```
 
+This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. It is not possible to compact a database in-place (using the same file as the target database); doing so would fail and would render your original database unreadable.
+
 ## Thread Safety
 
 It is possible to read a database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. Also, keep in mind that writes still need to come from one thread at a time.
