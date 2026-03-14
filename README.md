@@ -6,7 +6,8 @@
   <a href="https://github.com/xit-vcs/xitdb">Zig</a> |
   <a href="https://github.com/xit-vcs/xitdb-java">Java</a> |
   <a href="https://github.com/codeboost/xitdb-clj">Clojure</a> |
-  <a href="https://github.com/xit-vcs/xitdb-ts">TypeScript</a>
+  <a href="https://github.com/xit-vcs/xitdb-ts">TypeScript</a> |
+  <a href="https://github.com/xit-vcs/xitdb-go">Go</a>
 </p>
 
 * Each transaction efficiently creates a new "copy" of the database, and past copies can still be read from and reverted to.
