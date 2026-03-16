@@ -79,7 +79,7 @@ pub const DatabaseHeader = packed struct {
     // this, because it never hashes anything directly, so it
     // doesn't need to know the hash algorithm. it is only here
     // for the sake of readers of the db.
-    hash_id: HashId = .{ .id = 0 },
+    hash_id: HashId,
     // the size in bytes of all hashes used by the database.
     hash_size: u16,
     // increment this number when the file format changes,
@@ -144,19 +144,19 @@ pub const DatabaseKind = enum {
 pub const InitOptsMemory = struct {
     buffer: *std.Io.Writer.Allocating,
     max_size: ?u64 = null,
-    hash_id: HashId = .{ .id = 0 },
+    hash_id: ?HashId = null,
 };
 
 pub const InitOptsFile = struct {
     file: std.fs.File,
-    hash_id: HashId = .{ .id = 0 },
+    hash_id: ?HashId = null,
 };
 
 pub const InitOptsBufferedFile = struct {
     file: std.fs.File,
     buffer: *std.Io.Writer.Allocating,
     max_size: u64 = 2 * 1024 * 1024, // flushes when the memory is >= this size
-    hash_id: HashId = .{ .id = 0 },
+    hash_id: ?HashId = null,
 };
 
 pub fn InitOpts(comptime db_kind: DatabaseKind) type {
@@ -338,7 +338,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             if (try self.core.length() == 0) {
                 self.header = .{
-                    .hash_id = opts.hash_id,
+                    .hash_id = opts.hash_id orelse .{ .id = 0 },
                     .hash_size = byteSizeOf(HashInt),
                 };
                 var writer = self.core.writer();
@@ -375,7 +375,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: *std.AutoHashMap(u64, u64)) !Database(target_db_kind, HashInt) {
-            var target = try Database(target_db_kind, HashInt).init(target_opts);
+            var opts = target_opts;
+            opts.hash_id = target_opts.hash_id orelse self.header.hash_id;
+            var target = try Database(target_db_kind, HashInt).init(opts);
 
             if (self.header.tag == .none) return target;
             if (self.header.tag != .array_list) return error.UnexpectedTag;
