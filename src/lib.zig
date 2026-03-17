@@ -1,5 +1,5 @@
-//! you're looking at radar's hopeless attempt to implement
-//! his dream database. it will be embedded and immutable.
+//! you're looking at my hopeless attempt to implement
+//! my dream database. it will be embedded and immutable.
 //! it will be practical for both on-disk and in-memory use.
 //! there is so much work to do, and so much to learn. we're
 //! gonna leeroy jenkins our way through this.
