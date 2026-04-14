@@ -65,7 +65,9 @@ pub const Tag = enum(u7) {
     counted_hash_set,
 
     pub fn validate(self: Tag) !void {
-        _ = try std.meta.intToEnum(Tag, @intFromEnum(self));
+        if (null == std.enums.fromInt(Tag, @intFromEnum(self))) {
+            return error.InvalidEnumTag;
+        }
     }
 };
 
@@ -148,12 +150,14 @@ pub const InitOptsMemory = struct {
 };
 
 pub const InitOptsFile = struct {
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     hash_id: ?HashId = null,
 };
 
 pub const InitOptsBufferedFile = struct {
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     buffer: *std.Io.Writer.Allocating,
     max_size: u64 = 2 * 1024 * 1024, // flushes when the memory is >= this size
     hash_id: ?HashId = null,
@@ -315,6 +319,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 },
                 .file => .{
                     .core = .{
+                        .io = opts.io,
                         .file = opts.file,
                     },
                     .header = undefined,
@@ -328,6 +333,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .memory_max_size = opts.max_size,
                         .file = .{
+                            .io = opts.io,
                             .file = opts.file,
                         },
                     },
@@ -3591,7 +3597,7 @@ const CoreMemory = struct {
         return self.buffer.written().len;
     }
 
-    pub fn setLength(self: *CoreMemory, len: usize) !void {
+    pub fn setLength(self: *CoreMemory, len: u64) !void {
         var arr = self.buffer.toArrayList();
         arr.shrinkAndFree(self.buffer.allocator, len);
         self.buffer.* = std.Io.Writer.Allocating.fromArrayList(self.buffer.allocator, &arr);
@@ -3603,26 +3609,26 @@ const CoreMemory = struct {
 };
 
 const CoreFile = struct {
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
 
-    pub const Reader = std.fs.File.Reader;
-    pub const Writer = std.fs.File.Writer;
+    pub const Reader = std.Io.File.Reader;
+    pub const Writer = std.Io.File.Writer;
 
     pub fn reader(self: *const CoreFile) Reader {
-        return self.file.reader(&.{});
+        return self.file.reader(self.io, &.{});
     }
 
     pub fn writer(self: *const CoreFile) Writer {
-        return self.file.writer(&.{});
+        return self.file.writer(self.io, &.{});
     }
 
     pub fn length(self: *const CoreFile) !u64 {
-        try self.file.seekFromEnd(0);
-        return try self.file.getPos();
+        return try self.file.length(self.io);
     }
 
-    pub fn setLength(self: *const CoreFile, len: usize) !void {
-        self.file.setEndPos(len) catch |err| switch (err) {
+    pub fn setLength(self: *const CoreFile, len: u64) !void {
+        self.file.setLength(self.io, len) catch |err| switch (err) {
             // the file is open in read-only mode.
             // on windows, it will return AccessDenied.
             // otherwise it will return NonResizable.
@@ -3632,7 +3638,7 @@ const CoreFile = struct {
     }
 
     pub fn sync(self: *const CoreFile) !void {
-        try self.file.sync();
+        try self.file.sync(self.io);
     }
 
     pub fn flush(_: *const CoreFile) !void {}
@@ -3760,7 +3766,7 @@ const CoreBufferedFile = struct {
         return @max(self.memory_pos + self.memory.buffer.written().len, try self.file.length());
     }
 
-    pub fn setLength(self: *CoreBufferedFile, len: usize) !void {
+    pub fn setLength(self: *CoreBufferedFile, len: u64) !void {
         try self.flush();
         try self.file.setLength(len);
     }
@@ -3772,7 +3778,7 @@ const CoreBufferedFile = struct {
 
     pub fn flush(self: *CoreBufferedFile) !void {
         if (self.memory.buffer.written().len > 0) {
-            var file_writer = self.file.file.writer(&.{});
+            var file_writer = self.file.writer();
             try file_writer.seekTo(self.memory_pos);
             try file_writer.interface.writeAll(self.memory.buffer.written());
 

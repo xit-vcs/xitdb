@@ -16,7 +16,7 @@
 * Incrementally reads and writes, so file-based databases can contain larger-than-memory datasets.
 * Reads never block writes, and a database can be read from multiple threads/processes without locks.
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
-* No dependencies besides the Zig standard library (requires version 0.15.1).
+* No dependencies besides the Zig standard library (requires version 0.16.0).
 
 This database was originally made for the [xit version control system](https://github.com/xit-vcs/xit), but I bet it has a lot of potential for other projects. The combination of being immutable and having an API similar to in-memory data structures is pretty powerful. Consider using it [instead of SQLite](https://gist.github.com/xeubie/03a0724484e1111ef4c05d72a935c42c) for your Zig projects: it's simpler, it's pure Zig, and it creates no impedance mismatch with your program the way SQL databases do.
 
@@ -36,8 +36,8 @@ In this example, we create a new database, write some data in a transaction, and
 
 ```zig
 // create db file
-const file = try std.fs.cwd().createFile("main.db", .{ .read = true });
-defer file.close();
+const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
+defer file.close(io);
 
 // init the buffer (optional, but better for performance)
 var buffer = std.Io.Writer.Allocating.init(allocator);
@@ -45,7 +45,7 @@ defer buffer.deinit();
 
 // init the db
 const DB = xitdb.Database(.buffered_file, HashInt);
-var db = try DB.init(.{ .file = file, .buffer = &buffer });
+var db = try DB.init(.{ .io = io, .file = file, .buffer = &buffer });
 
 // to get the benefits of immutability, the top-level data structure
 // must be an ArrayList, so each transaction is stored as an item in it
@@ -159,7 +159,8 @@ In xitdb, you can optionally store a format tag with a byte array. A format tag 
 
 ```zig
 var random_number_buffer: [32]u8 = undefined;
-std.mem.writeInt(u256, &random_number_buffer, std.crypto.random.int(u256), .big);
+var prng = std.Random.DefaultPrng.init(12345);
+std.mem.writeInt(u256, &random_number_buffer, prng.random().int(u256), .big);
 try moment.put(hashInt("random-number"), .{ .bytes_object = .{ .value = &random_number_buffer, .format_tag = "bi".* } });
 ```
 
@@ -388,10 +389,10 @@ fn hashInt(buffer: []const u8) u160 {
 When initializing a database, you only tell xitdb the size of the hash via the `HashInt` parameter. If you're using SHA-1, this will be 160 bits:
 
 ```zig
-const file = try std.fs.cwd().createFile("main.db", .{ .read = true });
-defer file.close();
+const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
+defer file.close(io);
 
-const db = try xitdb.Database(.file, u160).init(.{ .file = file });
+const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file });
 ```
 
 The size of the hash in bytes will be stored in the database's header. If you try opening it later with the wrong hash size, it will return an error. If you are unsure what hash size the database uses, this creates a chicken-and-egg problem. You can read the header before initializing the database like this:
@@ -405,7 +406,7 @@ try std.testing.expectEqual(20, header.hash_size);
 The hash size alone does not disambiguate hashing algorithms, though. In addition, xitdb reserves four bytes in the header that you can use to put the name of the algorithm. You must provide it in the init options:
 
 ```zig
-const db = try xitdb.Database(.file, u160).init(.{ .file = file, .hash_id = .fromBytes("sha1") });
+const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file, .hash_id = .fromBytes("sha1") });
 ```
 
 The hash id is only written to the database header when it is first initialized. When you open it later, that init option is ignored. You can read the hash id of an existing database like this:
@@ -441,14 +442,14 @@ Normally, an immutable database grows forever, because old data is never deleted
 // create the buffer and file for the new database
 var compact_buffer = std.Io.Writer.Allocating.init(allocator);
 defer compact_buffer.deinit();
-const compact_file = try std.fs.cwd().createFile("compact.db", .{ .read = true });
-defer compact_file.close();
+const compact_file = try std.Io.Dir.cwd().createFile(io, "compact.db", .{ .read = true });
+defer compact_file.close(io);
 
 // cache of offsets to make the compaction much more efficient
 var offset_map = std.AutoHashMap(u64, u64).init(allocator);
 defer offset_map.deinit();
 
-var compact_db = try db.compact(.buffered_file, .{ .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+var compact_db = try db.compact(.buffered_file, .{ .io = io, .file = compact_file, .buffer = &compact_buffer }, &offset_map);
 
 // read from the new compacted db
 const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());

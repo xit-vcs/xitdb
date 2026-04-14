@@ -5,6 +5,7 @@ const HashInt = u160;
 const MAX_READ_BYTES = 1024;
 
 test "high level api" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     {
@@ -14,27 +15,28 @@ test "high level api" {
     }
 
     {
-        const file = try std.fs.cwd().createFile("main.db", .{ .read = true, .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
         defer {
-            file.close();
-            std.fs.cwd().deleteFile("main.db") catch {};
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
         }
-        try testHighLevelApi(allocator, .file, .{ .file = file });
+        try testHighLevelApi(allocator, .file, .{ .io = io, .file = file });
     }
 
     {
         var buffer = std.Io.Writer.Allocating.init(allocator);
         defer buffer.deinit();
-        const file = try std.fs.cwd().createFile("main.db", .{ .read = true, .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
         defer {
-            file.close();
-            std.fs.cwd().deleteFile("main.db") catch {};
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
         }
-        try testHighLevelApi(allocator, .buffered_file, .{ .file = file, .buffer = &buffer });
+        try testHighLevelApi(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
     }
 }
 
 test "low level api" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     {
@@ -44,23 +46,23 @@ test "low level api" {
     }
 
     {
-        const file = try std.fs.cwd().createFile("main.db", .{ .read = true, .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
         defer {
-            file.close();
-            std.fs.cwd().deleteFile("main.db") catch {};
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
         }
-        try testLowLevelApi(allocator, .file, .{ .file = file });
+        try testLowLevelApi(allocator, .file, .{ .io = io, .file = file });
     }
 
     {
         var buffer = std.Io.Writer.Allocating.init(allocator);
         defer buffer.deinit();
-        const file = try std.fs.cwd().createFile("main.db", .{ .read = true, .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
         defer {
-            file.close();
-            std.fs.cwd().deleteFile("main.db") catch {};
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
         }
-        try testLowLevelApi(allocator, .buffered_file, .{ .file = file, .buffer = &buffer });
+        try testLowLevelApi(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
     }
 }
 
@@ -167,11 +169,11 @@ fn clearStorage(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(
             init_opts.buffer.shrinkRetainingCapacity(0);
         },
         .file => {
-            try init_opts.file.setEndPos(0);
+            try init_opts.file.setLength(init_opts.io, 0);
         },
         .buffered_file => {
             init_opts.buffer.shrinkRetainingCapacity(0);
-            try init_opts.file.setEndPos(0);
+            try init_opts.file.setLength(init_opts.io, 0);
         },
     }
 }
@@ -255,7 +257,8 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 try letters_counted_set.put(hashInt("c"), .{ .bytes = "c" });
 
                 var random_number_buffer: [32]u8 = undefined;
-                std.mem.writeInt(u256, &random_number_buffer, std.crypto.random.int(u256), .big);
+                var prng = std.Random.DefaultPrng.init(12345);
+                std.mem.writeInt(u256, &random_number_buffer, prng.random().int(u256), .big);
                 try moment.put(hashInt("random-number"), .{ .bytes_object = .{ .value = &random_number_buffer, .format_tag = "bi".* } });
 
                 var long_text_cursor = try moment.putCursor(hashInt("long-text"));
@@ -623,15 +626,15 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         switch (db_kind) {
             .memory => {},
             .file => {
-                const file = try std.fs.cwd().openFile("main.db", .{ .mode = .read_only });
-                defer file.close();
+                const file = try std.Io.Dir.cwd().openFile(init_opts.io, "main.db", .{ .mode = .read_only });
+                defer file.close(init_opts.io);
                 var new_init_opts = init_opts;
                 new_init_opts.file = file;
                 _ = try DB.init(new_init_opts);
             },
             .buffered_file => {
-                const file = try std.fs.cwd().openFile("main.db", .{ .mode = .read_only });
-                defer file.close();
+                const file = try std.Io.Dir.cwd().openFile(init_opts.io, "main.db", .{ .mode = .read_only });
+                defer file.close(init_opts.io);
                 var new_init_opts = init_opts;
                 new_init_opts.file = file;
                 new_init_opts.buffer.shrinkRetainingCapacity(0);
@@ -780,7 +783,7 @@ fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind,
         allocator: std.mem.Allocator,
 
         pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-            var values = std.ArrayList(u64){};
+            var values: std.ArrayList(u64) = .empty;
             defer values.deinit(self.allocator);
 
             // create list
@@ -841,7 +844,7 @@ fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind,
             });
 
             // check all values in the combo list
-            var combo_values = std.ArrayList(u64){};
+            var combo_values: std.ArrayList(u64) = .empty;
             defer combo_values.deinit(self.allocator);
             try combo_values.appendSlice(self.allocator, values.items[slice_offset .. slice_offset + slice_size]);
             try combo_values.appendSlice(self.allocator, values.items[slice_offset .. slice_offset + slice_size]);
@@ -882,7 +885,7 @@ fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind
     var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
     var root_cursor = db.rootCursor();
 
-    var values = std.ArrayList(u64){};
+    var values: std.ArrayList(u64) = .empty;
     defer values.deinit(allocator);
 
     {
@@ -1005,7 +1008,7 @@ fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.Dat
         allocator: std.mem.Allocator,
 
         pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-            var values = std.ArrayList(u64){};
+            var values: std.ArrayList(u64) = .empty;
             defer values.deinit(self.allocator);
 
             // create list
@@ -1076,7 +1079,7 @@ fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.Dat
         allocator: std.mem.Allocator,
 
         pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-            var values = std.ArrayList(u64){};
+            var values: std.ArrayList(u64) = .empty;
             defer values.deinit(self.allocator);
 
             for (0..original_size) |i| {
@@ -1186,7 +1189,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 break :blk try xitdb.DatabaseHeader.read(&reader);
             },
             .file, .buffered_file => {
-                var reader = init_opts.file.reader(&.{});
+                var reader = init_opts.file.reader(init_opts.io, &.{});
                 break :blk try xitdb.DatabaseHeader.read(&reader.interface);
             },
         };
@@ -2391,7 +2394,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             allocator: std.mem.Allocator,
 
             pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-                var values = std.ArrayList(u64){};
+                var values: std.ArrayList(u64) = .empty;
                 defer values.deinit(self.allocator);
 
                 // create list
@@ -2556,6 +2559,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 }
 
 test "compaction" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     // memory
@@ -2575,22 +2579,22 @@ test "compaction" {
 
     // file
     {
-        const source_file = try std.fs.cwd().createFile("compact_source.db", .{ .read = true, .truncate = true });
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
         defer {
-            source_file.close();
-            std.fs.cwd().deleteFile("compact_source.db") catch {};
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
         }
-        const target_file = try std.fs.cwd().createFile("compact_target.db", .{ .read = true, .truncate = true });
+        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
         defer {
-            target_file.close();
-            std.fs.cwd().deleteFile("compact_target.db") catch {};
+            target_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
         }
         try testCompaction(
             allocator,
             .file,
-            .{ .file = source_file },
+            .{ .io = io, .file = source_file },
             .file,
-            .{ .file = target_file },
+            .{ .io = io, .file = target_file },
         );
     }
 
@@ -2600,22 +2604,22 @@ test "compaction" {
         defer source_buffer.deinit();
         var target_buffer = std.Io.Writer.Allocating.init(allocator);
         defer target_buffer.deinit();
-        const source_file = try std.fs.cwd().createFile("compact_source.db", .{ .read = true, .truncate = true });
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
         defer {
-            source_file.close();
-            std.fs.cwd().deleteFile("compact_source.db") catch {};
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
         }
-        const target_file = try std.fs.cwd().createFile("compact_target.db", .{ .read = true, .truncate = true });
+        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
         defer {
-            target_file.close();
-            std.fs.cwd().deleteFile("compact_target.db") catch {};
+            target_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
         }
         try testCompaction(
             allocator,
             .buffered_file,
-            .{ .file = source_file, .buffer = &source_buffer },
+            .{ .io = io, .file = source_file, .buffer = &source_buffer },
             .buffered_file,
-            .{ .file = target_file, .buffer = &target_buffer },
+            .{ .io = io, .file = target_file, .buffer = &target_buffer },
         );
     }
 
@@ -2625,15 +2629,15 @@ test "compaction" {
         defer source_buffer.deinit();
         var target_buffer = std.Io.Writer.Allocating.init(allocator);
         defer target_buffer.deinit();
-        const source_file = try std.fs.cwd().createFile("compact_source.db", .{ .read = true, .truncate = true });
+        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
         defer {
-            source_file.close();
-            std.fs.cwd().deleteFile("compact_source.db") catch {};
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
         }
         try testCompaction(
             allocator,
             .buffered_file,
-            .{ .file = source_file, .buffer = &source_buffer },
+            .{ .io = io, .file = source_file, .buffer = &source_buffer },
             .memory,
             .{ .buffer = &target_buffer, .max_size = 5_000_000 },
         );
