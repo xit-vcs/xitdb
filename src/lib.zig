@@ -189,8 +189,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         const HASH_SIZE = byteSizeOf(HashInt);
         const INDEX_BLOCK_SIZE = byteSizeOf(Slot) * SLOT_COUNT;
-        const LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE = byteSizeOf(LinkedArrayListSlot) * SLOT_COUNT;
         const MAX_BRANCH_LENGTH: usize = 16;
+        // the iterator pushes one stack level per tree level. the deepest
+        // iterable structure is the hash trie (HASH_SIZE*8/BIT_COUNT levels) or
+        // a b-tree (height is at most log2 of a u64 size = 64, given the minimum
+        // fan-out of 2); the array list's radix trie is shallower than both.
+        const ITERATOR_STACK_SIZE = @max(HASH_SIZE * 8 / BIT_COUNT, byteSizeOf(u64) * 8);
 
         const ArrayListHeaderInt = u128;
         const ArrayListHeader = packed struct {
@@ -204,14 +208,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             parent: ArrayListHeader,
         };
 
-        const LinkedArrayListHeaderInt = u136;
-        const LinkedArrayListHeader = packed struct {
-            shift: u6,
-            padding: u2 = 0,
-            ptr: u64,
-            size: u64,
-        };
-
         const KeyValuePairInt = @typeInfo(KeyValuePair).@"struct".backing_integer.?;
         const KeyValuePair = packed struct {
             value_slot: Slot,
@@ -219,21 +215,46 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             hash: HashInt,
         };
 
-        const LinkedArrayListSlotInt = u136;
-        const LinkedArrayListSlot = packed struct {
+        const BTREE_SLOT_COUNT = SLOT_COUNT; // max entries per leaf / children per branch
+        const BTREE_SPLIT_COUNT = (BTREE_SLOT_COUNT + 1) / 2; // left side of a split
+        // on-disk node block: [kind: u8][num: u8] followed by, for a leaf,
+        // BTREE_SLOT_COUNT value slots; for a branch, BTREE_SLOT_COUNT child
+        // slots then BTREE_SLOT_COUNT u64 subtree counts
+        const BTREE_NODE_HEADER_SIZE = byteSizeOf(u8) * 2;
+        const BTREE_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + byteSizeOf(Slot) * BTREE_SLOT_COUNT;
+        const BTREE_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (byteSizeOf(Slot) + byteSizeOf(u64)) * BTREE_SLOT_COUNT;
+
+        const BTreeHeaderInt = u128;
+        const BTreeHeader = packed struct {
+            root_ptr: u64,
             size: u64,
-            slot: Slot,
         };
 
-        const LinkedArrayListSlotPointer = struct {
-            slot_ptr: SlotPointer,
-            leaf_count: u64,
+        const BTreeNodeKind = enum(u8) { leaf, branch };
+
+        const BTreeNode = struct {
+            kind: BTreeNodeKind,
+            num: u8,
+            values: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // leaf
+            children: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
+            counts: [BTREE_SLOT_COUNT]u64 = [_]u64{0} ** BTREE_SLOT_COUNT, // branch
+
+            fn subtreeCount(self: *const BTreeNode) u64 {
+                if (self.kind == .leaf) return self.num;
+                var total: u64 = 0;
+                for (self.counts[0..self.num]) |c| total += c;
+                return total;
+            }
         };
 
-        const LinkedArrayListBlockInfo = struct {
-            block: [SLOT_COUNT]LinkedArrayListSlot,
-            i: u4,
-            parent_slot: LinkedArrayListSlot,
+        const BTreeInsertResult = struct {
+            node_ptr: u64,
+            count: u64,
+            // file position of the newly inserted element's value slot, so the
+            // caller can write the value into it
+            value_position: u64,
+            // set when this node overflowed and split off a new right sibling
+            split: ?struct { node_ptr: u64, count: u64 },
         };
 
         const HashMapSlotKind = enum {
@@ -671,55 +692,39 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     const position = slot_ptr.position orelse return error.CursorNotWriteable;
 
+                    var writer = self.core.writer();
+
                     switch (slot_ptr.slot.tag) {
                         .none => {
-                            // if slot was empty, insert the new list
-                            var writer = self.core.writer();
-                            const array_list_start = try self.core.length();
-                            const array_list_ptr = array_list_start + byteSizeOf(LinkedArrayListHeader);
-                            try writer.seekTo(array_list_start);
-                            try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(LinkedArrayListHeader{
-                                .shift = 0,
-                                .ptr = array_list_ptr,
-                                .size = 0,
-                            }), .big);
-                            const array_list_index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                            try writer.interface.writeAll(&array_list_index_block);
-                            // make slot point to new list
-                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = array_list_start, .tag = .linked_array_list } };
+                            // create an empty tree: a single empty leaf plus a header
+                            const root_ptr = try self.writeBTreeNode(.{ .kind = .leaf, .num = 0 });
+                            const header_ptr = try self.core.length();
+                            try writer.seekTo(header_ptr);
+                            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = root_ptr, .size = 0 }), .big);
+                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = .linked_array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
                             return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
                         },
                         .linked_array_list => {
-                            var reader = self.core.reader();
-                            var writer = self.core.writer();
-
-                            var array_list_start = slot_ptr.slot.value;
-
-                            // copy it to the end unless it was made in this transaction
+                            var header_ptr = slot_ptr.slot.value;
+                            // copy the header into this transaction unless it was made in it,
+                            // so past moments still pointing at the old header are unaffected.
+                            // b-tree nodes are always appended, so only the header (updated in
+                            // place by later operations in this tx) needs copying.
                             if (self.tx_start) |tx_start| {
-                                if (array_list_start < tx_start) {
-                                    // read existing block
-                                    try reader.seekTo(array_list_start);
-                                    var header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
-                                    try reader.seekTo(header.ptr);
-                                    var array_list_index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                                    try reader.interface.readSliceAll(&array_list_index_block);
-                                    // copy to the end
-                                    array_list_start = try self.core.length();
-                                    const next_array_list_ptr = array_list_start + byteSizeOf(LinkedArrayListHeader);
-                                    header.ptr = next_array_list_ptr;
-                                    try writer.seekTo(array_list_start);
-                                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(header), .big);
-                                    try writer.interface.writeAll(&array_list_index_block);
+                                if (header_ptr < tx_start) {
+                                    var reader = self.core.reader();
+                                    try reader.seekTo(header_ptr);
+                                    const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
+                                    header_ptr = try self.core.length();
+                                    try writer.seekTo(header_ptr);
+                                    try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
                                 }
                             } else if (self.header.tag == .array_list) {
                                 return error.ExpectedTxStart;
                             }
-
-                            // make slot point to list
-                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = array_list_start, .tag = .linked_array_list } };
+                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = .linked_array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
                             return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
@@ -734,41 +739,54 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         else => return error.UnexpectedTag,
                     }
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    try reader.seekTo(slot_ptr.slot.value);
-                    const header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
                     if (index >= header.size or index < -@as(i65, header.size)) {
                         return error.KeyNotFound;
                     }
-
-                    const key: u64 = if (index < 0)
+                    const rank: u64 = if (index < 0)
                         @intCast(header.size - @abs(index))
                     else
                         @intCast(index);
-                    const final_slot_ptr = try self.readLinkedArrayListSlot(header.ptr, key, header.shift, write_mode, is_top_level);
 
-                    return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr.slot_ptr);
+                    if (write_mode == .read_only) {
+                        const final_slot_ptr = try self.readBTreeSlot(header.root_ptr, rank);
+                        return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr);
+                    } else {
+                        // path-copy down to the value slot so the write is persistent
+                        const write_slot = try self.btreeGetForWrite(header.root_ptr, rank);
+                        const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = write_slot.value_position, .slot = write_slot.slot });
+                        // the header only needs rewriting if the root actually moved
+                        // (it stays put when the whole path was already this-transaction)
+                        if (write_slot.node_ptr != header.root_ptr) {
+                            var writer = self.core.writer();
+                            try writer.seekTo(header_ptr);
+                            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = write_slot.node_ptr, .size = header.size }), .big);
+                        }
+                        return final_slot_ptr;
+                    }
                 },
                 .linked_array_list_append => {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
 
                     if (slot_ptr.slot.tag != .linked_array_list) return error.UnexpectedTag;
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    const next_array_list_start = slot_ptr.slot.value;
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // read header
-                    try reader.seekTo(next_array_list_start);
-                    const orig_header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+                    const result = try self.btreeInsert(header.root_ptr, header.size);
+                    const new_root_ptr = try self.btreeGrowRoot(result);
 
-                    // append
-                    const append_result = try self.readLinkedArrayListSlotAppend(orig_header, write_mode, is_top_level);
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], append_result.slot_ptr.slot_ptr);
+                    // fill in the value via the rest of the path
+                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
 
-                    // update header
                     var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(append_result.header), .big);
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
                     return final_slot_ptr;
                 },
@@ -777,21 +795,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (slot_ptr.slot.tag != .linked_array_list) return error.UnexpectedTag;
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    const next_array_list_start = slot_ptr.slot.value;
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // read header
-                    try reader.seekTo(next_array_list_start);
-                    const orig_header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+                    // bounds-checked without overflow (offset + size could wrap)
+                    if (linked_array_list_slice.offset > header.size or
+                        linked_array_list_slice.size > header.size - linked_array_list_slice.offset)
+                    {
+                        return error.KeyNotFound;
+                    }
 
-                    // slice
-                    const slice_header = try self.readLinkedArrayListSlice(orig_header, linked_array_list_slice.offset, linked_array_list_slice.size);
+                    // slice = drop [0, offset) then keep [0, size) of what's left
+                    const after_offset = try self.btreeSplit(header.root_ptr, linked_array_list_slice.offset);
+                    const sliced = try self.btreeSplit(after_offset.right, linked_array_list_slice.size);
+                    const new_root_ptr = sliced.left;
                     const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
-                    // update header
                     var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(slice_header), .big);
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = linked_array_list_slice.size }), .big);
 
                     return final_slot_ptr;
                 },
@@ -802,23 +826,24 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (linked_array_list_concat.list.tag != .linked_array_list) return error.UnexpectedTag;
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    const next_array_list_start = slot_ptr.slot.value;
-
-                    // read headers
-                    try reader.seekTo(next_array_list_start);
-                    const header_a: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+                    try reader.seekTo(header_ptr);
+                    const header_a: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
                     try reader.seekTo(linked_array_list_concat.list.value);
-                    const header_b: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+                    const header_b: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // concat
-                    const concat_header = try self.readLinkedArrayListConcat(header_a, header_b);
+                    // the join result shares subtrees with both operands (and the
+                    // second operand stays live), so freeze everything created so far:
+                    // later in-place mutations will then copy those nodes instead of
+                    // overwriting a node that is still referenced elsewhere.
+                    self.tx_start = try self.core.length();
+                    const new_root_ptr = try self.btreeJoin(header_a.root_ptr, header_b.root_ptr);
                     const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
-                    // update header
                     var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(concat_header), .big);
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header_a.size + header_b.size }), .big);
 
                     return final_slot_ptr;
                 },
@@ -827,42 +852,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (slot_ptr.slot.tag != .linked_array_list) return error.UnexpectedTag;
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    const next_array_list_start = slot_ptr.slot.value;
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // read header
-                    try reader.seekTo(next_array_list_start);
-                    const orig_header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
-
-                    // get the key
-                    if (index >= orig_header.size or index < -@as(i65, orig_header.size)) {
+                    if (index >= header.size or index < -@as(i65, header.size)) {
                         return error.KeyNotFound;
                     }
-                    const key: u64 = if (index < 0)
-                        @intCast(orig_header.size - @abs(index))
+                    const rank: u64 = if (index < 0)
+                        @intCast(header.size - @abs(index))
                     else
                         @intCast(index);
 
-                    // split up the list
-                    const header_a = try self.readLinkedArrayListSlice(orig_header, 0, key);
-                    const header_b = try self.readLinkedArrayListSlice(orig_header, key, orig_header.size - key);
+                    const result = try self.btreeInsert(header.root_ptr, rank);
+                    const new_root_ptr = try self.btreeGrowRoot(result);
 
-                    // add new slot to first list
-                    const append_result = try self.readLinkedArrayListSlotAppend(header_a, write_mode, is_top_level);
+                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
 
-                    // concat the lists
-                    const concat_header = try self.readLinkedArrayListConcat(append_result.header, header_b);
-
-                    // get pointer to the new slot
-                    const next_slot_ptr = try self.readLinkedArrayListSlot(concat_header.ptr, key, concat_header.shift, .read_only, is_top_level);
-
-                    // recur down the rest of the path
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr.slot_ptr);
-
-                    // update header
                     var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(concat_header), .big);
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
                     return final_slot_ptr;
                 },
@@ -871,39 +881,28 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (slot_ptr.slot.tag != .linked_array_list) return error.UnexpectedTag;
 
+                    const header_ptr = slot_ptr.slot.value;
                     var reader = self.core.reader();
-                    const next_array_list_start = slot_ptr.slot.value;
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // read header
-                    try reader.seekTo(next_array_list_start);
-                    const orig_header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
-
-                    // get the key
-                    if (index >= orig_header.size or index < -@as(i65, orig_header.size)) {
+                    if (index >= header.size or index < -@as(i65, header.size)) {
                         return error.KeyNotFound;
                     }
-                    const key: u64 = if (index < 0)
-                        @intCast(orig_header.size - @abs(index))
+                    const rank: u64 = if (index < 0)
+                        @intCast(header.size - @abs(index))
                     else
                         @intCast(index);
 
-                    // split up the list
-                    const header_a = try self.readLinkedArrayListSlice(orig_header, 0, key);
-                    const header_b = try self.readLinkedArrayListSlice(orig_header, key + 1, orig_header.size - (key + 1));
+                    // remove = join the parts before and after the removed element
+                    const before = try self.btreeSplit(header.root_ptr, rank);
+                    const after = try self.btreeSplit(before.right, 1);
+                    const new_root_ptr = try self.btreeJoin(before.left, after.right);
+                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
-                    // concat the lists
-                    const concat_header = try self.readLinkedArrayListConcat(header_a, header_b);
-
-                    // get pointer to the list
-                    const next_slot_ptr = SlotPointer{ .position = concat_header.ptr, .slot = .{ .value = next_array_list_start, .tag = .linked_array_list } };
-
-                    // recur down the rest of the path
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
-
-                    // update header
                     var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(concat_header), .big);
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size - 1 }), .big);
 
                     return final_slot_ptr;
                 },
@@ -1530,590 +1529,475 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        // linked_array_list
+        // b-tree
 
-        const LinkedArrayListAppendResult = struct {
-            header: LinkedArrayListHeader,
-            slot_ptr: LinkedArrayListSlotPointer,
+        fn readBTreeNode(self: *Database(db_kind, HashInt), ptr: u64) !BTreeNode {
+            var reader = self.core.reader();
+            try reader.seekTo(ptr);
+            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            const num = try takeInt(&reader.interface, u8, .big);
+            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
+            var node = BTreeNode{ .kind = kind, .num = num };
+            switch (kind) {
+                .leaf => {
+                    for (&node.values) |*s| {
+                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try s.tag.validate();
+                    }
+                },
+                .branch => {
+                    for (&node.children) |*s| {
+                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try s.tag.validate();
+                    }
+                    for (&node.counts) |*c| {
+                        c.* = try takeInt(&reader.interface, u64, .big);
+                    }
+                },
+            }
+            return node;
+        }
+
+        // always appends the node as a fresh block and returns its position.
+        // b-tree mutations are persistent: every node on the path from the root
+        // is rewritten, while untouched subtrees are shared by pointer.
+        fn writeBTreeNodeAt(self: *Database(db_kind, HashInt), node: BTreeNode, ptr: u64) !void {
+            var writer = self.core.writer();
+            try writer.seekTo(ptr);
+            try writer.interface.writeInt(u8, @intFromEnum(node.kind), .big);
+            try writer.interface.writeInt(u8, node.num, .big);
+            switch (node.kind) {
+                .leaf => {
+                    for (node.values) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                },
+                .branch => {
+                    for (node.children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.counts) |c| try writer.interface.writeInt(u64, c, .big);
+                },
+            }
+        }
+
+        // appends `node` as a fresh block and returns its position.
+        fn writeBTreeNode(self: *Database(db_kind, HashInt), node: BTreeNode) !u64 {
+            const ptr = try self.core.length();
+            try self.writeBTreeNodeAt(node, ptr);
+            return ptr;
+        }
+
+        // a node is safe to mutate in place when it was created in the current
+        // transaction (offset >= tx_start), since no committed moment and no
+        // pre-`concat` sharing can reference it. `concat` advances tx_start (an
+        // implicit freeze) precisely so its shared subtrees fall below it here.
+        // for an ephemeral (non-array-list) top level there is no transaction, so
+        // everything is mutable in place until a `concat` first sets tx_start.
+        fn btreeReusable(self: *Database(db_kind, HashInt), ptr: u64) bool {
+            if (self.tx_start) |tx_start| return ptr >= tx_start;
+            return self.header.tag != .array_list;
+        }
+
+        // write a new version of a node, reusing `old_ptr`'s position in place if
+        // that node belongs to this transaction, otherwise appending a copy
+        fn btreeWriteNode(self: *Database(db_kind, HashInt), node: BTreeNode, old_ptr: u64) !u64 {
+            if (self.btreeReusable(old_ptr)) {
+                try self.writeBTreeNodeAt(node, old_ptr);
+                return old_ptr;
+            }
+            return try self.writeBTreeNode(node);
+        }
+
+        // descend to the value slot at the given rank (0-based), returning a
+        // pointer to it (its file position and current slot).
+        fn readBTreeSlot(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) !SlotPointer {
+            var node_ptr = root_ptr;
+            var rem = rank;
+            while (true) {
+                const node = try self.readBTreeNode(node_ptr);
+                switch (node.kind) {
+                    .leaf => {
+                        const position = node_ptr + BTREE_NODE_HEADER_SIZE + rem * byteSizeOf(Slot);
+                        return .{ .position = position, .slot = node.values[@intCast(rem)] };
+                    },
+                    .branch => {
+                        var i: u8 = 0;
+                        while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                            rem -= node.counts[i];
+                        }
+                        node_ptr = node.children[i].value;
+                    },
+                }
+            }
+        }
+
+        // insert a placeholder slot at `rank` within the subtree at node_ptr,
+        // writing new nodes along the path. the caller fills in the value at the
+        // returned `value_position`.
+        fn btreeInsert(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeInsertResult {
+            const node = try self.readBTreeNode(node_ptr);
+            switch (node.kind) {
+                .leaf => {
+                    // build the entries with a placeholder spliced in at `rank`.
+                    // the placeholder is a `.none` slot marked `full` so that, if the
+                    // caller never writes a value (e.g. appendCursor), iteration still
+                    // counts it as an element rather than skipping it as padding.
+                    var vals = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    const r: usize = @intCast(rank);
+                    @memcpy(vals[0..r], node.values[0..r]);
+                    vals[r] = .{ .full = true };
+                    @memcpy(vals[r + 1 .. node.num + 1], node.values[r..node.num]);
+                    const total: usize = node.num + 1;
+
+                    if (total <= BTREE_SLOT_COUNT) {
+                        var leaf = BTreeNode{ .kind = .leaf, .num = @intCast(total) };
+                        @memcpy(leaf.values[0..total], vals[0..total]);
+                        const ptr = try self.btreeWriteNode(leaf, node_ptr);
+                        return .{
+                            .node_ptr = ptr,
+                            .count = total,
+                            .value_position = ptr + BTREE_NODE_HEADER_SIZE + r * byteSizeOf(Slot),
+                            .split = null,
+                        };
+                    }
+
+                    // overflow: split into two leaves (reuse this node for the left half)
+                    const left_n = BTREE_SPLIT_COUNT;
+                    const right_n = total - left_n;
+                    var left = BTreeNode{ .kind = .leaf, .num = @intCast(left_n) };
+                    @memcpy(left.values[0..left_n], vals[0..left_n]);
+                    var right = BTreeNode{ .kind = .leaf, .num = @intCast(right_n) };
+                    @memcpy(right.values[0..right_n], vals[left_n..total]);
+                    const left_ptr = try self.btreeWriteNode(left, node_ptr);
+                    const right_ptr = try self.writeBTreeNode(right);
+                    const value_position = if (r < left_n)
+                        left_ptr + BTREE_NODE_HEADER_SIZE + r * byteSizeOf(Slot)
+                    else
+                        right_ptr + BTREE_NODE_HEADER_SIZE + (r - left_n) * byteSizeOf(Slot);
+                    return .{
+                        .node_ptr = left_ptr,
+                        .count = left_n,
+                        .value_position = value_position,
+                        .split = .{ .node_ptr = right_ptr, .count = right_n },
+                    };
+                },
+                .branch => {
+                    // pick the child that contains `rank`
+                    var i: u8 = 0;
+                    var rem = rank;
+                    while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
+                        rem -= node.counts[i];
+                    }
+                    const child = try self.btreeInsert(node.children[i].value, rem);
+
+                    // rebuild this branch with the (possibly split) child
+                    var children = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    var counts = [_]u64{0} ** (BTREE_SLOT_COUNT + 1);
+                    @memcpy(children[0..node.num], node.children[0..node.num]);
+                    @memcpy(counts[0..node.num], node.counts[0..node.num]);
+                    children[i] = .{ .value = child.node_ptr, .tag = .index };
+                    counts[i] = child.count;
+                    var total: usize = node.num;
+                    if (child.split) |split| {
+                        var j: usize = node.num;
+                        while (j > i + 1) : (j -= 1) {
+                            children[j] = children[j - 1];
+                            counts[j] = counts[j - 1];
+                        }
+                        children[i + 1] = .{ .value = split.node_ptr, .tag = .index };
+                        counts[i + 1] = split.count;
+                        total = node.num + 1;
+                    }
+
+                    if (total <= BTREE_SLOT_COUNT) {
+                        var branch = BTreeNode{ .kind = .branch, .num = @intCast(total) };
+                        @memcpy(branch.children[0..total], children[0..total]);
+                        @memcpy(branch.counts[0..total], counts[0..total]);
+                        const ptr = try self.btreeWriteNode(branch, node_ptr);
+                        return .{
+                            .node_ptr = ptr,
+                            .count = branch.subtreeCount(),
+                            .value_position = child.value_position,
+                            .split = null,
+                        };
+                    }
+
+                    // overflow: split into two branches (reuse this node for the left half)
+                    const left_n = BTREE_SPLIT_COUNT;
+                    const right_n = total - left_n;
+                    var left = BTreeNode{ .kind = .branch, .num = @intCast(left_n) };
+                    @memcpy(left.children[0..left_n], children[0..left_n]);
+                    @memcpy(left.counts[0..left_n], counts[0..left_n]);
+                    var right = BTreeNode{ .kind = .branch, .num = @intCast(right_n) };
+                    @memcpy(right.children[0..right_n], children[left_n..total]);
+                    @memcpy(right.counts[0..right_n], counts[left_n..total]);
+                    const left_ptr = try self.btreeWriteNode(left, node_ptr);
+                    const right_ptr = try self.writeBTreeNode(right);
+                    return .{
+                        .node_ptr = left_ptr,
+                        .count = left.subtreeCount(),
+                        .value_position = child.value_position,
+                        .split = .{ .node_ptr = right_ptr, .count = right.subtreeCount() },
+                    };
+                },
+            }
+        }
+
+        // create a new, empty tree (a single empty leaf) and return its root pointer
+        fn btreeNewRoot(self: *Database(db_kind, HashInt)) !u64 {
+            return try self.writeBTreeNode(.{ .kind = .leaf, .num = 0 });
+        }
+
+        // turn an insert result into a root pointer, growing the tree a level if
+        // the old root split (shares the root-building logic with btreeMakeRoot)
+        fn btreeGrowRoot(self: *Database(db_kind, HashInt), result: BTreeInsertResult) !u64 {
+            return try self.btreeMakeRoot(.{
+                .node_ptr = result.node_ptr,
+                .count = result.count,
+                .split = if (result.split) |split| .{ .node_ptr = split.node_ptr, .count = split.count } else null,
+            });
+        }
+
+        const BTreeWriteSlot = struct {
+            node_ptr: u64,
+            value_position: u64,
+            slot: Slot,
         };
 
-        fn readLinkedArrayListSlotAppend(self: *Database(db_kind, HashInt), header: LinkedArrayListHeader, comptime write_mode: WriteMode, is_top_level: bool) !LinkedArrayListAppendResult {
-            var writer = self.core.writer();
-
-            var ptr = header.ptr;
-            const key = header.size;
-            var shift = header.shift;
-
-            var slot_ptr = self.readLinkedArrayListSlot(ptr, key, shift, write_mode, is_top_level) catch |err| switch (err) {
-                error.NoAvailableSlots => blk: {
-                    // root overflow
-                    const next_ptr = try self.core.length();
-                    var index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                    try writer.seekTo(next_ptr);
-                    try writer.interface.writeAll(&index_block);
-                    try writer.seekTo(next_ptr);
-                    try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(LinkedArrayListSlot{
-                        .slot = .{ .value = ptr, .tag = .index, .full = true },
-                        .size = header.size,
-                    }), .big);
-                    ptr = next_ptr;
-                    shift += 1;
-                    break :blk try self.readLinkedArrayListSlot(ptr, key, shift, write_mode, is_top_level);
+        // descend to the value slot at `rank` for writing, copy-on-writing only the
+        // nodes that belong to a past transaction. the element count is unchanged,
+        // so when the whole path is already this-transaction nothing is rewritten
+        // and the caller writes straight into the existing leaf.
+        fn btreeGetForWrite(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeWriteSlot {
+            const node = try self.readBTreeNode(node_ptr);
+            switch (node.kind) {
+                .leaf => {
+                    const new_ptr = if (self.btreeReusable(node_ptr)) node_ptr else try self.writeBTreeNode(node);
+                    return .{
+                        .node_ptr = new_ptr,
+                        .value_position = new_ptr + BTREE_NODE_HEADER_SIZE + rank * byteSizeOf(Slot),
+                        .slot = node.values[@intCast(rank)],
+                    };
                 },
-                else => |e| return e,
-            };
-
-            // newly-appended slots must have full set to true
-            // or else the indexing will be screwed up
-            const new_slot = Slot{ .value = 0, .tag = .none, .full = true };
-            slot_ptr.slot_ptr.slot = new_slot;
-            const position = slot_ptr.slot_ptr.position orelse return error.CursorNotWriteable;
-            try writer.seekTo(position);
-            try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(LinkedArrayListSlot{ .slot = new_slot, .size = 0 }), .big);
-            if (header.size < SLOT_COUNT and shift > 0) {
-                return error.MustSetNewSlotsToFull;
-            }
-
-            return .{
-                .header = .{
-                    .shift = shift,
-                    .ptr = ptr,
-                    .size = header.size + 1,
-                },
-                .slot_ptr = slot_ptr,
-            };
-        }
-
-        fn blockLeafCount(block: []LinkedArrayListSlot, shift: u6, i: u4) u64 {
-            var n: u64 = 0;
-            // for leaf nodes, count all non-empty slots along with the slot being accessed
-            if (shift == 0) {
-                for (block, 0..) |block_slot, block_i| {
-                    if (!block_slot.slot.empty() or block_i == i) {
-                        n += 1;
+                .branch => {
+                    var i: u8 = 0;
+                    var rem = rank;
+                    while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                        rem -= node.counts[i];
                     }
-                }
-            }
-            // for non-leaf nodes, add up their sizes
-            else {
-                for (block) |block_slot| {
-                    n += block_slot.size;
-                }
-            }
-            return n;
-        }
-
-        fn slotLeafCount(slot: LinkedArrayListSlot, shift: u6) u64 {
-            if (shift == 0) {
-                if (slot.slot.empty()) {
-                    return 0;
-                } else {
-                    return 1;
-                }
-            } else {
-                return slot.size;
+                    const child = try self.btreeGetForWrite(node.children[i].value, rem);
+                    // if the child stayed put, this branch is unchanged too
+                    if (child.node_ptr == node.children[i].value) {
+                        return .{ .node_ptr = node_ptr, .value_position = child.value_position, .slot = child.slot };
+                    }
+                    var new_node = node;
+                    new_node.children[i] = .{ .value = child.node_ptr, .tag = .index };
+                    const new_ptr = try self.btreeWriteNode(new_node, node_ptr);
+                    return .{ .node_ptr = new_ptr, .value_position = child.value_position, .slot = child.slot };
+                },
             }
         }
 
-        fn keyAndIndexForLinkedArrayList(slot_block: []LinkedArrayListSlot, key: u64, shift: u6) ?struct { key: u64, index: u4 } {
-            var next_key = key;
-            var i: u4 = 0;
-            const max_leaf_count: u64 = if (shift == 0) 1 else std.math.pow(u64, SLOT_COUNT, shift);
+        // join (concat): a true O(log n), structure-sharing concatenation of two
+        // trees where every element of `a` precedes every element of `b`. unlike
+        // the rebuild helpers above, untouched subtrees are shared by pointer, so
+        // concatenating a list with itself stays cheap.
+
+        const BTreeJoinResult = struct {
+            node_ptr: u64,
+            count: u64,
+            // set if assembling overflowed and produced a right sibling
+            split: ?struct { node_ptr: u64, count: u64 },
+        };
+
+        // height of a tree = number of branch levels above the leaves
+        fn btreeHeight(self: *Database(db_kind, HashInt), root_ptr: u64) !u8 {
+            var ptr = root_ptr;
+            var height: u8 = 0;
             while (true) {
-                const slot_leaf_count = slotLeafCount(slot_block[i], shift);
-                if (next_key == slot_leaf_count) {
-                    // if the slot's leaf count is at its maximum
-                    // or it is full, we have to skip to the next slot
-                    if (slot_leaf_count == max_leaf_count or slot_block[i].slot.full) {
-                        if (i < SLOT_COUNT - 1) {
-                            next_key -= slot_leaf_count;
-                            i += 1;
-                        } else {
-                            return null;
-                        }
-                    }
-                    break;
-                } else if (next_key < slot_leaf_count) {
-                    break;
-                } else if (i < SLOT_COUNT - 1) {
-                    next_key -= slot_leaf_count;
-                    i += 1;
-                } else {
-                    return null;
-                }
-            }
-            return .{ .key = next_key, .index = i };
-        }
-
-        fn readLinkedArrayListSlot(self: *Database(db_kind, HashInt), index_pos: u64, key: u64, shift: u6, comptime write_mode: WriteMode, is_top_level: bool) !LinkedArrayListSlotPointer {
-            if (shift >= MAX_BRANCH_LENGTH) return error.MaxShiftExceeded;
-
-            var reader = self.core.reader();
-            var writer = self.core.writer();
-
-            var slot_block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-            {
-                try reader.seekTo(index_pos);
-                var index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                try reader.interface.readSliceAll(&index_block);
-
-                var block_reader = std.Io.Reader.fixed(&index_block);
-                for (&slot_block) |*block_slot| {
-                    block_slot.* = @bitCast(try takeInt(&block_reader, LinkedArrayListSlotInt, .big));
-                    try block_slot.slot.tag.validate();
-                }
-            }
-
-            const key_and_index = keyAndIndexForLinkedArrayList(&slot_block, key, shift) orelse return error.NoAvailableSlots;
-            const next_key = key_and_index.key;
-            const i = key_and_index.index;
-            const slot = slot_block[i];
-            const slot_pos = index_pos + (byteSizeOf(LinkedArrayListSlot) * i);
-
-            if (shift == 0) {
-                const leaf_count = blockLeafCount(&slot_block, shift, i);
-                return .{ .slot_ptr = .{ .position = slot_pos, .slot = slot.slot }, .leaf_count = leaf_count };
-            }
-
-            const ptr = slot.slot.value;
-
-            switch (slot.slot.tag) {
-                .none => {
-                    switch (write_mode) {
-                        .read_only => return error.KeyNotFound,
-                        .read_write => {
-                            const next_index_pos = try self.core.length();
-                            var index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                            try writer.seekTo(next_index_pos);
-                            try writer.interface.writeAll(&index_block);
-
-                            const next_slot_ptr = try self.readLinkedArrayListSlot(next_index_pos, next_key, shift - 1, write_mode, is_top_level);
-
-                            slot_block[i].size = next_slot_ptr.leaf_count;
-                            const leaf_count = blockLeafCount(&slot_block, shift, i);
-
-                            try writer.seekTo(slot_pos);
-                            try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(LinkedArrayListSlot{ .slot = .{ .value = next_index_pos, .tag = .index }, .size = next_slot_ptr.leaf_count }), .big);
-                            return .{ .slot_ptr = next_slot_ptr.slot_ptr, .leaf_count = leaf_count };
-                        },
-                    }
-                },
-                .index => {
-                    var next_ptr = ptr;
-                    if (write_mode == .read_write and !is_top_level) {
-                        if (self.tx_start) |tx_start| {
-                            if (next_ptr < tx_start) {
-                                // read existing block
-                                try reader.seekTo(ptr);
-                                var index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                                try reader.interface.readSliceAll(&index_block);
-                                // copy it to the end
-                                next_ptr = try self.core.length();
-                                try writer.seekTo(next_ptr);
-                                try writer.interface.writeAll(&index_block);
-                            }
-                        } else if (self.header.tag == .array_list) {
-                            return error.ExpectedTxStart;
-                        }
-                    }
-
-                    const next_slot_ptr = try self.readLinkedArrayListSlot(next_ptr, next_key, shift - 1, write_mode, is_top_level);
-
-                    slot_block[i].size = next_slot_ptr.leaf_count;
-                    const leaf_count = blockLeafCount(&slot_block, shift, i);
-
-                    if (write_mode == .read_write and !is_top_level) {
-                        // make slot point to block
-                        try writer.seekTo(slot_pos);
-                        try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(LinkedArrayListSlot{ .slot = .{ .value = next_ptr, .tag = .index }, .size = next_slot_ptr.leaf_count }), .big);
-                    }
-
-                    return .{ .slot_ptr = next_slot_ptr.slot_ptr, .leaf_count = leaf_count };
-                },
-                else => return error.UnexpectedTag,
+                const node = try self.readBTreeNode(ptr);
+                if (node.kind == .leaf) return height;
+                height += 1;
+                ptr = node.children[0].value;
             }
         }
 
-        fn readLinkedArrayListBlocks(self: *Database(db_kind, HashInt), index_pos: u64, key: u64, shift: u6, blocks: *BoundedArray(LinkedArrayListBlockInfo, MAX_BRANCH_LENGTH)) !void {
-            var reader = self.core.reader();
-
-            var slot_block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-            {
-                try reader.seekTo(index_pos);
-                var index_block = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-                try reader.interface.readSliceAll(&index_block);
-
-                var block_reader = std.Io.Reader.fixed(&index_block);
-                for (&slot_block) |*block_slot| {
-                    block_slot.* = @bitCast(try takeInt(&block_reader, LinkedArrayListSlotInt, .big));
-                    try block_slot.slot.tag.validate();
-                }
+        fn btreeMakeRoot(self: *Database(db_kind, HashInt), result: BTreeJoinResult) !u64 {
+            if (result.split) |split| {
+                var root = BTreeNode{ .kind = .branch, .num = 2 };
+                root.children[0] = .{ .value = result.node_ptr, .tag = .index };
+                root.children[1] = .{ .value = split.node_ptr, .tag = .index };
+                root.counts[0] = result.count;
+                root.counts[1] = split.count;
+                return try self.writeBTreeNode(root);
             }
-
-            const key_and_index = keyAndIndexForLinkedArrayList(&slot_block, key, shift) orelse return error.NoAvailableSlots;
-            const next_key = key_and_index.key;
-            const i = key_and_index.index;
-            const leaf_count = blockLeafCount(&slot_block, shift, i);
-
-            try blocks.append(.{ .block = slot_block, .i = i, .parent_slot = .{ .slot = .{ .value = index_pos, .tag = .index }, .size = leaf_count } });
-
-            if (shift == 0) {
-                return;
-            }
-
-            const slot = slot_block[i];
-            switch (slot.slot.tag) {
-                .none => return error.EmptySlot,
-                .index => {
-                    try self.readLinkedArrayListBlocks(slot.slot.value, next_key, shift - 1, blocks);
-                },
-                else => return error.UnexpectedTag,
-            }
+            return result.node_ptr;
         }
 
-        fn readLinkedArrayListSlice(self: *Database(db_kind, HashInt), header: LinkedArrayListHeader, offset: u64, size: u64) !LinkedArrayListHeader {
-            var core_writer = self.core.writer();
-
-            if (offset + size > header.size) {
-                return error.KeyNotFound;
+        // write `vals` as one leaf, or split into two balanced leaves if it
+        // exceeds the node capacity
+        fn btreeAssembleLeaf(self: *Database(db_kind, HashInt), vals: []const Slot) !BTreeJoinResult {
+            const total = vals.len;
+            if (total <= BTREE_SLOT_COUNT) {
+                var leaf = BTreeNode{ .kind = .leaf, .num = @intCast(total) };
+                @memcpy(leaf.values[0..total], vals);
+                return .{ .node_ptr = try self.writeBTreeNode(leaf), .count = total, .split = null };
             }
-
-            // read the list's left blocks
-            var left_blocks = try BoundedArray(LinkedArrayListBlockInfo, MAX_BRANCH_LENGTH).init(0);
-            try self.readLinkedArrayListBlocks(header.ptr, offset, header.shift, &left_blocks);
-
-            // read the list's right blocks
-            var right_blocks = try BoundedArray(LinkedArrayListBlockInfo, MAX_BRANCH_LENGTH).init(0);
-            const right_key = if (offset + size == 0) 0 else offset + size - 1;
-            try self.readLinkedArrayListBlocks(header.ptr, right_key, header.shift, &right_blocks);
-
-            // create the new blocks
-            const block_count = left_blocks.slice().len;
-            var next_slots = [_]?LinkedArrayListSlot{null} ** 2;
-            var next_shift: u6 = 0;
-            for (0..block_count) |i| {
-                const is_leaf_node = next_slots[0] == null;
-
-                const left_block = left_blocks.slice()[block_count - i - 1];
-                const right_block = right_blocks.slice()[block_count - i - 1];
-                const orig_block_infos = [_]LinkedArrayListBlockInfo{
-                    left_block,
-                    right_block,
-                };
-                var next_blocks: [2]?[SLOT_COUNT]LinkedArrayListSlot = .{ null, null };
-
-                if (left_block.parent_slot.slot.value == right_block.parent_slot.slot.value) {
-                    var slot_i: usize = 0;
-                    var new_root_block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-                    // left slot
-                    if (size > 0) {
-                        if (next_slots[0]) |left_slot| {
-                            new_root_block[slot_i] = left_slot;
-                        } else {
-                            new_root_block[slot_i] = left_block.block[left_block.i];
-                        }
-                        slot_i += 1;
-                    }
-                    if (size > 1) {
-                        // middle slots
-                        for (left_block.block[left_block.i + 1 .. right_block.i]) |middle_slot| {
-                            new_root_block[slot_i] = middle_slot;
-                            slot_i += 1;
-                        }
-
-                        // right slot
-                        if (next_slots[1]) |right_slot| {
-                            new_root_block[slot_i] = right_slot;
-                        } else {
-                            new_root_block[slot_i] = left_block.block[right_block.i];
-                        }
-                    }
-                    next_blocks[0] = new_root_block;
-                } else {
-                    var slot_i: usize = 0;
-                    var new_left_block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-
-                    // first slot
-                    if (next_slots[0]) |first_slot| {
-                        new_left_block[slot_i] = first_slot;
-                    } else {
-                        new_left_block[slot_i] = left_block.block[left_block.i];
-                    }
-                    slot_i += 1;
-                    // rest of slots
-                    for (left_block.block[left_block.i + 1 ..]) |next_slot| {
-                        new_left_block[slot_i] = next_slot;
-                        slot_i += 1;
-                    }
-                    next_blocks[0] = new_left_block;
-
-                    slot_i = 0;
-                    var new_right_block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-                    // first slots
-                    for (right_block.block[0..right_block.i]) |first_slot| {
-                        new_right_block[slot_i] = first_slot;
-                        slot_i += 1;
-                    }
-                    // last slot
-                    if (next_slots[1]) |last_slot| {
-                        new_right_block[slot_i] = last_slot;
-                    } else {
-                        new_right_block[slot_i] = right_block.block[right_block.i];
-                    }
-                    next_blocks[1] = new_right_block;
-
-                    next_shift += 1;
-                }
-
-                // clear the next slots
-                next_slots = .{ null, null };
-
-                const Side = enum { left, right };
-                const sides = [_]Side{ .left, .right };
-
-                // write the block(s)
-                for (&next_slots, next_blocks, orig_block_infos, sides) |*next_slot, block_maybe, orig_block_info, side| {
-                    if (block_maybe) |block| {
-                        // determine if the block changed compared to the original block
-                        var eql = true;
-                        for (block, orig_block_info.block) |block_slot, orig_slot| {
-                            if (!block_slot.slot.eql(orig_slot.slot)) {
-                                eql = false;
-                                break;
-                            }
-                        }
-                        // if there is no change, just use the original block
-                        if (eql) {
-                            next_slot.* = orig_block_info.parent_slot;
-                        }
-                        // otherwise make a new block
-                        else {
-                            const next_ptr = try self.core.length();
-                            try core_writer.seekTo(next_ptr);
-                            var leaf_count: u64 = 0;
-                            for (block) |block_slot| {
-                                try core_writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(block_slot), .big);
-                                if (is_leaf_node) {
-                                    if (!block_slot.slot.empty()) {
-                                        leaf_count += 1;
-                                    }
-                                } else {
-                                    leaf_count += block_slot.size;
-                                }
-                            }
-                            next_slot.* = LinkedArrayListSlot{
-                                .slot = switch (side) {
-                                    // only the left side needs to be set to full,
-                                    // because it can have a gap that affects indexing
-                                    .left => .{ .value = next_ptr, .tag = .index, .full = true },
-                                    .right => .{ .value = next_ptr, .tag = .index },
-                                },
-                                .size = leaf_count,
-                            };
-                        }
-                    }
-                }
-
-                // we found the root node so we can exit
-                if (next_slots[0] != null and next_slots[1] == null) {
-                    break;
-                }
-            }
-
-            const root_slot = next_slots[0] orelse return error.ExpectedRootNode;
-
+            const left_n = total / 2;
+            var left = BTreeNode{ .kind = .leaf, .num = @intCast(left_n) };
+            @memcpy(left.values[0..left_n], vals[0..left_n]);
+            var right = BTreeNode{ .kind = .leaf, .num = @intCast(total - left_n) };
+            @memcpy(right.values[0 .. total - left_n], vals[left_n..]);
             return .{
-                .shift = next_shift,
-                .ptr = root_slot.slot.value,
-                .size = size,
+                .node_ptr = try self.writeBTreeNode(left),
+                .count = left_n,
+                .split = .{ .node_ptr = try self.writeBTreeNode(right), .count = total - left_n },
             };
         }
 
-        fn readLinkedArrayListConcat(self: *Database(db_kind, HashInt), header_a: LinkedArrayListHeader, header_b: LinkedArrayListHeader) !LinkedArrayListHeader {
-            var core_writer = self.core.writer();
-
-            // read the first list's blocks
-            var blocks_a = try BoundedArray(LinkedArrayListBlockInfo, MAX_BRANCH_LENGTH).init(0);
-            const key_a = if (header_a.size == 0) 0 else header_a.size - 1;
-            try self.readLinkedArrayListBlocks(header_a.ptr, key_a, header_a.shift, &blocks_a);
-
-            // read the second list's blocks
-            var blocks_b = try BoundedArray(LinkedArrayListBlockInfo, MAX_BRANCH_LENGTH).init(0);
-            try self.readLinkedArrayListBlocks(header_b.ptr, 0, header_b.shift, &blocks_b);
-
-            // stitch the blocks together
-            var next_slots = [_]?LinkedArrayListSlot{null} ** 2;
-            var next_shift: u6 = 0;
-            for (0..@max(blocks_a.slice().len, blocks_b.slice().len)) |i| {
-                const block_infos: [2]?LinkedArrayListBlockInfo = .{
-                    if (i < blocks_a.slice().len) blocks_a.slice()[blocks_a.slice().len - 1 - i] else null,
-                    if (i < blocks_b.slice().len) blocks_b.slice()[blocks_b.slice().len - 1 - i] else null,
-                };
-                var next_blocks: [2]?[SLOT_COUNT]LinkedArrayListSlot = .{ null, null };
-                const is_leaf_node = next_slots[0] == null;
-
-                if (!is_leaf_node) {
-                    next_shift += 1;
-                }
-
-                for (block_infos, &next_blocks) |block_info_maybe, *next_block_maybe| {
-                    if (block_info_maybe) |block_info| {
-                        var block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-                        var target_i: usize = 0;
-                        for (block_info.block, 0..) |block_slot, source_i| {
-                            // skip i'th block if necessary
-                            if (!is_leaf_node and block_info.i == source_i) {
-                                continue;
-                            }
-                            // break on first empty slot
-                            else if (block_slot.slot.empty()) {
-                                break;
-                            }
-                            block[target_i] = block_slot;
-                            target_i += 1;
-                        }
-
-                        // there are no slots in this block so don't bother writing it
-                        if (target_i == 0) {
-                            continue;
-                        }
-
-                        next_block_maybe.* = block;
-                    }
-                }
-
-                var slots_to_write = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** (SLOT_COUNT * 2);
-                var slot_i: usize = 0;
-
-                // add the left block
-                if (next_blocks[0]) |block| {
-                    for (block) |block_slot| {
-                        if (block_slot.slot.empty()) {
-                            break;
-                        }
-                        slots_to_write[slot_i] = block_slot;
-                        slot_i += 1;
-                    }
-                }
-
-                // add the center block
-                for (next_slots) |slot_maybe| {
-                    if (slot_maybe) |block_slot| {
-                        slots_to_write[slot_i] = block_slot;
-                        slot_i += 1;
-                    }
-                }
-
-                // add the right block
-                if (next_blocks[1]) |block| {
-                    for (block) |block_slot| {
-                        if (block_slot.slot.empty()) {
-                            break;
-                        }
-                        slots_to_write[slot_i] = block_slot;
-                        slot_i += 1;
-                    }
-                }
-
-                // clear the next slots
-                next_slots = .{ null, null };
-
-                // put the slots to write in separate blocks
-                var blocks: [2][SLOT_COUNT]LinkedArrayListSlot = .{
-                    [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT,
-                    [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT,
-                };
-                if (slot_i > SLOT_COUNT) {
-                    // if there are enough slots to fill two blocks,
-                    // we need to decide which block to leave the gap in.
-                    // if the first list is smaller, leave the gap in
-                    // the first block. otherwise, leave it in the second.
-                    // this will cause the gap to stay near the left or
-                    // right edge of the concatenated list. we do this
-                    // because if many gaps form inside the list, the
-                    // branches will get long and lead to MaxShiftExceeded.
-                    if (header_a.size < header_b.size) {
-                        for (0..slot_i - SLOT_COUNT) |j| {
-                            blocks[0][j] = slots_to_write[j];
-                        }
-                        for (0..SLOT_COUNT) |j| {
-                            blocks[1][j] = slots_to_write[j + (slot_i - SLOT_COUNT)];
-                        }
-                    } else {
-                        for (0..SLOT_COUNT) |j| {
-                            blocks[0][j] = slots_to_write[j];
-                        }
-                        for (0..slot_i - SLOT_COUNT) |j| {
-                            blocks[1][j] = slots_to_write[j + SLOT_COUNT];
-                        }
-                    }
-                } else {
-                    for (0..slot_i) |j| {
-                        blocks[0][j] = slots_to_write[j];
-                    }
-                }
-
-                // write the block(s)
-                for (blocks, &next_slots) |block, *next_slot| {
-                    // this block is empty so don't bother writing it
-                    if (block[0].slot.empty()) {
-                        break;
-                    }
-
-                    // write the block
-                    const next_ptr = try self.core.length();
-                    try core_writer.seekTo(next_ptr);
-                    var leaf_count: u64 = 0;
-                    for (block) |block_slot| {
-                        try core_writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(block_slot), .big);
-                        if (is_leaf_node) {
-                            if (!block_slot.slot.empty()) {
-                                leaf_count += 1;
-                            }
-                        } else {
-                            leaf_count += block_slot.size;
-                        }
-                    }
-
-                    next_slot.* = LinkedArrayListSlot{ .slot = .{ .value = next_ptr, .tag = .index, .full = true }, .size = leaf_count };
-                }
+        // write `children`/`counts` as one branch, or split into two balanced branches
+        fn btreeAssembleBranch(self: *Database(db_kind, HashInt), children: []const Slot, counts: []const u64) !BTreeJoinResult {
+            const total = children.len;
+            if (total <= BTREE_SLOT_COUNT) {
+                var branch = BTreeNode{ .kind = .branch, .num = @intCast(total) };
+                @memcpy(branch.children[0..total], children);
+                @memcpy(branch.counts[0..total], counts);
+                return .{ .node_ptr = try self.writeBTreeNode(branch), .count = branch.subtreeCount(), .split = null };
             }
-
-            const root_ptr = blk: {
-                if (next_slots[0]) |first_slot| {
-                    // if there is more than one slot, make a root node
-                    if (next_slots[1]) |second_slot| {
-                        var block = [_]LinkedArrayListSlot{.{ .slot = .{}, .size = 0 }} ** SLOT_COUNT;
-                        block[0] = first_slot;
-                        block[1] = second_slot;
-
-                        // write the root node
-                        const new_ptr = core_writer.pos;
-                        for (block) |block_slot| {
-                            try core_writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(block_slot), .big);
-                        }
-
-                        if (next_shift == MAX_BRANCH_LENGTH) return error.MaxShiftExceeded;
-                        next_shift += 1;
-
-                        break :blk new_ptr;
-                    }
-                    // otherwise the first slot is the root node
-                    else {
-                        break :blk first_slot.slot.value;
-                    }
-                }
-                // lists were empty so just re-use existing empty block
-                else {
-                    break :blk header_a.ptr;
-                }
-            };
-
+            const left_n = total / 2;
+            var left = BTreeNode{ .kind = .branch, .num = @intCast(left_n) };
+            @memcpy(left.children[0..left_n], children[0..left_n]);
+            @memcpy(left.counts[0..left_n], counts[0..left_n]);
+            var right = BTreeNode{ .kind = .branch, .num = @intCast(total - left_n) };
+            @memcpy(right.children[0 .. total - left_n], children[left_n..]);
+            @memcpy(right.counts[0 .. total - left_n], counts[left_n..]);
             return .{
-                .shift = next_shift,
-                .ptr = root_ptr,
-                .size = header_a.size + header_b.size,
+                .node_ptr = try self.writeBTreeNode(left),
+                .count = left.subtreeCount(),
+                .split = .{ .node_ptr = try self.writeBTreeNode(right), .count = right.subtreeCount() },
             };
+        }
+
+        // merge two nodes of equal height (a precedes b) into one or two nodes
+        fn btreeMergeNodes(self: *Database(db_kind, HashInt), a: BTreeNode, b: BTreeNode) !BTreeJoinResult {
+            switch (a.kind) {
+                .leaf => {
+                    var vals: [2 * BTREE_SLOT_COUNT]Slot = undefined;
+                    @memcpy(vals[0..a.num], a.values[0..a.num]);
+                    @memcpy(vals[a.num .. a.num + b.num], b.values[0..b.num]);
+                    return try self.btreeAssembleLeaf(vals[0 .. a.num + b.num]);
+                },
+                .branch => {
+                    var children: [2 * BTREE_SLOT_COUNT]Slot = undefined;
+                    var counts: [2 * BTREE_SLOT_COUNT]u64 = undefined;
+                    @memcpy(children[0..a.num], a.children[0..a.num]);
+                    @memcpy(counts[0..a.num], a.counts[0..a.num]);
+                    @memcpy(children[a.num .. a.num + b.num], b.children[0..b.num]);
+                    @memcpy(counts[a.num .. a.num + b.num], b.counts[0..b.num]);
+                    return try self.btreeAssembleBranch(children[0 .. a.num + b.num], counts[0 .. a.num + b.num]);
+                },
+            }
+        }
+
+        // join b (shorter) into the rightmost spine of a (taller), at height hb
+        fn btreeJoinRight(self: *Database(db_kind, HashInt), a_ptr: u64, ha: u8, b_ptr: u64, hb: u8) anyerror!BTreeJoinResult {
+            const a = try self.readBTreeNode(a_ptr);
+            const last = a.num - 1;
+            const sub = if (ha - 1 == hb)
+                try self.btreeMergeNodes(try self.readBTreeNode(a.children[last].value), try self.readBTreeNode(b_ptr))
+            else
+                try self.btreeJoinRight(a.children[last].value, ha - 1, b_ptr, hb);
+
+            var children: [BTREE_SLOT_COUNT + 1]Slot = undefined;
+            var counts: [BTREE_SLOT_COUNT + 1]u64 = undefined;
+            @memcpy(children[0..a.num], a.children[0..a.num]);
+            @memcpy(counts[0..a.num], a.counts[0..a.num]);
+            children[last] = .{ .value = sub.node_ptr, .tag = .index };
+            counts[last] = sub.count;
+            var total: usize = a.num;
+            if (sub.split) |split| {
+                children[total] = .{ .value = split.node_ptr, .tag = .index };
+                counts[total] = split.count;
+                total += 1;
+            }
+            return try self.btreeAssembleBranch(children[0..total], counts[0..total]);
+        }
+
+        // join a (shorter) into the leftmost spine of b (taller), at height ha
+        fn btreeJoinLeft(self: *Database(db_kind, HashInt), a_ptr: u64, ha: u8, b_ptr: u64, hb: u8) anyerror!BTreeJoinResult {
+            const b = try self.readBTreeNode(b_ptr);
+            const sub = if (hb - 1 == ha)
+                try self.btreeMergeNodes(try self.readBTreeNode(a_ptr), try self.readBTreeNode(b.children[0].value))
+            else
+                try self.btreeJoinLeft(a_ptr, ha, b.children[0].value, hb - 1);
+
+            var children: [BTREE_SLOT_COUNT + 1]Slot = undefined;
+            var counts: [BTREE_SLOT_COUNT + 1]u64 = undefined;
+            children[0] = .{ .value = sub.node_ptr, .tag = .index };
+            counts[0] = sub.count;
+            var head: usize = 1;
+            if (sub.split) |split| {
+                children[1] = .{ .value = split.node_ptr, .tag = .index };
+                counts[1] = split.count;
+                head = 2;
+            }
+            @memcpy(children[head .. head + b.num - 1], b.children[1..b.num]);
+            @memcpy(counts[head .. head + b.num - 1], b.counts[1..b.num]);
+            return try self.btreeAssembleBranch(children[0 .. head + b.num - 1], counts[0 .. head + b.num - 1]);
+        }
+
+        fn btreeJoin(self: *Database(db_kind, HashInt), root_a: u64, root_b: u64) !u64 {
+            const ha = try self.btreeHeight(root_a);
+            const hb = try self.btreeHeight(root_b);
+            const result = if (ha == hb)
+                try self.btreeMergeNodes(try self.readBTreeNode(root_a), try self.readBTreeNode(root_b))
+            else if (ha > hb)
+                try self.btreeJoinRight(root_a, ha, root_b, hb)
+            else
+                try self.btreeJoinLeft(root_a, ha, root_b, hb);
+            return try self.btreeMakeRoot(result);
+        }
+
+        // split (used by slice and remove): a true O(log n), structure-sharing
+        // split of a tree into [0, rank) and [rank, size). partial nodes along the
+        // path are reassembled with join, so the result trees stay balanced.
+
+        const BTreeSplitResult = struct { left: u64, right: u64 };
+
+        // build a tree from a run of sibling children (already height-h-1 subtrees):
+        // empty -> a new empty leaf, one -> that child unwrapped, many -> a branch
+        fn btreeSubtree(self: *Database(db_kind, HashInt), children: []const Slot, counts: []const u64) !u64 {
+            if (children.len == 0) return try self.btreeNewRoot();
+            if (children.len == 1) return children[0].value;
+            // children.len <= BTREE_SLOT_COUNT here, so this never splits
+            const result = try self.btreeAssembleBranch(children, counts);
+            return result.node_ptr;
+        }
+
+        fn btreeSplit(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) anyerror!BTreeSplitResult {
+            const node = try self.readBTreeNode(root_ptr);
+            switch (node.kind) {
+                .leaf => {
+                    const r: usize = @intCast(rank);
+                    var left = BTreeNode{ .kind = .leaf, .num = @intCast(r) };
+                    @memcpy(left.values[0..r], node.values[0..r]);
+                    var right = BTreeNode{ .kind = .leaf, .num = @intCast(node.num - r) };
+                    @memcpy(right.values[0 .. node.num - r], node.values[r..node.num]);
+                    return .{ .left = try self.writeBTreeNode(left), .right = try self.writeBTreeNode(right) };
+                },
+                .branch => {
+                    var i: u8 = 0;
+                    var rem = rank;
+                    while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
+                        rem -= node.counts[i];
+                    }
+                    const child = try self.btreeSplit(node.children[i].value, rem);
+                    const left_sub = try self.btreeSubtree(node.children[0..i], node.counts[0..i]);
+                    const right_sub = try self.btreeSubtree(node.children[i + 1 .. node.num], node.counts[i + 1 .. node.num]);
+                    return .{
+                        .left = try self.btreeJoin(left_sub, child.left),
+                        .right = try self.btreeJoin(child.right, right_sub),
+                    };
+                },
+            }
         }
 
         // Cursor
@@ -2542,7 +2426,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .linked_array_list => {
                             try core_reader.seekTo(self.slot_ptr.slot.value);
-                            const header: LinkedArrayListHeader = @bitCast(try takeInt(&core_reader.interface, LinkedArrayListHeaderInt, .big));
+                            const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                             return header.size;
                         },
                         .bytes => {
@@ -2568,7 +2452,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     core: struct {
                         size: u64,
                         index: u64,
-                        stack: BoundedArray(Level, MAX_BRANCH_LENGTH),
+                        stack: BoundedArray(Level, ITERATOR_STACK_SIZE),
                     },
 
                     pub const Level = struct {
@@ -2584,7 +2468,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 .none => .{
                                     .size = 0,
                                     .index = 0,
-                                    .stack = try BoundedArray(Level, MAX_BRANCH_LENGTH).init(0),
+                                    .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0),
                                 },
                                 .array_list => blk: {
                                     const position = cursor.slot_ptr.slot.value;
@@ -2594,29 +2478,31 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     break :blk .{
                                         .size = try cursor.count(),
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.ptr, INDEX_BLOCK_SIZE),
+                                        .stack = try initStack(cursor, header.ptr),
                                     };
                                 },
                                 .linked_array_list => blk: {
+                                    // backed by a b-tree: read the header, then walk from the
+                                    // root node's value/child slots (skipping its kind+num header)
                                     const position = cursor.slot_ptr.slot.value;
                                     var core_reader = cursor.db.core.reader();
                                     try core_reader.seekTo(position);
-                                    const header: LinkedArrayListHeader = @bitCast(try takeInt(&core_reader.interface, LinkedArrayListHeaderInt, .big));
+                                    const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                                     break :blk .{
                                         .size = try cursor.count(),
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.ptr, LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE),
+                                        .stack = try initStack(cursor, header.root_ptr + BTREE_NODE_HEADER_SIZE),
                                     };
                                 },
                                 .hash_map, .hash_set => .{
                                     .size = 0,
                                     .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value, INDEX_BLOCK_SIZE),
+                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value),
                                 },
                                 .counted_hash_map, .counted_hash_set => .{
                                     .size = 0,
                                     .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64), INDEX_BLOCK_SIZE),
+                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64)),
                                 },
                                 else => return error.UnexpectedTag,
                             },
@@ -2629,47 +2515,47 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             .array_list => {
                                 if (self.core.index == self.core.size) return null;
                                 self.core.index += 1;
-                                return try self.nextInternal(INDEX_BLOCK_SIZE);
+                                return try self.nextInternal(0);
                             },
                             .linked_array_list => {
                                 if (self.core.index == self.core.size) return null;
                                 self.core.index += 1;
-                                return try self.nextInternal(LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE);
+                                // b-tree nodes have a kind+num header before their slots,
+                                // so child pointers are offset by BTREE_NODE_HEADER_SIZE
+                                return try self.nextInternal(BTREE_NODE_HEADER_SIZE);
                             },
-                            .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => return try self.nextInternal(INDEX_BLOCK_SIZE),
+                            .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => return try self.nextInternal(0),
                             else => return error.UnexpectedTag,
                         }
                     }
 
-                    fn initStack(cursor: Cursor(write_mode), position: u64, comptime block_size: u64) !BoundedArray(Level, MAX_BRANCH_LENGTH) {
-                        // find the block
+                    // read a 16-slot index block (the iterable structures all use
+                    // 9-byte slots in their index/node blocks)
+                    fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(position);
-                        // read the block
-                        var index_block_bytes = [_]u8{0} ** block_size;
+                        var index_block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
                         try core_reader.interface.readSliceAll(&index_block_bytes);
-                        // convert the block into slots
                         var index_block = [_]Slot{undefined} ** SLOT_COUNT;
-                        {
-                            var block_reader = std.Io.Reader.fixed(&index_block_bytes);
-                            for (&index_block) |*block_slot| {
-                                block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                                try block_slot.tag.validate();
-                                // linked array list has larger slots so we need to skip over the rest
-                                block_reader.toss((block_size / SLOT_COUNT) - byteSizeOf(Slot));
-                            }
+                        var block_reader = std.Io.Reader.fixed(&index_block_bytes);
+                        for (&index_block) |*block_slot| {
+                            block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                            try block_slot.tag.validate();
                         }
-                        // init the stack
-                        var stack = try BoundedArray(Level, MAX_BRANCH_LENGTH).init(0);
+                        return index_block;
+                    }
+
+                    fn initStack(cursor: Cursor(write_mode), position: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
                         try stack.append(.{
                             .position = position,
-                            .block = index_block,
+                            .block = try readSlotBlock(cursor, position),
                             .index = 0,
                         });
                         return stack;
                     }
 
-                    fn nextInternal(self: *Iter, comptime block_size: u64) !?Cursor(write_mode) {
+                    fn nextInternal(self: *Iter, comptime node_offset: u64) !?Cursor(write_mode) {
                         while (self.core.stack.slice().len > 0) {
                             const level = self.core.stack.slice()[self.core.stack.slice().len - 1];
                             if (level.index == level.block.len) {
@@ -2681,28 +2567,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             } else {
                                 const next_slot = level.block[level.index];
                                 if (next_slot.tag == .index) {
-                                    // find the block
-                                    var core_reader = self.cursor.db.core.reader();
-                                    const next_pos = next_slot.value;
-                                    try core_reader.seekTo(next_pos);
-                                    // read the block
-                                    var index_block_bytes = [_]u8{0} ** block_size;
-                                    try core_reader.interface.readSliceAll(&index_block_bytes);
-                                    // convert the block into slots
-                                    var index_block = [_]Slot{undefined} ** SLOT_COUNT;
-                                    {
-                                        var block_reader = std.Io.Reader.fixed(&index_block_bytes);
-                                        for (&index_block) |*block_slot| {
-                                            block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                                            try block_slot.tag.validate();
-                                            // linked array list has larger slots so we need to skip over the rest
-                                            block_reader.toss((block_size / SLOT_COUNT) - byteSizeOf(Slot));
-                                        }
-                                    }
-                                    // append to the stack
+                                    // node_offset skips a b-tree node's kind+num header
+                                    const next_pos = next_slot.value + node_offset;
                                     try self.core.stack.append(.{
                                         .position = next_pos,
-                                        .block = index_block,
+                                        .block = try readSlotBlock(self.cursor, next_pos),
                                         .index = 0,
                                     });
                                     continue;
@@ -3252,7 +3121,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapLinkedArrayList(source_core, target_db_kind, target_core, offset_map, slot);
+                    const new_offset = try remapBTree(source_core, target_db_kind, target_core, offset_map, slot);
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
@@ -3361,81 +3230,91 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return new_offset;
         }
 
-        fn remapLinkedArrayList(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+        fn remapBTree(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
-            // read LinkedArrayListHeader (17 bytes)
             try reader.seekTo(slot.value);
-            const header: LinkedArrayListHeader = @bitCast(try takeInt(&reader.interface, LinkedArrayListHeaderInt, .big));
+            const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-            // remap root block
-            const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_db_kind, target_core, offset_map, header.ptr);
+            const remapped_root = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
 
-            // write new header
             const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
-            try writer.interface.writeInt(LinkedArrayListHeaderInt, @bitCast(LinkedArrayListHeader{
-                .shift = header.shift,
-                .ptr = remapped_ptr,
+            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
+                .root_ptr = remapped_root,
                 .size = header.size,
             }), .big);
 
             return new_offset;
         }
 
-        fn remapLinkedArrayListBlock(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), block_offset: u64) !u64 {
-            // dedup check
-            if (offset_map.get(block_offset)) |mapped| {
+        fn remapBTreeNode(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), node_offset: u64) anyerror!u64 {
+            // dedup check (subtrees are shared by pointer)
+            if (offset_map.get(node_offset)) |mapped| {
                 return mapped;
             }
 
             var reader = source_core.reader();
             var writer = target_core.writer();
 
-            // read 272-byte block (16 x LinkedArrayListSlot of 17 bytes)
-            try reader.seekTo(block_offset);
-            var block_bytes = [_]u8{0} ** LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE;
-            try reader.interface.readSliceAll(&block_bytes);
+            // read the whole node into memory first, so the recursion below can
+            // freely create its own readers/writers
+            try reader.seekTo(node_offset);
+            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            const num = try takeInt(&reader.interface, u8, .big);
 
-            // parse slots
-            var block_reader = std.Io.Reader.fixed(&block_bytes);
-            var slots: [SLOT_COUNT]LinkedArrayListSlot = undefined;
-            for (&slots) |*s| {
-                s.* = @bitCast(try takeInt(&block_reader, LinkedArrayListSlotInt, .big));
+            switch (kind) {
+                .leaf => {
+                    var body = [_]u8{0} ** (BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    try reader.interface.readSliceAll(&body);
+                    var body_reader = std.Io.Reader.fixed(&body);
+
+                    var slots: [BTREE_SLOT_COUNT]Slot = undefined;
+                    for (&slots) |*s| {
+                        const value_slot: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, value_slot);
+                    }
+
+                    const new_offset = try target_core.length();
+                    try writer.seekTo(new_offset);
+                    try writer.interface.writeInt(u8, kind_int, .big);
+                    try writer.interface.writeInt(u8, num, .big);
+                    for (slots) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+
+                    try offset_map.put(node_offset, new_offset);
+                    return new_offset;
+                },
+                .branch => {
+                    var body = [_]u8{0} ** (BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    try reader.interface.readSliceAll(&body);
+                    var body_reader = std.Io.Reader.fixed(&body);
+
+                    var children: [BTREE_SLOT_COUNT]Slot = undefined;
+                    for (&children) |*s| {
+                        const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        if (child.tag == .index) {
+                            const remapped_ptr = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, child.value);
+                            s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
+                        } else {
+                            s.* = child;
+                        }
+                    }
+                    var counts: [BTREE_SLOT_COUNT]u64 = undefined;
+                    for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
+
+                    const new_offset = try target_core.length();
+                    try writer.seekTo(new_offset);
+                    try writer.interface.writeInt(u8, kind_int, .big);
+                    try writer.interface.writeInt(u8, num, .big);
+                    for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (counts) |c| try writer.interface.writeInt(u64, c, .big);
+
+                    try offset_map.put(node_offset, new_offset);
+                    return new_offset;
+                },
             }
-
-            // remap each slot
-            var remapped_slots: [SLOT_COUNT]LinkedArrayListSlot = undefined;
-            for (&remapped_slots, slots) |*rs, s| {
-                if (s.slot.tag == .index) {
-                    // index slots point to other 272-byte blocks, recurse on ourselves
-                    const remapped_ptr = try remapLinkedArrayListBlock(source_core, target_db_kind, target_core, offset_map, s.slot.value);
-                    rs.* = .{
-                        .size = s.size,
-                        .slot = .{ .value = remapped_ptr, .tag = .index, .full = s.slot.full },
-                    };
-                } else if (s.slot.empty()) {
-                    rs.* = s;
-                } else {
-                    // leaf slot - remap via remapSlot
-                    const remapped = try remapSlot(source_core, target_db_kind, target_core, offset_map, s.slot);
-                    rs.* = .{
-                        .size = s.size,
-                        .slot = remapped,
-                    };
-                }
-            }
-
-            // write remapped block to target
-            const new_offset = try target_core.length();
-            try writer.seekTo(new_offset);
-            for (remapped_slots) |s| {
-                try writer.interface.writeInt(LinkedArrayListSlotInt, @bitCast(s), .big);
-            }
-
-            try offset_map.put(block_offset, new_offset);
-            return new_offset;
         }
 
         fn remapHashMapOrSet(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot, counted: bool) !u64 {

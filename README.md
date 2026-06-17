@@ -144,7 +144,7 @@ In xitdb there are a variety of immutable data structures that you can nest arbi
 * `ArrayList` is a growable array
 * `LinkedArrayList` is like an `ArrayList` that can also be efficiently sliced and concatenated
 
-All data structures use the hash array mapped trie, invented by Phil Bagwell. The `LinkedArrayList` is based on his later work on RRB trees. These data structures were originally made immutable and widely available by Rich Hickey in Clojure. To my knowledge, they haven't been available in any open source database until xitdb.
+The `Hash`-based data structures and the `Arraylist` use the hash array mapped trie, invented by Phil Bagwell (originally made immutable and widely available by Rich Hickey in Clojure). The `LinkedArrayList` is based on a B-tree.
 
 There are also scalar types you can store in the above-mentioned data structures:
 
