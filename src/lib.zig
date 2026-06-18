@@ -3727,6 +3727,11 @@ const CoreBufferedFile = struct {
                 }
                 // write to the disk
                 else {
+                    // a direct disk write that overlaps the buffered region would be
+                    // clobbered by a later flush of stale buffer bytes, so flush first
+                    if (w.pos < w.parent.memory_pos + w.parent.memory.buffer.written().len and w.pos + n > w.parent.memory_pos) {
+                        w.parent.flush() catch return error.WriteFailed;
+                    }
                     var file_writer = w.parent.file.writer();
                     file_writer.seekTo(w.pos) catch return error.WriteFailed;
                     file_writer.interface.writeAll(buf) catch return error.WriteFailed;
