@@ -844,14 +844,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const result = try self.btreeInsert(header.root_ptr, header.size);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
-                    // fill in the value via the rest of the path
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
-
+                    // update the header before filling in the value, so that a failure
+                    // in the rest of the path leaves the tree and header consistent
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
-                    return final_slot_ptr;
+                    // fill in the value via the rest of the path
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
                 },
                 .linked_array_list_slice => |linked_array_list_slice| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -874,13 +874,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const after_offset = try self.btreeSplit(header.root_ptr, linked_array_list_slice.offset);
                     const sliced = try self.btreeSplit(after_offset.right, linked_array_list_slice.size);
                     const new_root_ptr = sliced.left;
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
+                    // update the header before recursing into the rest of the path, so
+                    // that a failure there leaves the tree and header consistent
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = linked_array_list_slice.size }), .big);
 
-                    return final_slot_ptr;
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
                 },
                 .linked_array_list_concat => |linked_array_list_concat| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -902,13 +903,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // overwriting a node that is still referenced elsewhere.
                     self.tx_start = try self.core.length();
                     const new_root_ptr = try self.btreeJoin(header_a.root_ptr, header_b.root_ptr);
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
+                    // update the header before recursing into the rest of the path, so
+                    // that a failure there leaves the tree and header consistent
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header_a.size + header_b.size }), .big);
 
-                    return final_slot_ptr;
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
                 },
                 .linked_array_list_insert => |index| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -931,13 +933,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const result = try self.btreeInsert(header.root_ptr, rank);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
-
+                    // update the header before filling in the value, so that a failure
+                    // in the rest of the path leaves the tree and header consistent
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
-                    return final_slot_ptr;
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
                 },
                 .linked_array_list_remove => |index| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -961,13 +963,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const before = try self.btreeSplit(header.root_ptr, rank);
                     const after = try self.btreeSplit(before.right, 1);
                     const new_root_ptr = try self.btreeJoin(before.left, after.right);
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
+                    // update the header before recursing into the rest of the path, so
+                    // that a failure there leaves the tree and header consistent
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size - 1 }), .big);
 
-                    return final_slot_ptr;
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
                 },
                 .hash_map_init => |hash_map_init| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1194,15 +1197,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     } else {
                         const result = try self.sortedPut(header.root_ptr, key);
                         const new_root_ptr = try self.sortedGrowRoot(result);
-                        const kv_pos = result.value_position - byteSizeOf(HashInt) - byteSizeOf(Slot);
-                        const target_slot = try self.sortedTargetSlot(kv_pos, target);
-                        const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
 
+                        // update the header before filling in the value, so that a
+                        // failure in the rest of the path leaves the tree and header
+                        // consistent (the entry exists with an empty value) rather
+                        // than inserted-but-uncounted
                         var writer = self.core.writer();
                         try writer.seekTo(header_ptr);
                         try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + @as(u64, if (result.added) 1 else 0) }), .big);
 
-                        return final_slot_ptr;
+                        const kv_pos = result.value_position - byteSizeOf(HashInt) - byteSizeOf(Slot);
+                        const target_slot = try self.sortedTargetSlot(kv_pos, target);
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
                     }
                 },
                 .sorted_map_get_index => |index| {

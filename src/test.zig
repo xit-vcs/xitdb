@@ -3215,6 +3215,18 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 .{ .sorted_map_get = .{ .key = "k0001" } },
                 .{ .write = .{ .bytes = "x" } },
             }));
+
+            // a write that fails after the key is inserted (a missing key written
+            // through the non-writeable key slot) must still leave the count
+            // consistent with the tree, not inserted-but-uncounted
+            const count_before_failed_write = try map.count();
+            try std.testing.expectError(error.CursorNotWriteable, map.cursor.writePath(void, &.{
+                .{ .sorted_map_get = .{ .key = "missing-key" } },
+                .{ .write = .{ .bytes = "x" } },
+            }));
+            try std.testing.expectEqual(count_before_failed_write + 1, try map.count());
+            try std.testing.expect((try map.getKeyValuePair("missing-key")) != null);
+            try std.testing.expect(try map.remove("missing-key")); // restore the map for the assertions below
         }
     };
 
