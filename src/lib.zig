@@ -63,6 +63,8 @@ pub const Tag = enum(u7) {
     hash_set,
     counted_hash_map,
     counted_hash_set,
+    sorted_map,
+    sorted_set,
 
     pub fn validate(self: Tag) !void {
         if (null == std.enums.fromInt(Tag, @intFromEnum(self))) {
@@ -263,6 +265,57 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             value,
         };
 
+        // sorted_map / sorted_set: a count-augmented B+tree keyed on arbitrary
+        // byte strings, ordered lexicographically. reuses the b-tree's capacity
+        // constants, persistence model (tx_start reuse), KeyValuePair entries, and
+        // the `BTreeHeader{root_ptr, size}` header (identical layout).
+        const SortedNodeKind = enum(u8) { leaf, branch };
+
+        // on-disk node block: [kind: u8][num: u8] followed by, for a leaf,
+        // BTREE_SLOT_COUNT .kv_pair slots (entries in ascending key order); for a
+        // branch, BTREE_SLOT_COUNT child slots (.index), then BTREE_SLOT_COUNT
+        // separator slots (a bytes/short_bytes slot = the smallest key in that
+        // child's subtree; separators[0] is an unused sentinel), then
+        // BTREE_SLOT_COUNT u64 subtree counts.
+        const SORTED_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + byteSizeOf(Slot) * BTREE_SLOT_COUNT;
+        const SORTED_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (byteSizeOf(Slot) * 2 + byteSizeOf(u64)) * BTREE_SLOT_COUNT;
+
+        const SortedNode = struct {
+            kind: SortedNodeKind,
+            num: u8,
+            entries: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // leaf
+            children: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
+            separators: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
+            counts: [BTREE_SLOT_COUNT]u64 = [_]u64{0} ** BTREE_SLOT_COUNT, // branch
+
+            fn subtreeCount(self: *const SortedNode) u64 {
+                if (self.kind == .leaf) return self.num;
+                var total: u64 = 0;
+                for (self.counts[0..self.num]) |c| total += c;
+                return total;
+            }
+        };
+
+        // insert/replace result: where to write the value, whether a new entry was
+        // added (vs replacing), and the new right sibling if this node split
+        const SortedInsertResult = struct {
+            node_ptr: u64,
+            count: u64,
+            value_position: u64,
+            added: bool,
+            split: ?struct { node_ptr: u64, count: u64, separator: Slot },
+        };
+
+        // remove result threaded back up the descent: the rewritten node and whether
+        // the key was found. separators are stable lower-bound boundaries (not exact
+        // mins), so deletions never need to refresh them; an emptied leaf is simply
+        // left in place (its slot is reclaimed by compaction), which keeps every leaf
+        // at equal depth with no rebalancing.
+        const SortedRemoveResult = struct {
+            node_ptr: u64,
+            found: bool,
+        };
+
         pub const Bytes = struct {
             value: []const u8,
             // the format tag can be any arbitrary two bytes.
@@ -321,6 +374,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     value: HashInt,
                 },
                 hash_map_remove: HashInt,
+                sorted_map_init: struct {
+                    set: bool = false,
+                },
+                sorted_map_get: union(HashMapSlotKind) {
+                    kv_pair: []const u8,
+                    key: []const u8,
+                    value: []const u8,
+                },
+                sorted_map_get_index: i65,
+                sorted_map_remove: []const u8,
                 write: WriteableData,
                 ctx: Ctx,
             };
@@ -1061,6 +1124,134 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     if (!key_found) return error.KeyNotFound;
+
+                    return slot_ptr;
+                },
+                .sorted_map_init => |opts| {
+                    if (write_mode == .read_only) return error.WriteNotAllowed;
+                    if (is_top_level) return error.InvalidTopLevelType;
+                    const position = slot_ptr.position orelse return error.CursorNotWriteable;
+                    const tag: Tag = if (opts.set) .sorted_set else .sorted_map;
+                    var writer = self.core.writer();
+                    switch (slot_ptr.slot.tag) {
+                        .none => {
+                            const root_ptr = try self.writeSortedNode(.{ .kind = .leaf, .num = 0 });
+                            const header_ptr = try self.core.length();
+                            try writer.seekTo(header_ptr);
+                            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = root_ptr, .size = 0 }), .big);
+                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = tag } };
+                            try writer.seekTo(position);
+                            try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                        },
+                        .sorted_map, .sorted_set => {
+                            if (slot_ptr.slot.tag != tag) return error.UnexpectedTag;
+                            var header_ptr = slot_ptr.slot.value;
+                            // copy the header into this transaction unless it was made in it
+                            if (self.tx_start) |tx_start| {
+                                if (header_ptr < tx_start) {
+                                    var reader = self.core.reader();
+                                    try reader.seekTo(header_ptr);
+                                    const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
+                                    header_ptr = try self.core.length();
+                                    try writer.seekTo(header_ptr);
+                                    try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
+                                }
+                            } else if (self.header.tag == .array_list) {
+                                return error.ExpectedTxStart;
+                            }
+                            const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = tag } };
+                            try writer.seekTo(position);
+                            try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                        },
+                        else => return error.UnexpectedTag,
+                    }
+                },
+                .sorted_map_get => |sorted_map_get| {
+                    switch (slot_ptr.slot.tag) {
+                        .none => return error.KeyNotFound,
+                        .sorted_map, .sorted_set => {},
+                        else => return error.UnexpectedTag,
+                    }
+
+                    const target: HashMapSlotKind = sorted_map_get;
+                    const key: []const u8 = switch (sorted_map_get) {
+                        .kv_pair => |k| k,
+                        .key => |k| k,
+                        .value => |k| k,
+                    };
+
+                    const header_ptr = slot_ptr.slot.value;
+                    var reader = self.core.reader();
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+
+                    if (write_mode == .read_only) {
+                        const found = (try self.sortedGet(header.root_ptr, key)) orelse return error.KeyNotFound;
+                        const target_slot = try self.sortedTargetSlot(found.slot.value, target);
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+                    } else {
+                        const result = try self.sortedPut(header.root_ptr, key);
+                        const new_root_ptr = try self.sortedGrowRoot(result);
+                        const kv_pos = result.value_position - byteSizeOf(HashInt) - byteSizeOf(Slot);
+                        const target_slot = try self.sortedTargetSlot(kv_pos, target);
+                        const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+
+                        var writer = self.core.writer();
+                        try writer.seekTo(header_ptr);
+                        try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + @as(u64, if (result.added) 1 else 0) }), .big);
+
+                        return final_slot_ptr;
+                    }
+                },
+                .sorted_map_get_index => |index| {
+                    if (write_mode == .read_write) return error.WriteNotAllowed;
+
+                    switch (slot_ptr.slot.tag) {
+                        .none => return error.KeyNotFound,
+                        .sorted_map, .sorted_set => {},
+                        else => return error.UnexpectedTag,
+                    }
+
+                    const header_ptr = slot_ptr.slot.value;
+                    var reader = self.core.reader();
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+
+                    if (index >= header.size or index < -@as(i65, header.size)) {
+                        return error.KeyNotFound;
+                    }
+                    const rank: u64 = if (index < 0)
+                        @intCast(header.size - @abs(index))
+                    else
+                        @intCast(index);
+
+                    const found = try self.sortedGetByIndex(header.root_ptr, rank);
+                    // return the kv_pair entry so the caller can read key and value
+                    const target_slot = SlotPointer{ .position = found.position, .slot = found.slot };
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+                },
+                .sorted_map_remove => |key| {
+                    if (write_mode == .read_only) return error.WriteNotAllowed;
+
+                    switch (slot_ptr.slot.tag) {
+                        .none => return error.KeyNotFound,
+                        .sorted_map, .sorted_set => {},
+                        else => return error.UnexpectedTag,
+                    }
+
+                    const header_ptr = slot_ptr.slot.value;
+                    var reader = self.core.reader();
+                    try reader.seekTo(header_ptr);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+
+                    const result = try self.sortedRemove(header.root_ptr, key);
+                    if (!result.found) return error.KeyNotFound;
+
+                    var writer = self.core.writer();
+                    try writer.seekTo(header_ptr);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = result.node_ptr, .size = header.size - 1 }), .big);
 
                     return slot_ptr;
                 },
@@ -2000,6 +2191,445 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
+        // sorted_map / sorted_set
+
+        fn readSortedNode(self: *Database(db_kind, HashInt), ptr: u64) !SortedNode {
+            var reader = self.core.reader();
+            try reader.seekTo(ptr);
+            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            const num = try takeInt(&reader.interface, u8, .big);
+            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
+            var node = SortedNode{ .kind = kind, .num = num };
+            switch (kind) {
+                .leaf => {
+                    for (&node.entries) |*s| {
+                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try s.tag.validate();
+                    }
+                },
+                .branch => {
+                    for (&node.children) |*s| {
+                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try s.tag.validate();
+                    }
+                    for (&node.separators) |*s| {
+                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try s.tag.validate();
+                    }
+                    for (&node.counts) |*c| {
+                        c.* = try takeInt(&reader.interface, u64, .big);
+                    }
+                },
+            }
+            return node;
+        }
+
+        fn writeSortedNodeAt(self: *Database(db_kind, HashInt), node: SortedNode, ptr: u64) !void {
+            var writer = self.core.writer();
+            try writer.seekTo(ptr);
+            try writer.interface.writeInt(u8, @intFromEnum(node.kind), .big);
+            try writer.interface.writeInt(u8, node.num, .big);
+            switch (node.kind) {
+                .leaf => {
+                    for (node.entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                },
+                .branch => {
+                    for (node.children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.counts) |c| try writer.interface.writeInt(u64, c, .big);
+                },
+            }
+        }
+
+        fn writeSortedNode(self: *Database(db_kind, HashInt), node: SortedNode) !u64 {
+            const ptr = try self.core.length();
+            try self.writeSortedNodeAt(node, ptr);
+            return ptr;
+        }
+
+        // reuse old_ptr's position in place when it belongs to this transaction
+        // (mirrors btreeWriteNode / the tx_start path-copying model)
+        fn sortedWriteNode(self: *Database(db_kind, HashInt), node: SortedNode, old_ptr: u64) !u64 {
+            if (self.btreeReusable(old_ptr)) {
+                try self.writeSortedNodeAt(node, old_ptr);
+                return old_ptr;
+            }
+            return try self.writeSortedNode(node);
+        }
+
+        fn readKvPair(self: *Database(db_kind, HashInt), kv_slot: Slot) !KeyValuePair {
+            if (kv_slot.tag != .kv_pair) return error.UnexpectedTag;
+            var reader = self.core.reader();
+            try reader.seekTo(kv_slot.value);
+            return @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
+        }
+
+        // lexicographic comparison of the byte key stored at `key_slot` (a bytes or
+        // short_bytes slot) against the in-memory `target`. streams external bytes so
+        // keys of any length work without allocation.
+        fn compareKey(self: *Database(db_kind, HashInt), key_slot: Slot, target: []const u8) !std.math.Order {
+            switch (key_slot.tag) {
+                .short_bytes => {
+                    var buf = [_]u8{0} ** byteSizeOf(u64);
+                    std.mem.writeInt(u64, &buf, key_slot.value, .big);
+                    const total = if (key_slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
+                    const len = std.mem.indexOfScalar(u8, buf[0..total], 0) orelse total;
+                    return std.mem.order(u8, buf[0..len], target);
+                },
+                .bytes => {
+                    var reader = self.core.reader();
+                    try reader.seekTo(key_slot.value);
+                    const len = try takeInt(&reader.interface, u64, .big);
+                    var i: u64 = 0;
+                    var chunk: [256]u8 = undefined;
+                    while (i < len) {
+                        const n: usize = @intCast(@min(chunk.len, len - i));
+                        try reader.interface.readSliceAll(chunk[0..n]);
+                        for (chunk[0..n], 0..) |b, j| {
+                            const ti = i + j;
+                            if (ti >= target.len) return .gt; // stored has more, equal so far
+                            if (b < target[ti]) return .lt;
+                            if (b > target[ti]) return .gt;
+                        }
+                        i += n;
+                    }
+                    return if (target.len > len) .lt else .eq;
+                },
+                else => return error.UnexpectedTag,
+            }
+        }
+
+        const SortedSlot = struct { slot: Slot, position: u64 };
+
+        // descend by key to the matching leaf entry (the .kv_pair slot), or null
+        fn sortedGet(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !?SortedSlot {
+            var node_ptr = root_ptr;
+            while (true) {
+                const node = try self.readSortedNode(node_ptr);
+                switch (node.kind) {
+                    .leaf => {
+                        for (0..node.num) |i| {
+                            const entry = node.entries[i];
+                            const kv = try self.readKvPair(entry);
+                            switch (try self.compareKey(kv.key_slot, key)) {
+                                .eq => return .{ .slot = entry, .position = node_ptr + BTREE_NODE_HEADER_SIZE + i * byteSizeOf(Slot) },
+                                .gt => return null,
+                                .lt => {},
+                            }
+                        }
+                        return null;
+                    },
+                    .branch => {
+                        var i: u8 = 0;
+                        while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                        node_ptr = node.children[i].value;
+                    },
+                }
+            }
+        }
+
+        // descend by rank to the leaf entry at the given 0-based index
+        fn sortedGetByIndex(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) !SortedSlot {
+            var node_ptr = root_ptr;
+            var rem = rank;
+            while (true) {
+                const node = try self.readSortedNode(node_ptr);
+                switch (node.kind) {
+                    .leaf => {
+                        const i: usize = @intCast(rem);
+                        return .{ .slot = node.entries[i], .position = node_ptr + BTREE_NODE_HEADER_SIZE + i * byteSizeOf(Slot) };
+                    },
+                    .branch => {
+                        var i: u8 = 0;
+                        while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                            rem -= node.counts[i];
+                        }
+                        node_ptr = node.children[i].value;
+                    },
+                }
+            }
+        }
+
+        // number of keys strictly less than `key` (the inverse of getByIndex)
+        fn sortedRank(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !u64 {
+            var node_ptr = root_ptr;
+            var rank: u64 = 0;
+            while (true) {
+                const node = try self.readSortedNode(node_ptr);
+                switch (node.kind) {
+                    .leaf => {
+                        for (0..node.num) |i| {
+                            const kv = try self.readKvPair(node.entries[i]);
+                            if ((try self.compareKey(kv.key_slot, key)) == .lt) {
+                                rank += 1;
+                            } else break;
+                        }
+                        return rank;
+                    },
+                    .branch => {
+                        var i: u8 = 0;
+                        while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {
+                            rank += node.counts[i];
+                        }
+                        node_ptr = node.children[i].value;
+                    },
+                }
+            }
+        }
+
+        // write a byte key as a short_bytes (inline, <=8 bytes, no interior zero) or
+        // external bytes slot
+        fn writeKey(self: *Database(db_kind, HashInt), key: []const u8) !Slot {
+            if (key.len <= byteSizeOf(u64) and std.mem.indexOfScalar(u8, key, 0) == null) {
+                var value = [_]u8{0} ** byteSizeOf(u64);
+                @memcpy(value[0..key.len], key);
+                return .{ .value = std.mem.readInt(u64, &value, .big), .tag = .short_bytes };
+            }
+            var writer = self.core.writer();
+            const pos = try self.core.length();
+            try writer.seekTo(pos);
+            try writer.interface.writeInt(u64, key.len, .big);
+            try writer.interface.writeAll(key);
+            return .{ .value = pos, .tag = .bytes };
+        }
+
+        const SortedEntry = struct { kv_slot: Slot, key_slot: Slot, value_position: u64 };
+
+        // materialize a new leaf entry: write the key bytes and a KeyValuePair with an
+        // empty value (the caller fills it via value_position). the hash field is unused
+        // by sorted maps (navigation is by key bytes), so it is left zero.
+        fn sortedNewEntry(self: *Database(db_kind, HashInt), key: []const u8) !SortedEntry {
+            const key_slot = try self.writeKey(key);
+            var writer = self.core.writer();
+            const kv_pos = try self.core.length();
+            const kv_pair = KeyValuePair{
+                .value_slot = @bitCast(@as(SlotInt, 0)),
+                .key_slot = key_slot,
+                .hash = 0,
+            };
+            try writer.seekTo(kv_pos);
+            try writer.interface.writeInt(KeyValuePairInt, @bitCast(kv_pair), .big);
+            return .{
+                .kv_slot = .{ .value = kv_pos, .tag = .kv_pair },
+                .key_slot = key_slot,
+                .value_position = kv_pos + byteSizeOf(HashInt) + byteSizeOf(Slot),
+            };
+        }
+
+        // insert `key` (or locate it for replacement) within the subtree at node_ptr,
+        // path-copying nodes and maintaining separators + counts. the caller writes the
+        // value at the returned value_position.
+        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8) anyerror!SortedInsertResult {
+            const node = try self.readSortedNode(node_ptr);
+            var writer = self.core.writer();
+            switch (node.kind) {
+                .leaf => {
+                    // find the matching or insertion index
+                    var idx: usize = node.num;
+                    var found = false;
+                    for (0..node.num) |i| {
+                        const kv = try self.readKvPair(node.entries[i]);
+                        switch (try self.compareKey(kv.key_slot, key)) {
+                            .eq => {
+                                idx = i;
+                                found = true;
+                                break;
+                            },
+                            .gt => {
+                                idx = i;
+                                break;
+                            },
+                            .lt => {},
+                        }
+                    }
+
+                    if (found) {
+                        // replace: return a writable value slot, copy-on-writing the
+                        // kv_pair if it belongs to a past moment
+                        var leaf = node;
+                        const kv_slot = node.entries[idx];
+                        var value_position: u64 = undefined;
+                        if (self.btreeReusable(kv_slot.value)) {
+                            value_position = kv_slot.value + byteSizeOf(HashInt) + byteSizeOf(Slot);
+                        } else {
+                            const kv = try self.readKvPair(kv_slot);
+                            const new_kv_pos = try self.core.length();
+                            try writer.seekTo(new_kv_pos);
+                            try writer.interface.writeInt(KeyValuePairInt, @bitCast(kv), .big);
+                            leaf.entries[idx] = .{ .value = new_kv_pos, .tag = .kv_pair };
+                            value_position = new_kv_pos + byteSizeOf(HashInt) + byteSizeOf(Slot);
+                        }
+                        const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                        return .{ .node_ptr = ptr, .count = node.num, .value_position = value_position, .added = false, .split = null };
+                    }
+
+                    // insert a new entry at idx
+                    const entry = try self.sortedNewEntry(key);
+                    var entries = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    @memcpy(entries[0..idx], node.entries[0..idx]);
+                    entries[idx] = entry.kv_slot;
+                    @memcpy(entries[idx + 1 .. node.num + 1], node.entries[idx..node.num]);
+                    const total: usize = node.num + 1;
+
+                    if (total <= BTREE_SLOT_COUNT) {
+                        var leaf = SortedNode{ .kind = .leaf, .num = @intCast(total) };
+                        @memcpy(leaf.entries[0..total], entries[0..total]);
+                        const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                        return .{ .node_ptr = ptr, .count = total, .value_position = entry.value_position, .added = true, .split = null };
+                    }
+
+                    // overflow: split into two leaves; the new sibling's separator is the
+                    // key of its first entry
+                    const left_n = BTREE_SPLIT_COUNT;
+                    const right_n = total - left_n;
+                    var left = SortedNode{ .kind = .leaf, .num = @intCast(left_n) };
+                    @memcpy(left.entries[0..left_n], entries[0..left_n]);
+                    var right = SortedNode{ .kind = .leaf, .num = @intCast(right_n) };
+                    @memcpy(right.entries[0..right_n], entries[left_n..total]);
+                    const separator = (try self.readKvPair(entries[left_n])).key_slot;
+                    const left_ptr = try self.sortedWriteNode(left, node_ptr);
+                    const right_ptr = try self.writeSortedNode(right);
+                    return .{
+                        .node_ptr = left_ptr,
+                        .count = left_n,
+                        .value_position = entry.value_position,
+                        .added = true,
+                        .split = .{ .node_ptr = right_ptr, .count = right_n, .separator = separator },
+                    };
+                },
+                .branch => {
+                    var i: u8 = 0;
+                    while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                    const child = try self.sortedPut(node.children[i].value, key);
+
+                    var children = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    var separators = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    var counts = [_]u64{0} ** (BTREE_SLOT_COUNT + 1);
+                    @memcpy(children[0..node.num], node.children[0..node.num]);
+                    @memcpy(separators[0..node.num], node.separators[0..node.num]);
+                    @memcpy(counts[0..node.num], node.counts[0..node.num]);
+                    children[i] = .{ .value = child.node_ptr, .tag = .index };
+                    counts[i] = child.count;
+                    var total: usize = node.num;
+                    if (child.split) |split| {
+                        var j: usize = node.num;
+                        while (j > i + 1) : (j -= 1) {
+                            children[j] = children[j - 1];
+                            separators[j] = separators[j - 1];
+                            counts[j] = counts[j - 1];
+                        }
+                        children[i + 1] = .{ .value = split.node_ptr, .tag = .index };
+                        separators[i + 1] = split.separator;
+                        counts[i + 1] = split.count;
+                        total = node.num + 1;
+                    }
+
+                    if (total <= BTREE_SLOT_COUNT) {
+                        var branch = SortedNode{ .kind = .branch, .num = @intCast(total) };
+                        @memcpy(branch.children[0..total], children[0..total]);
+                        @memcpy(branch.separators[0..total], separators[0..total]);
+                        @memcpy(branch.counts[0..total], counts[0..total]);
+                        const ptr = try self.sortedWriteNode(branch, node_ptr);
+                        return .{ .node_ptr = ptr, .count = branch.subtreeCount(), .value_position = child.value_position, .added = child.added, .split = null };
+                    }
+
+                    // overflow: split into two branches; the new sibling's separator is the
+                    // smallest key of its first child (separators[left_n] of the combined)
+                    const left_n = BTREE_SPLIT_COUNT;
+                    const right_n = total - left_n;
+                    var left = SortedNode{ .kind = .branch, .num = @intCast(left_n) };
+                    @memcpy(left.children[0..left_n], children[0..left_n]);
+                    @memcpy(left.separators[0..left_n], separators[0..left_n]);
+                    @memcpy(left.counts[0..left_n], counts[0..left_n]);
+                    var right = SortedNode{ .kind = .branch, .num = @intCast(right_n) };
+                    @memcpy(right.children[0..right_n], children[left_n..total]);
+                    @memcpy(right.separators[0..right_n], separators[left_n..total]);
+                    @memcpy(right.counts[0..right_n], counts[left_n..total]);
+                    const separator = separators[left_n];
+                    const left_ptr = try self.sortedWriteNode(left, node_ptr);
+                    const right_ptr = try self.writeSortedNode(right);
+                    return .{
+                        .node_ptr = left_ptr,
+                        .count = left.subtreeCount(),
+                        .value_position = child.value_position,
+                        .added = child.added,
+                        .split = .{ .node_ptr = right_ptr, .count = right.subtreeCount(), .separator = separator },
+                    };
+                },
+            }
+        }
+
+        // remove `key` from the subtree at node_ptr, path-copying nodes and
+        // decrementing counts. an emptied leaf is left in place (see SortedRemoveResult).
+        fn sortedRemove(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8) anyerror!SortedRemoveResult {
+            const node = try self.readSortedNode(node_ptr);
+            switch (node.kind) {
+                .leaf => {
+                    var idx: usize = node.num;
+                    var found = false;
+                    for (0..node.num) |i| {
+                        const kv = try self.readKvPair(node.entries[i]);
+                        switch (try self.compareKey(kv.key_slot, key)) {
+                            .eq => {
+                                idx = i;
+                                found = true;
+                                break;
+                            },
+                            .gt => break,
+                            .lt => {},
+                        }
+                    }
+                    if (!found) return .{ .node_ptr = node_ptr, .found = false };
+
+                    var leaf = SortedNode{ .kind = .leaf, .num = node.num - 1 };
+                    @memcpy(leaf.entries[0..idx], node.entries[0..idx]);
+                    @memcpy(leaf.entries[idx .. node.num - 1], node.entries[idx + 1 .. node.num]);
+                    const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                    return .{ .node_ptr = ptr, .found = true };
+                },
+                .branch => {
+                    var i: u8 = 0;
+                    while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                    const child = try self.sortedRemove(node.children[i].value, key);
+                    if (!child.found) return .{ .node_ptr = node_ptr, .found = false };
+
+                    var branch = node;
+                    branch.children[i] = .{ .value = child.node_ptr, .tag = .index };
+                    branch.counts[i] -= 1;
+                    const ptr = try self.sortedWriteNode(branch, node_ptr);
+                    return .{ .node_ptr = ptr, .found = true };
+                },
+            }
+        }
+
+        fn sortedGrowRoot(self: *Database(db_kind, HashInt), result: SortedInsertResult) !u64 {
+            if (result.split) |split| {
+                var root = SortedNode{ .kind = .branch, .num = 2 };
+                root.children[0] = .{ .value = result.node_ptr, .tag = .index };
+                root.children[1] = .{ .value = split.node_ptr, .tag = .index };
+                root.separators[1] = split.separator; // separators[0] is an unused sentinel
+                root.counts[0] = result.count;
+                root.counts[1] = split.count;
+                return try self.writeSortedNode(root);
+            }
+            return result.node_ptr;
+        }
+
+        // turn a located/inserted kv_pair (at kv_pos) into the slot for the requested
+        // target. only the value is writeable (that is how put works); the key and the
+        // kv_pair pointer are immutable — overwriting a key would leave the entry
+        // mis-ordered (it stays in place and separators aren't updated) — so they are
+        // returned with no writeable position. reads use slot.value, not position.
+        fn sortedTargetSlot(self: *Database(db_kind, HashInt), kv_pos: u64, target: HashMapSlotKind) !SlotPointer {
+            const kv = try self.readKvPair(.{ .value = kv_pos, .tag = .kv_pair });
+            return switch (target) {
+                .kv_pair => .{ .position = null, .slot = .{ .value = kv_pos, .tag = .kv_pair } },
+                .key => .{ .position = null, .slot = kv.key_slot },
+                .value => .{ .position = kv_pos + byteSizeOf(HashInt) + byteSizeOf(Slot), .slot = kv.value_slot },
+            };
+        }
+
         // Cursor
 
         pub fn KeyValuePairCursor(comptime write_mode: WriteMode) type {
@@ -2424,7 +3054,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
                             return header.size;
                         },
-                        .linked_array_list => {
+                        .linked_array_list, .sorted_map, .sorted_set => {
                             try core_reader.seekTo(self.slot_ptr.slot.value);
                             const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                             return header.size;
@@ -2481,9 +3111,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                         .stack = try initStack(cursor, header.ptr),
                                     };
                                 },
-                                .linked_array_list => blk: {
-                                    // backed by a b-tree: read the header, then walk from the
-                                    // root node's value/child slots (skipping its kind+num header)
+                                .linked_array_list, .sorted_map, .sorted_set => blk: {
                                     const position = cursor.slot_ptr.slot.value;
                                     var core_reader = cursor.db.core.reader();
                                     try core_reader.seekTo(position);
@@ -2509,6 +3137,103 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         };
                     }
 
+                    // start a sorted-map iterator at the entry with rank `start_index`
+                    // (the count descent), iterating in key order from there
+                    pub fn initSortedFromIndex(cursor: Cursor(write_mode), start_index: u64) !Iter {
+                        const total = try cursor.count();
+                        // an unwritten map is .none (like iterator()): yield nothing
+                        if (cursor.slot_ptr.slot.tag == .none or start_index >= total) {
+                            return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                        }
+                        const root_ptr = try sortedRootPtr(cursor);
+                        return .{
+                            .cursor = cursor,
+                            .core = .{ .size = total, .index = start_index, .stack = try sortedStackFromIndex(cursor, root_ptr, start_index) },
+                        };
+                    }
+
+                    // start a sorted-map iterator at the first entry with key >= start_key
+                    pub fn initSortedFromKey(cursor: Cursor(write_mode), start_key: []const u8) !Iter {
+                        if (cursor.slot_ptr.slot.tag == .none) {
+                            return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                        }
+                        const total = try cursor.count();
+                        const root_ptr = try sortedRootPtr(cursor);
+                        const built = try sortedStackFromKey(cursor, root_ptr, start_key);
+                        return .{
+                            .cursor = cursor,
+                            .core = .{ .size = total, .index = built.before, .stack = built.stack },
+                        };
+                    }
+
+                    fn sortedRootPtr(cursor: Cursor(write_mode)) !u64 {
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .sorted_map, .sorted_set => {},
+                            else => return error.UnexpectedTag,
+                        }
+                        var core_reader = cursor.db.core.reader();
+                        try core_reader.seekTo(cursor.slot_ptr.slot.value);
+                        const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                        return header.root_ptr;
+                    }
+
+                    fn sortedStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        var node_ptr = root_ptr;
+                        var rem = start_index;
+                        while (true) {
+                            const node = try cursor.db.readSortedNode(node_ptr);
+                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            switch (node.kind) {
+                                .leaf => {
+                                    try stack.append(.{ .position = position, .block = node.entries, .index = @intCast(rem) });
+                                    return stack;
+                                },
+                                .branch => {
+                                    var i: u8 = 0;
+                                    while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                                        rem -= node.counts[i];
+                                    }
+                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    node_ptr = node.children[i].value;
+                                },
+                            }
+                        }
+                    }
+
+                    fn sortedStackFromKey(cursor: Cursor(write_mode), root_ptr: u64, key: []const u8) !struct { stack: BoundedArray(Level, ITERATOR_STACK_SIZE), before: u64 } {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        var node_ptr = root_ptr;
+                        var before: u64 = 0;
+                        while (true) {
+                            const node = try cursor.db.readSortedNode(node_ptr);
+                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            switch (node.kind) {
+                                .leaf => {
+                                    var li: u8 = node.num;
+                                    for (0..node.num) |j| {
+                                        const kv = try cursor.db.readKvPair(node.entries[j]);
+                                        if ((try cursor.db.compareKey(kv.key_slot, key)) != .lt) {
+                                            li = @intCast(j);
+                                            break;
+                                        }
+                                    }
+                                    before += li;
+                                    try stack.append(.{ .position = position, .block = node.entries, .index = li });
+                                    return .{ .stack = stack, .before = before };
+                                },
+                                .branch => {
+                                    var i: u8 = 0;
+                                    while (i + 1 < node.num and (try cursor.db.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {
+                                        before += node.counts[i];
+                                    }
+                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    node_ptr = node.children[i].value;
+                                },
+                            }
+                        }
+                    }
+
                     pub fn next(self: *Iter) !?Cursor(write_mode) {
                         switch (self.cursor.slot_ptr.slot.tag) {
                             .none => return null,
@@ -2517,7 +3242,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 self.core.index += 1;
                                 return try self.nextInternal(0);
                             },
-                            .linked_array_list => {
+                            .linked_array_list, .sorted_map, .sorted_set => {
                                 if (self.core.index == self.core.size) return null;
                                 self.core.index += 1;
                                 // b-tree nodes have a kind+num header before their slots,
@@ -2898,6 +3623,180 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
+        // an ordered map keyed on arbitrary byte strings (lexicographic order),
+        // backed by a count-augmented B+tree. supports key lookup, ordered iteration
+        // (from a key or an index), and order-statistics (getByIndex / rank).
+        pub fn SortedMap(comptime write_mode: WriteMode) type {
+            return struct {
+                cursor: Database(db_kind, HashInt).Cursor(write_mode),
+
+                pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !SortedMap(write_mode) {
+                    return switch (write_mode) {
+                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                            .none, .sorted_map, .sorted_set => .{ .cursor = cursor },
+                            else => error.UnexpectedTag,
+                        },
+                        .read_write => .{
+                            .cursor = try cursor.writePath(void, &.{.{ .sorted_map_init = .{ .set = false } }}),
+                        },
+                    };
+                }
+
+                pub fn readOnly(self: SortedMap(.read_write)) SortedMap(.read_only) {
+                    return .{ .cursor = self.cursor.readOnly() };
+                }
+
+                pub fn slot(self: SortedMap(write_mode)) Slot {
+                    return self.cursor.slot();
+                }
+
+                pub fn count(self: SortedMap(write_mode)) !u64 {
+                    return try self.cursor.count();
+                }
+
+                pub fn iterator(self: SortedMap(write_mode)) !Cursor(write_mode).Iter {
+                    return try self.cursor.iterator();
+                }
+
+                // iterate in key order starting at the first entry with key >= start_key
+                pub fn iteratorFrom(self: SortedMap(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
+                    return try Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
+                }
+
+                // iterate in key order starting at the entry with rank start_index
+                pub fn iteratorFromIndex(self: SortedMap(write_mode), start_index: u64) !Cursor(write_mode).Iter {
+                    return try Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
+                }
+
+                pub fn getCursor(self: SortedMap(write_mode), key: []const u8) !?Cursor(.read_only) {
+                    return try self.cursor.readPath(void, &.{
+                        .{ .sorted_map_get = .{ .value = key } },
+                    });
+                }
+
+                pub fn getSlot(self: SortedMap(write_mode), key: []const u8) !?Slot {
+                    return try self.cursor.readPathSlot(void, &.{
+                        .{ .sorted_map_get = .{ .value = key } },
+                    });
+                }
+
+                pub fn getKeyValuePair(self: SortedMap(write_mode), key: []const u8) !?KeyValuePairCursor(.read_only) {
+                    var cursor = (try self.cursor.readPath(void, &.{
+                        .{ .sorted_map_get = .{ .kv_pair = key } },
+                    })) orelse return null;
+                    return try cursor.readKeyValuePair();
+                }
+
+                // the key/value pair at the given rank (negative counts from the end)
+                pub fn getIndexKeyValuePair(self: SortedMap(write_mode), index: i65) !?KeyValuePairCursor(.read_only) {
+                    var cursor = (try self.cursor.readPath(void, &.{
+                        .{ .sorted_map_get_index = index },
+                    })) orelse return null;
+                    return try cursor.readKeyValuePair();
+                }
+
+                pub fn put(self: SortedMap(.read_write), key: []const u8, data: WriteableData) !void {
+                    _ = try self.cursor.writePath(void, &.{
+                        .{ .sorted_map_get = .{ .value = key } },
+                        .{ .write = data },
+                    });
+                }
+
+                pub fn putCursor(self: SortedMap(.read_write), key: []const u8) !Cursor(.read_write) {
+                    return try self.cursor.writePath(void, &.{
+                        .{ .sorted_map_get = .{ .value = key } },
+                    });
+                }
+
+                pub fn remove(self: SortedMap(.read_write), key: []const u8) !bool {
+                    _ = self.cursor.writePath(void, &.{
+                        .{ .sorted_map_remove = key },
+                    }) catch |err| switch (err) {
+                        error.KeyNotFound => return false,
+                        else => |e| return e,
+                    };
+                    return true;
+                }
+
+                // number of keys strictly less than `key` (the inverse of getByIndex)
+                pub fn rank(self: SortedMap(write_mode), key: []const u8) !u64 {
+                    if (self.cursor.slot_ptr.slot.tag == .none) return 0;
+                    var core_reader = self.cursor.db.core.reader();
+                    try core_reader.seekTo(self.cursor.slot_ptr.slot.value);
+                    const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                    return try self.cursor.db.sortedRank(header.root_ptr, key);
+                }
+            };
+        }
+
+        // a sorted set of byte-string keys (a SortedMap with no values).
+        pub fn SortedSet(comptime write_mode: WriteMode) type {
+            return struct {
+                map: SortedMap(write_mode),
+
+                pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !SortedSet(write_mode) {
+                    return switch (write_mode) {
+                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                            .none, .sorted_map, .sorted_set => .{ .map = .{ .cursor = cursor } },
+                            else => error.UnexpectedTag,
+                        },
+                        .read_write => .{
+                            .map = .{ .cursor = try cursor.writePath(void, &.{.{ .sorted_map_init = .{ .set = true } }}) },
+                        },
+                    };
+                }
+
+                pub fn readOnly(self: SortedSet(.read_write)) SortedSet(.read_only) {
+                    return .{ .map = self.map.readOnly() };
+                }
+
+                pub fn slot(self: SortedSet(write_mode)) Slot {
+                    return self.map.cursor.slot();
+                }
+
+                pub fn count(self: SortedSet(write_mode)) !u64 {
+                    return try self.map.cursor.count();
+                }
+
+                pub fn iterator(self: SortedSet(write_mode)) !Cursor(write_mode).Iter {
+                    return try self.map.iterator();
+                }
+
+                pub fn iteratorFrom(self: SortedSet(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
+                    return try self.map.iteratorFrom(start_key);
+                }
+
+                pub fn iteratorFromIndex(self: SortedSet(write_mode), start_index: u64) !Cursor(write_mode).Iter {
+                    return try self.map.iteratorFromIndex(start_index);
+                }
+
+                pub fn put(self: SortedSet(.read_write), key: []const u8) !void {
+                    _ = try self.map.cursor.writePath(void, &.{
+                        .{ .sorted_map_get = .{ .key = key } },
+                    });
+                }
+
+                pub fn contains(self: SortedSet(write_mode), key: []const u8) !bool {
+                    const cursor = try self.map.cursor.readPath(void, &.{
+                        .{ .sorted_map_get = .{ .key = key } },
+                    });
+                    return cursor != null;
+                }
+
+                pub fn getIndexKeyValuePair(self: SortedSet(write_mode), index: i65) !?KeyValuePairCursor(.read_only) {
+                    return try self.map.getIndexKeyValuePair(index);
+                }
+
+                pub fn remove(self: SortedSet(.read_write), key: []const u8) !bool {
+                    return try self.map.remove(key);
+                }
+
+                pub fn rank(self: SortedSet(write_mode), key: []const u8) !u64 {
+                    return try self.map.rank(key);
+                }
+            };
+        }
+
         pub fn ArrayList(comptime write_mode: WriteMode) type {
             return struct {
                 cursor: Database(db_kind, HashInt).Cursor(write_mode),
@@ -3149,6 +4048,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
+                .sorted_map, .sorted_set => {
+                    if (offset_map.get(slot.value)) |mapped| {
+                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                    }
+                    const new_offset = try remapSortedMap(source_core, target_db_kind, target_core, offset_map, slot);
+                    try offset_map.put(slot.value, new_offset);
+                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
+                },
             }
         }
 
@@ -3372,6 +4279,96 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }), .big);
 
             return new_offset;
+        }
+
+        fn remapSortedMap(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            try reader.seekTo(slot.value);
+            const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+
+            const remapped_root = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
+
+            const new_offset = try target_core.length();
+            try writer.seekTo(new_offset);
+            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
+                .root_ptr = remapped_root,
+                .size = header.size,
+            }), .big);
+
+            return new_offset;
+        }
+
+        fn remapSortedMapNode(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), node_offset: u64) anyerror!u64 {
+            if (offset_map.get(node_offset)) |mapped| {
+                return mapped;
+            }
+
+            var reader = source_core.reader();
+            var writer = target_core.writer();
+
+            try reader.seekTo(node_offset);
+            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            const num = try takeInt(&reader.interface, u8, .big);
+
+            switch (kind) {
+                .leaf => {
+                    var body = [_]u8{0} ** (SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    try reader.interface.readSliceAll(&body);
+                    var body_reader = std.Io.Reader.fixed(&body);
+
+                    var entries: [BTREE_SLOT_COUNT]Slot = undefined;
+                    for (&entries) |*s| {
+                        const entry: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, entry);
+                    }
+
+                    const new_offset = try target_core.length();
+                    try writer.seekTo(new_offset);
+                    try writer.interface.writeInt(u8, kind_int, .big);
+                    try writer.interface.writeInt(u8, num, .big);
+                    for (entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+
+                    try offset_map.put(node_offset, new_offset);
+                    return new_offset;
+                },
+                .branch => {
+                    var body = [_]u8{0} ** (SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    try reader.interface.readSliceAll(&body);
+                    var body_reader = std.Io.Reader.fixed(&body);
+
+                    var children: [BTREE_SLOT_COUNT]Slot = undefined;
+                    for (&children) |*s| {
+                        const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        if (child.tag == .index) {
+                            const remapped_ptr = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, child.value);
+                            s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
+                        } else {
+                            s.* = child;
+                        }
+                    }
+                    var separators: [BTREE_SLOT_COUNT]Slot = undefined;
+                    for (&separators) |*s| {
+                        const sep: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, sep);
+                    }
+                    var counts: [BTREE_SLOT_COUNT]u64 = undefined;
+                    for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
+
+                    const new_offset = try target_core.length();
+                    try writer.seekTo(new_offset);
+                    try writer.interface.writeInt(u8, kind_int, .big);
+                    try writer.interface.writeInt(u8, num, .big);
+                    for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (counts) |c| try writer.interface.writeInt(u64, c, .big);
+
+                    try offset_map.put(node_offset, new_offset);
+                    return new_offset;
+                },
+            }
         }
     };
 }

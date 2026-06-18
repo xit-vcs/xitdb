@@ -2732,6 +2732,19 @@ fn testCompaction(
                     const cset = try DB.CountedHashSet(.read_write).init(cset_cursor);
                     try cset.put(hashInt("p"), .{ .bytes = "p" });
                     try cset.put(hashInt("q"), .{ .bytes = "q" });
+
+                    // SortedMap
+                    const sorted_cursor = try moment.putCursor(hashInt("sorted"));
+                    const sorted = try DB.SortedMap(.read_write).init(sorted_cursor);
+                    try sorted.put("apple", .{ .uint = 1 });
+                    try sorted.put("banana", .{ .uint = 2 });
+                    try sorted.put("cherry", .{ .uint = 3 });
+
+                    // SortedSet
+                    const sorted_set_cursor = try moment.putCursor(hashInt("sortedset"));
+                    const sorted_set = try DB.SortedSet(.read_write).init(sorted_set_cursor);
+                    try sorted_set.put("foo");
+                    try sorted_set.put("bar");
                 }
             };
             try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx2{});
@@ -2837,6 +2850,27 @@ fn testCompaction(
         const p_val = try (try cset.getCursor(hashInt("p"))).?.readBytesAlloc(allocator, 1024);
         defer allocator.free(p_val);
         try std.testing.expectEqualStrings("p", p_val);
+
+        // SortedMap
+        const sorted_cursor = (try moment.getCursor(hashInt("sorted"))).?;
+        const sorted = try TargetDB.SortedMap(.read_only).init(sorted_cursor);
+        try std.testing.expectEqual(3, try sorted.count());
+        try std.testing.expectEqual(2, try (try sorted.getCursor("banana")).?.readUint());
+        // lexicographic order is preserved across compaction
+        const first_key = try (try sorted.getIndexKeyValuePair(0)).?.key_cursor.readBytesAlloc(allocator, 1024);
+        defer allocator.free(first_key);
+        try std.testing.expectEqualStrings("apple", first_key);
+        const last_key = try (try sorted.getIndexKeyValuePair(-1)).?.key_cursor.readBytesAlloc(allocator, 1024);
+        defer allocator.free(last_key);
+        try std.testing.expectEqualStrings("cherry", last_key);
+
+        // SortedSet
+        const sorted_set_cursor = (try moment.getCursor(hashInt("sortedset"))).?;
+        const sorted_set = try TargetDB.SortedSet(.read_only).init(sorted_set_cursor);
+        try std.testing.expectEqual(2, try sorted_set.count());
+        try std.testing.expect(try sorted_set.contains("foo"));
+        try std.testing.expect(try sorted_set.contains("bar"));
+        try std.testing.expect(!try sorted_set.contains("baz"));
     }
 
     // structural sharing (most data shared, only 1 key changes per moment)
@@ -2995,5 +3029,249 @@ fn testCompaction(
             defer allocator.free(orig_in_m1);
             try std.testing.expectEqualStrings("original_data", orig_in_m1);
         }
+    }
+}
+
+test "sorted map and set" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        try testSortedMap(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 });
+    }
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        try testSortedMap(allocator, .file, .{ .io = io, .file = file });
+    }
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        try testSortedMap(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+    }
+}
+
+fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+    _ = allocator;
+    try clearStorage(db_kind, init_opts);
+    const DB = xitdb.Database(db_kind, HashInt);
+    var db = try DB.init(init_opts);
+    var root_cursor = db.rootCursor();
+
+    // keys "k0000".."k0059" sort lexicographically in numeric order
+    const COUNT = 60;
+
+    const Ctx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+            var map = try DB.SortedMap(.read_write).init(try moment.putCursor(hashInt("map")));
+
+            // insert in reverse order to exercise front-insertions and splits
+            var i: usize = COUNT;
+            while (i > 0) {
+                i -= 1;
+                var kbuf: [8]u8 = undefined;
+                const key = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+                try map.put(key, .{ .uint = @intCast(i) });
+            }
+            try std.testing.expectEqual(COUNT, try map.count());
+
+            // dedup: re-putting an existing key replaces the value, not the count
+            try map.put("k0005", .{ .uint = 999 });
+            try std.testing.expectEqual(COUNT, try map.count());
+            try std.testing.expectEqual(999, try (try map.getCursor("k0005")).?.readUint());
+            try map.put("k0005", .{ .uint = 5 });
+
+            // ordered iteration yields k0000..k0059 in order with intact values
+            {
+                var iter = try map.iterator();
+                var n: usize = 0;
+                while (try iter.next()) |c| {
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [8]u8 = undefined;
+                    var ebuf: [8]u8 = undefined;
+                    const expect = try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{n});
+                    try std.testing.expectEqualStrings(expect, try kv.key_cursor.readBytes(&kbuf));
+                    try std.testing.expectEqual(n, try kv.value_cursor.readUint());
+                    n += 1;
+                }
+                try std.testing.expectEqual(COUNT, n);
+            }
+
+            try std.testing.expect((try map.getCursor("k0042")) != null);
+            try std.testing.expect((try map.getCursor("nope")) == null);
+
+            // getByIndex (positive and negative) and rank are inverses
+            {
+                var idx: usize = 0;
+                while (idx < COUNT) : (idx += 1) {
+                    const kv = (try map.getIndexKeyValuePair(@intCast(idx))).?;
+                    var kbuf: [8]u8 = undefined;
+                    var ebuf: [8]u8 = undefined;
+                    const key = try kv.key_cursor.readBytes(&kbuf);
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{idx}), key);
+                    try std.testing.expectEqual(idx, try map.rank(key));
+                }
+                var kbuf: [8]u8 = undefined;
+                const last = (try map.getIndexKeyValuePair(-1)).?;
+                try std.testing.expectEqualStrings("k0059", try last.key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try map.getIndexKeyValuePair(COUNT)) == null);
+            }
+
+            // lower-bound iteration from a present and an absent key
+            {
+                var iter = try map.iteratorFrom("k0030");
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0030", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+            {
+                // "k00095" sorts between "k0009" and "k0010"
+                var iter = try map.iteratorFrom("k00095");
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0010", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+            {
+                var iter = try map.iteratorFromIndex(COUNT - 2);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0058", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+
+            // remove the even keys, then re-verify order, count, and presence
+            {
+                var j: usize = 0;
+                while (j < COUNT) : (j += 2) {
+                    var kbuf: [8]u8 = undefined;
+                    try std.testing.expect(try map.remove(try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{j})));
+                }
+                try std.testing.expectEqual(COUNT / 2, try map.count());
+                try std.testing.expect(!try map.remove("k0000")); // already gone
+
+                var iter = try map.iterator();
+                var expect_i: usize = 1;
+                var seen: usize = 0;
+                while (try iter.next()) |c| {
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [8]u8 = undefined;
+                    var ebuf: [8]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{expect_i}), try kv.key_cursor.readBytes(&kbuf));
+                    expect_i += 2;
+                    seen += 1;
+                }
+                try std.testing.expectEqual(COUNT / 2, seen);
+            }
+
+            // iterating-from on an unwritten (.none) map yields nothing, like iterator()
+            {
+                const none_cursor = DB.Cursor(.read_only){ .slot_ptr = .{ .position = null, .slot = .{} }, .db = cursor.db };
+                const empty = try DB.SortedMap(.read_only).init(none_cursor);
+                var it1 = try empty.iteratorFrom("anything");
+                try std.testing.expect((try it1.next()) == null);
+                var it2 = try empty.iteratorFromIndex(0);
+                try std.testing.expect((try it2.next()) == null);
+            }
+
+            // SortedSet with mixed short (inline) and long (external) keys
+            var set = try DB.SortedSet(.read_write).init(try moment.putCursor(hashInt("set")));
+            try set.put("short");
+            try set.put("a-much-longer-key-stored-externally");
+            try set.put("mid");
+            try set.put("short"); // dup is a no-op
+            try std.testing.expectEqual(3, try set.count());
+            try std.testing.expect(try set.contains("mid"));
+            try std.testing.expect(!try set.contains("nope"));
+            {
+                var iter = try set.iterator();
+                const want = [_][]const u8{ "a-much-longer-key-stored-externally", "mid", "short" };
+                var n: usize = 0;
+                while (try iter.next()) |c| {
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [64]u8 = undefined;
+                    try std.testing.expectEqualStrings(want[n], try kv.key_cursor.readBytes(&kbuf));
+                    n += 1;
+                }
+                try std.testing.expectEqual(3, n);
+            }
+            try std.testing.expect(try set.remove("mid"));
+            try std.testing.expectEqual(2, try set.count());
+
+            // immutability guards: positional access is read-only, and keys/entries
+            // cannot be overwritten through the low-level path API
+            try std.testing.expectError(error.WriteNotAllowed, map.cursor.writePath(void, &.{
+                .{ .sorted_map_get_index = 0 },
+            }));
+            try std.testing.expectError(error.CursorNotWriteable, map.cursor.writePath(void, &.{
+                .{ .sorted_map_get = .{ .key = "k0001" } },
+                .{ .write = .{ .bytes = "x" } },
+            }));
+        }
+    };
+
+    _ = try root_cursor.writePath(Ctx, &.{
+        .array_list_init,
+        .array_list_append,
+        .{ .hash_map_init = .{} },
+        .{ .ctx = .{} },
+    });
+
+    // the map persists in the committed moment
+    {
+        const history = try DB.ArrayList(.read_only).init(db.rootCursor().readOnly());
+        const moment = (try history.getCursor(-1)).?;
+        const map_cursor = (try moment.readPath(void, &.{
+            .{ .hash_map_get = .{ .value = hashInt("map") } },
+        })).?;
+        const map = try DB.SortedMap(.read_only).init(map_cursor);
+        try std.testing.expectEqual(COUNT / 2, try map.count());
+        var kbuf: [8]u8 = undefined;
+        try std.testing.expectEqualStrings("k0001", try (try map.getIndexKeyValuePair(0)).?.key_cursor.readBytes(&kbuf));
+    }
+
+    // a second moment that inherits and mutates the map must not disturb the first
+    // (copy-on-write immutability across transactions)
+    const Ctx2 = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+            var map = try DB.SortedMap(.read_write).init(try moment.putCursor(hashInt("map")));
+            try std.testing.expect(try map.remove("k0001"));
+            try map.put("k0001", .{ .uint = 7 }); // not in moment 0
+        }
+    };
+    _ = try root_cursor.writePath(Ctx2, &.{
+        .array_list_init,
+        .array_list_append,
+        .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
+        .{ .hash_map_init = .{} },
+        .{ .ctx = .{} },
+    });
+    {
+        const history = try DB.ArrayList(.read_only).init(db.rootCursor().readOnly());
+
+        // moment 0 (original) is unchanged: k0001 still present with value 1
+        const m0 = (try history.getCursor(0)).?;
+        const map0 = try DB.SortedMap(.read_only).init((try m0.readPath(void, &.{
+            .{ .hash_map_get = .{ .value = hashInt("map") } },
+        })).?);
+        try std.testing.expectEqual(COUNT / 2, try map0.count());
+        try std.testing.expectEqual(1, try (try map0.getCursor("k0001")).?.readUint());
+
+        // moment 1 reflects the mutation: k0001 re-added with value 7
+        const m1 = (try history.getCursor(1)).?;
+        const map1 = try DB.SortedMap(.read_only).init((try m1.readPath(void, &.{
+            .{ .hash_map_get = .{ .value = hashInt("map") } },
+        })).?);
+        try std.testing.expectEqual(COUNT / 2, try map1.count());
+        try std.testing.expectEqual(7, try (try map1.getCursor("k0001")).?.readUint());
     }
 }
