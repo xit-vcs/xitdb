@@ -772,6 +772,99 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         const big_cities = try DB.ArrayList(.read_only).init(big_cities_cursor);
         try std.testing.expectEqual(2, try big_cities.count());
     }
+
+    {
+        // build a secondary index with a SortedMap to sort and paginate,
+        // like the "Sorting and Paginating" section of the readme
+        const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+        const post_id_size = 16;
+        const Post = struct { id: *const [post_id_size]u8, title: []const u8, created_ts: u64 };
+
+        // post ids are fixed-length so the timestamp tie-breaker stays aligned
+        const new_posts = [_]Post{
+            .{ .id = "post000000000001", .title = "Hello, world", .created_ts = 1_700_000_000 },
+            .{ .id = "post000000000002", .title = "Second post", .created_ts = 1_700_000_500 },
+            .{ .id = "post000000000003", .title = "Third post", .created_ts = 1_700_001_000 },
+        };
+
+        const Ctx = struct {
+            posts: []const Post,
+
+            // build a SortedMap key that sorts by creation time. the big-endian
+            // timestamp makes byte order match chronological order; the post id
+            // is appended so two posts with the same timestamp stay distinct.
+            fn orderKey(timestamp: u64, post_id: *const [post_id_size]u8) [@sizeOf(u64) + post_id_size]u8 {
+                var key: [@sizeOf(u64) + post_id_size]u8 = undefined;
+                std.mem.writeInt(u64, key[0..@sizeOf(u64)], timestamp, .big);
+                @memcpy(key[@sizeOf(u64)..], post_id);
+                return key;
+            }
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try DB.HashMap(.read_write).init(cursor.*);
+
+                // the primary store: a HashMap from post id to the post's fields
+                const id_to_post_cursor = try moment.putCursor(hashInt("id->post"));
+                const id_to_post = try DB.HashMap(.read_write).init(id_to_post_cursor);
+
+                // the secondary index: a SortedMap ordered by creation time
+                const created_ts_to_post_id_cursor = try moment.putCursor(hashInt("created-ts->post-id"));
+                const created_ts_to_post_id = try DB.SortedMap(.read_write).init(created_ts_to_post_id_cursor);
+
+                for (self.posts) |post| {
+                    const post_cursor = try id_to_post.putCursor(hashInt(post.id));
+                    const post_map = try DB.HashMap(.read_write).init(post_cursor);
+                    try post_map.put(hashInt("title"), .{ .bytes = post.title });
+                    try post_map.put(hashInt("created-ts"), .{ .uint = post.created_ts });
+
+                    const order_key = orderKey(post.created_ts, post.id);
+                    try created_ts_to_post_id.put(&order_key, .{ .bytes = post.id });
+                }
+            }
+        };
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .posts = &new_posts });
+
+        const moment_cursor = (try history.getCursor(-1)).?;
+        const moment = try DB.HashMap(.read_only).init(moment_cursor);
+
+        const id_to_post_cursor = (try moment.getCursor(hashInt("id->post"))).?;
+        const id_to_post = try DB.HashMap(.read_only).init(id_to_post_cursor);
+
+        const created_ts_to_post_id_cursor = (try moment.getCursor(hashInt("created-ts->post-id"))).?;
+        const created_ts_to_post_id = try DB.SortedMap(.read_only).init(created_ts_to_post_id_cursor);
+
+        try std.testing.expectEqual(new_posts.len, try created_ts_to_post_id.count());
+
+        // page through the index two at a time, oldest first, and check we get
+        // every post back in creation order
+        const page_size = 2;
+        const expected_titles = [_][]const u8{ "Hello, world", "Second post", "Third post" };
+
+        const count = try created_ts_to_post_id.count();
+        var seen: usize = 0;
+        var after: u64 = 0;
+        while (after < count) : (after += page_size) {
+            const end = @min(after + page_size, count);
+            var iter = try created_ts_to_post_id.iteratorFromIndex(after);
+            var i = after;
+            while (i < end) : (i += 1) {
+                var id_cursor = (try iter.next()).?;
+                const id_kv = try id_cursor.readKeyValuePair();
+                var post_id: [post_id_size]u8 = undefined;
+                _ = try id_kv.value_cursor.readBytes(&post_id);
+
+                const post_cursor = (try id_to_post.getCursor(hashInt(&post_id))).?;
+                const post_map = try DB.HashMap(.read_only).init(post_cursor);
+                const title_cursor = (try post_map.getCursor(hashInt("title"))).?;
+                var title_buf: [64]u8 = undefined;
+                const title = try title_cursor.readBytes(&title_buf);
+                try std.testing.expectEqualStrings(expected_titles[seen], title);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(new_posts.len, seen);
+    }
 }
 
 fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime slice_offset: u64, comptime slice_size: u64) !void {
