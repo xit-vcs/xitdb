@@ -488,7 +488,7 @@ The above code iterates over `people`, which is an `ArrayList`, and for each per
 
 The iteration of the `HashMap` looks the same with `HashSet`, `CountedHashMap`, and `CountedHashSet`. When iterating, you call `readKeyValuePair` on the cursor and can read the `key_cursor` and `value_cursor` from it. In maps, `put` sets the value `putKey` sets the key (see the tests for examples). In sets, there is only `put` and it sets the key; the value will always have a tag type of `.none`.
 
-Unlike the other structures, `SortedMap` and `SortedSet` keep their keys in order, so besides `iterator` they also offer `iteratorFrom` and `iteratorFromIndex`, which start the iterator at an arbitrary point. `iteratorFrom` begins at the first key greater than or equal to the key you pass, while `iteratorFromIndex` begins at a given rank (the Nth key in order). This is especially useful for pagination: you can seek straight to the start of a page and walk forward only as far as you need. See the [Sorting and Paginating](#sorting-and-paginating) section for an example.
+`ArrayList` and `LinkedArrayList` also have an `iteratorFrom` method, which starts the iterator from the given index. `SortedMap` and `SortedSet` have `iteratorFrom` and `iteratorFromIndex` to start the iterator from a key or index respectively. This is especially useful for pagination: you can seek straight to the start of a page and walk forward only as far as you need. See the [Sorting and Paginating](#sorting-and-paginating) section for an example.
 
 ## Hashing
 

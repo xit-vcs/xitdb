@@ -3143,22 +3143,29 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         };
                     }
 
-                    // start a sorted-map iterator at the entry with rank `start_index`
-                    // (the count descent), iterating in key order from there
-                    pub fn initSortedFromIndex(cursor: Cursor(write_mode), start_index: u64) !Iter {
-                        const total = try cursor.count();
+                    fn resolveStartIndex(index: i65, size: u64) ?u64 {
+                        const ssize: i65 = @intCast(size);
+                        const resolved: i65 = if (index < 0) index + ssize else index;
+                        if (resolved < 0 or resolved >= ssize) return null;
+                        return @intCast(resolved);
+                    }
+
+                    fn emptyIter(cursor: Cursor(write_mode)) !Iter {
+                        return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                    }
+
+                    pub fn initSortedFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
                         // an unwritten map is .none (like iterator()): yield nothing
-                        if (cursor.slot_ptr.slot.tag == .none or start_index >= total) {
-                            return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
-                        }
+                        if (cursor.slot_ptr.slot.tag == .none) return emptyIter(cursor);
+                        const total = try cursor.count();
+                        const idx = resolveStartIndex(start_index, total) orelse return emptyIter(cursor);
                         const root_ptr = try sortedRootPtr(cursor);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = total, .index = start_index, .stack = try sortedStackFromIndex(cursor, root_ptr, start_index) },
+                            .core = .{ .size = total, .index = idx, .stack = try sortedStackFromIndex(cursor, root_ptr, idx) },
                         };
                     }
 
-                    // start a sorted-map iterator at the first entry with key >= start_key
                     pub fn initSortedFromKey(cursor: Cursor(write_mode), start_key: []const u8) !Iter {
                         if (cursor.slot_ptr.slot.tag == .none) {
                             return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
@@ -3169,6 +3176,32 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{
                             .cursor = cursor,
                             .core = .{ .size = total, .index = built.before, .stack = built.stack },
+                        };
+                    }
+
+                    pub fn initArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        if (cursor.slot_ptr.slot.tag != .array_list) return emptyIter(cursor);
+                        var core_reader = cursor.db.core.reader();
+                        try core_reader.seekTo(cursor.slot_ptr.slot.value);
+                        const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
+                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        const last_key = header.size - 1;
+                        const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
+                        return .{
+                            .cursor = cursor,
+                            .core = .{ .size = header.size, .index = idx, .stack = try arrayListStackFromIndex(cursor, header.ptr, idx, shift) },
+                        };
+                    }
+
+                    pub fn initLinkedArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        if (cursor.slot_ptr.slot.tag != .linked_array_list) return emptyIter(cursor);
+                        var core_reader = cursor.db.core.reader();
+                        try core_reader.seekTo(cursor.slot_ptr.slot.value);
+                        const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        return .{
+                            .cursor = cursor,
+                            .core = .{ .size = header.size, .index = idx, .stack = try btreeStackFromIndex(cursor, header.root_ptr, idx) },
                         };
                     }
 
@@ -3232,6 +3265,51 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     var i: u8 = 0;
                                     while (i + 1 < node.num and (try cursor.db.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {
                                         before += node.counts[i];
+                                    }
+                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    node_ptr = node.children[i].value;
+                                },
+                            }
+                        }
+                    }
+
+                    // descend the array-list radix trie to `start_index`, pushing one
+                    // Level per tier with its index set to that tier's child slot.
+                    // nextInternal then walks forward from there.
+                    fn arrayListStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, shift: u6) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        var pos = root_ptr;
+                        var sh = shift;
+                        while (true) {
+                            const block = try readSlotBlock(cursor, pos);
+                            const i: u8 = @intCast(start_index >> (sh * BIT_COUNT) & MASK);
+                            try stack.append(.{ .position = pos, .block = block, .index = i });
+                            if (sh == 0) return stack;
+                            // every tier above the leaf is a populated .index slot for
+                            // any start_index < size, so this child always exists
+                            pos = block[i].value;
+                            sh -= 1;
+                        }
+                    }
+
+                    // descend the linked-array-list count b-tree to `start_index`; the
+                    // positional analog of sortedStackFromIndex (no separator keys).
+                    fn btreeStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        var node_ptr = root_ptr;
+                        var rem = start_index;
+                        while (true) {
+                            const node = try cursor.db.readBTreeNode(node_ptr);
+                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            switch (node.kind) {
+                                .leaf => {
+                                    try stack.append(.{ .position = position, .block = node.values, .index = @intCast(rem) });
+                                    return stack;
+                                },
+                                .branch => {
+                                    var i: u8 = 0;
+                                    while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                                        rem -= node.counts[i];
                                     }
                                     try stack.append(.{ .position = position, .block = node.children, .index = i });
                                     node_ptr = node.children[i].value;
@@ -3664,13 +3742,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return try self.cursor.iterator();
                 }
 
-                // iterate in key order starting at the first entry with key >= start_key
                 pub fn iteratorFrom(self: SortedMap(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
                     return try Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
                 }
 
-                // iterate in key order starting at the entry with rank start_index
-                pub fn iteratorFromIndex(self: SortedMap(write_mode), start_index: u64) !Cursor(write_mode).Iter {
+                pub fn iteratorFromIndex(self: SortedMap(write_mode), start_index: i65) !Cursor(write_mode).Iter {
                     return try Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
                 }
 
@@ -3772,7 +3848,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return try self.map.iteratorFrom(start_key);
                 }
 
-                pub fn iteratorFromIndex(self: SortedSet(write_mode), start_index: u64) !Cursor(write_mode).Iter {
+                pub fn iteratorFromIndex(self: SortedSet(write_mode), start_index: i65) !Cursor(write_mode).Iter {
                     return try self.map.iteratorFromIndex(start_index);
                 }
 
@@ -3833,6 +3909,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn iterator(self: ArrayList(write_mode)) !Cursor(write_mode).Iter {
                     return try self.cursor.iterator();
+                }
+
+                pub fn iteratorFrom(self: ArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
+                    return try Cursor(write_mode).Iter.initArrayListFromIndex(self.cursor, index);
                 }
 
                 pub fn getCursor(self: ArrayList(write_mode), index: i65) !?Cursor(.read_only) {
@@ -3920,6 +4000,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn iterator(self: LinkedArrayList(write_mode)) !Cursor(write_mode).Iter {
                     return try self.cursor.iterator();
+                }
+
+                pub fn iteratorFrom(self: LinkedArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
+                    return try Cursor(write_mode).Iter.initLinkedArrayListFromIndex(self.cursor, index);
                 }
 
                 pub fn getCursor(self: LinkedArrayList(write_mode), index: i65) !?Cursor(.read_only) {

@@ -3240,6 +3240,25 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 var kbuf: [8]u8 = undefined;
                 try std.testing.expectEqualStrings("k0058", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
             }
+            // negative indexes count from the end: -1 is the last entry, -COUNT the first
+            {
+                var iter = try map.iteratorFromIndex(-1);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0059", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try iter.next()) == null); // -1 is the last entry, so nothing follows
+            }
+            {
+                var iter = try map.iteratorFromIndex(-@as(i65, COUNT));
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0000", try (try (try iter.next()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+            // out of range past either end yields nothing
+            {
+                var it_hi = try map.iteratorFromIndex(COUNT);
+                try std.testing.expect((try it_hi.next()) == null);
+                var it_lo = try map.iteratorFromIndex(-@as(i65, COUNT) - 1);
+                try std.testing.expect((try it_lo.next()) == null);
+            }
 
             // remove the even keys, then re-verify order, count, and presence
             {
@@ -3378,5 +3397,121 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
         })).?);
         try std.testing.expectEqual(COUNT / 2, try map1.count());
         try std.testing.expectEqual(7, try (try map1.getCursor("k0001")).?.readUint());
+    }
+}
+
+test "iterator from index" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        try testIteratorFrom(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 });
+    }
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        try testIteratorFrom(allocator, .file, .{ .io = io, .file = file });
+    }
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        try testIteratorFrom(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+    }
+}
+
+fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+    _ = allocator;
+    try clearStorage(db_kind, init_opts);
+    const DB = xitdb.Database(db_kind, HashInt);
+    var db = try DB.init(init_opts);
+    var root_cursor = db.rootCursor();
+
+    // enough items to force several tiers in both the array-list radix trie
+    // (16^2 = 256 > 200) and the linked-array-list b-tree
+    const COUNT = 200;
+
+    const Ctx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+
+            const list = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+            for (0..COUNT) |i| {
+                try list.append(.{ .uint = @intCast(i) });
+            }
+
+            const linked = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("linked")));
+            for (0..COUNT) |i| {
+                try linked.append(.{ .uint = @intCast(i) });
+            }
+        }
+    };
+
+    _ = try root_cursor.writePath(Ctx, &.{
+        .array_list_init,
+        .array_list_append,
+        .{ .hash_map_init = .{} },
+        .{ .ctx = .{} },
+    });
+
+    const history = try DB.ArrayList(.read_only).init(db.rootCursor().readOnly());
+    const moment = try DB.HashMap(.read_only).init((try history.getCursor(-1)).?);
+    const list = try DB.ArrayList(.read_only).init((try moment.getCursor(hashInt("list"))).?);
+    const linked = try DB.LinkedArrayList(.read_only).init((try moment.getCursor(hashInt("linked"))).?);
+
+    // iteratorFrom(k) yields exactly k, k+1, .., COUNT-1 in order, for both types.
+    // negative indexes count from the end: -1 starts at the last element, -COUNT
+    // at the first.
+    const starts = [_]i65{ 0, 1, 15, 16, 17, 100, COUNT - 2, COUNT - 1, -1, -2, -16, -100, -COUNT };
+    for (starts) |start| {
+        const resolved: u64 = if (start < 0) @intCast(COUNT + start) else @intCast(start);
+        {
+            var iter = try list.iteratorFrom(start);
+            var expected = resolved;
+            while (try iter.next()) |c| {
+                try std.testing.expectEqual(expected, try c.readUint());
+                expected += 1;
+            }
+            try std.testing.expectEqual(COUNT, expected);
+        }
+        {
+            var iter = try linked.iteratorFrom(start);
+            var expected = resolved;
+            while (try iter.next()) |c| {
+                try std.testing.expectEqual(expected, try c.readUint());
+                expected += 1;
+            }
+            try std.testing.expectEqual(COUNT, expected);
+        }
+    }
+
+    // iteratorFrom(0) matches a plain iterator()
+    {
+        var a = try list.iterator();
+        var b = try list.iteratorFrom(0);
+        while (try a.next()) |ca| {
+            const cb = (try b.next()).?;
+            try std.testing.expectEqual(try ca.readUint(), try cb.readUint());
+        }
+        try std.testing.expect((try b.next()) == null);
+    }
+
+    // a start out of range (past the end, or more negative than -COUNT) yields nothing
+    for ([_]i65{ COUNT, COUNT + 1, COUNT + 1000, -COUNT - 1, -COUNT - 1000 }) |start| {
+        var li = try list.iteratorFrom(start);
+        try std.testing.expect((try li.next()) == null);
+        var ki = try linked.iteratorFrom(start);
+        try std.testing.expect((try ki.next()) == null);
     }
 }
