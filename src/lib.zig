@@ -20,11 +20,7 @@ pub const Slot = packed struct {
     //    being used. this allows us to distinguish between
     //    an unused slot (whose tag is always `none`) and
     //    a slot that was explicitly set to `none`.
-    // 2. if `index`, it means that it has no more space
-    //    for children. this is only relevant for the linked
-    //    array list, whose index slots must be marked as
-    //    full to prevent gaps from being used.
-    // 3. if `bytes` or `short_bytes`, it means the byte
+    // 2. if `bytes` or `short_bytes`, it means the byte
     //    array has a special format tag stored immediately
     //    after it. this format tag is two bytes long and
     //    has no special meaning to xitdb, but users can
