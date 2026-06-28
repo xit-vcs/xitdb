@@ -312,115 +312,145 @@ try std.testing.expectEqual(2, try big_cities.count());
 
 ## Sorting and Paginating
 
-The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order, which is meaningless to a human. You may need to display data in a sensible order (like newest posts first or users by signup date) and show it one page at a time. Relational databases like SQLite have this built-in: you declare a `CREATE INDEX`, write `ORDER BY created_ts LIMIT 20 OFFSET 40`, and the query planner maintains the index and seeks into it for you.
+The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order, which is meaningless to a human. Real apps need to show data in a sensible order (such as users listed alphabetically) one page at a time. Relational databases like SQLite have this built-in: you declare a `CREATE INDEX`, write `ORDER BY username LIMIT 20 OFFSET 40`, and the query planner maintains the index for you.
 
-In xitdb there are no built-in indexes, so you build and maintain them yourself. That's a little more code, but the index is just another data structure: a `SortedMap` whose keys are crafted to sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data.
+In xitdb there are no built-in indexes, so you build and maintain them yourself. That's a little more code, but the index is just another data structure: a `SortedMap` whose keys sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data.
 
-Let's model the storage a basic blog would need: a collection of posts we look up by id, plus a secondary index that lets us list them oldest-first with pagination. The primary store is a `HashMap` from post id to the post's fields (like a row keyed by its primary key). The secondary index is a `SortedMap` keyed by creation time, whose value is the post id to look up.
+Why a `SortedMap` and not an `ArrayList`? An `ArrayList` keeps things in insertion order, which is only useful when the order you want *is* the order you wrote them in. The moment you want a different order (alphabetical, by score, by anything that isn't "when it arrived") you need a structure that stays sorted by a key. A `SortedMap` does, and it can seek straight to the first key greater than or equal to a given value, which is what makes type-ahead search possible.
 
-The trick is the key. A `SortedMap` orders its keys lexicographically by their raw bytes, so we encode the timestamp as a big-endian integer (so byte order matches chronological order) and append the post id to break ties between posts created in the same second and keep every key unique:
+Let's model a user directory: a collection of users we look up by id, plus a secondary index that lists them alphabetically by username. The primary store is a `HashMap` from user id to the user's fields (like a row keyed by its primary key). The secondary index is a `SortedMap` keyed by username, whose value is the user id to look up.
 
-```zig
-const post_id_size = 16;
+A `SortedMap` orders its keys lexicographically by their raw bytes. For ASCII usernames that's just alphabetical order, and since usernames are unique, every key is already distinct, so the key is simply the username itself. For a sort key that *isn't* unique, like a score, you'd append the id to keep keys distinct. See the note at the end.
 
-// build a SortedMap key that sorts by creation time. the big-endian
-// timestamp makes byte order match chronological order; the post id is
-// appended so two posts with the same timestamp still get distinct keys.
-fn orderKey(timestamp: u64, post_id: *const [post_id_size]u8) [@sizeOf(u64) + post_id_size]u8 {
-    var key: [@sizeOf(u64) + post_id_size]u8 = undefined;
-    std.mem.writeInt(u64, key[0..@sizeOf(u64)], timestamp, .big);
-    @memcpy(key[@sizeOf(u64)..], post_id);
-    return key;
-}
-```
-
-Now we write some posts. On each insert we write the post into the primary map and add an entry to the secondary index (keeping both in sync is your job, not the database's):
+Now we write some users. Note they're inserted in arbitrary order; the index sorts them, so insertion order doesn't matter. On each insert we write the user into the primary map and add an entry to the secondary index (keeping both in sync is your job, not the database's):
 
 ```zig
-const Post = struct { id: *const [post_id_size]u8, title: []const u8, created_ts: u64 };
+const user_id_size = 16;
+const User = struct { id: *const [user_id_size]u8, username: []const u8, name: []const u8 };
 
-const new_posts = [_]Post{
-    .{ .id = "post000000000001", .title = "Hello, world", .created_ts = 1_700_000_000 },
-    .{ .id = "post000000000002", .title = "Second post", .created_ts = 1_700_000_500 },
-    .{ .id = "post000000000003", .title = "Third post", .created_ts = 1_700_001_000 },
+// inserted in arbitrary order; the index will sort them alphabetically
+const new_users = [_]User{
+    .{ .id = "user000000000001", .username = "dave", .name = "Dave Smith" },
+    .{ .id = "user000000000002", .username = "alice", .name = "Alice Jones" },
+    .{ .id = "user000000000003", .username = "carol", .name = "Carol White" },
+    .{ .id = "user000000000004", .username = "dan", .name = "Dan Brown" },
+    .{ .id = "user000000000005", .username = "bob", .name = "Bob Lee" },
+    .{ .id = "user000000000006", .username = "eve", .name = "Eve Adams" },
 };
 
 const Ctx = struct {
     pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
         const moment = try DB.HashMap(.read_write).init(cursor.*);
 
-        // the primary store: a HashMap from post id to the post's fields
-        const id_to_post_cursor = try moment.putCursor(hashInt("id->post"));
-        const id_to_post = try DB.HashMap(.read_write).init(id_to_post_cursor);
+        // the primary store: a HashMap from user id to the user's fields
+        const id_to_user_cursor = try moment.putCursor(hashInt("id->user"));
+        const id_to_user = try DB.HashMap(.read_write).init(id_to_user_cursor);
 
-        // the secondary index: a SortedMap ordered by creation time. there's
-        // no CREATE INDEX here, so we maintain it ourselves on every write.
-        const created_ts_to_post_id_cursor = try moment.putCursor(hashInt("created-ts->post-id"));
-        const created_ts_to_post_id = try DB.SortedMap(.read_write).init(created_ts_to_post_id_cursor);
+        // the secondary index: a SortedMap ordered alphabetically by username.
+        // there's no CREATE INDEX here, so we maintain it ourselves on every write.
+        const username_to_id_cursor = try moment.putCursor(hashInt("username->id"));
+        const username_to_id = try DB.SortedMap(.read_write).init(username_to_id_cursor);
 
-        for (new_posts) |post| {
-            // write the post into the primary map under its id
-            const post_cursor = try id_to_post.putCursor(hashInt(post.id));
-            const post_map = try DB.HashMap(.read_write).init(post_cursor);
-            try post_map.put(hashInt("title"), .{ .bytes = post.title });
-            try post_map.put(hashInt("created-ts"), .{ .uint = post.created_ts });
+        for (new_users) |user| {
+            // write the user into the primary map under its id
+            const user_cursor = try id_to_user.putCursor(hashInt(user.id));
+            const user_map = try DB.HashMap(.read_write).init(user_cursor);
+            try user_map.put(hashInt("username"), .{ .bytes = user.username });
+            try user_map.put(hashInt("name"), .{ .bytes = user.name });
 
-            // add an entry to the secondary index. the key sorts by time,
-            // and the value is the post id we'll use to look the post back up.
-            const order_key = orderKey(post.created_ts, post.id);
-            try created_ts_to_post_id.put(&order_key, .{ .bytes = post.id });
+            // add an entry to the secondary index: the key is the username (the
+            // sort key), and the value is the user id we'll use to look it back up.
+            try username_to_id.put(user.username, .{ .bytes = user.id });
         }
     }
 };
 try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
 ```
 
-To display a page, we walk the `SortedMap` instead of the `HashMap`. A web app would take a `page_size` and an `after` offset from the request (something like `/posts?after=20`), so this is the xitdb equivalent of `ORDER BY created_ts LIMIT page_size OFFSET after`:
+To display a page, we walk the `SortedMap` instead of the `HashMap`. A web app would take a `page_size` and an `after` offset from the request (something like `/users?after=20`), so this is the xitdb equivalent of `ORDER BY username LIMIT page_size OFFSET after`:
 
 ```zig
 const moment_cursor = (try history.getCursor(-1)).?;
 const moment = try DB.HashMap(.read_only).init(moment_cursor);
 
-const id_to_post_cursor = (try moment.getCursor(hashInt("id->post"))).?;
-const id_to_post = try DB.HashMap(.read_only).init(id_to_post_cursor);
+const id_to_user_cursor = (try moment.getCursor(hashInt("id->user"))).?;
+const id_to_user = try DB.HashMap(.read_only).init(id_to_user_cursor);
 
-const created_ts_to_post_id_cursor = (try moment.getCursor(hashInt("created-ts->post-id"))).?;
-const created_ts_to_post_id = try DB.SortedMap(.read_only).init(created_ts_to_post_id_cursor);
+const username_to_id_cursor = (try moment.getCursor(hashInt("username->id"))).?;
+const username_to_id = try DB.SortedMap(.read_only).init(username_to_id_cursor);
 
 // a web request would supply these; here we just grab the first page
 const page_size = 2;
 const after = 0;
 
-const count = try created_ts_to_post_id.count();
+const count = try username_to_id.count();
 const end = @min(after + page_size, count);
 
 // seek straight to the start of the page, then walk forward one entry at a
 // time. because SortedMap is a count-augmented B+tree, iteratorFromIndex
 // finds rank `after` in O(log n) without scanning the entries it skips, so
 // jumping to page 500 is just as cheap as page 1.
-var iter = try created_ts_to_post_id.iteratorFromIndex(after);
+var iter = try username_to_id.iteratorFromIndex(after);
 var i = after;
 while (i < end) : (i += 1) {
     var id_cursor = (try iter.next()) orelse break;
     const id_kv = try id_cursor.readKeyValuePair();
 
-    // the index entry's value is the post id; use it to read the
-    // full post out of the primary map
-    var post_id: [post_id_size]u8 = undefined;
-    _ = try id_kv.value_cursor.readBytes(&post_id);
+    // the index entry's value is the user id; use it to read the
+    // full user out of the primary map
+    var user_id: [user_id_size]u8 = undefined;
+    _ = try id_kv.value_cursor.readBytes(&user_id);
 
-    const post_cursor = (try id_to_post.getCursor(hashInt(&post_id))).?;
-    const post_map = try DB.HashMap(.read_only).init(post_cursor);
-    const title_cursor = (try post_map.getCursor(hashInt("title"))).?;
-    const title = try title_cursor.readBytesAlloc(allocator, MAX_READ_BYTES);
-    defer allocator.free(title);
+    const user_cursor = (try id_to_user.getCursor(hashInt(&user_id))).?;
+    const user_map = try DB.HashMap(.read_only).init(user_cursor);
+    const name_cursor = (try user_map.getCursor(hashInt("name"))).?;
+    const name = try name_cursor.readBytesAlloc(allocator, MAX_READ_BYTES);
+    defer allocator.free(name);
 
     // a real app would render this into the page's HTML
-    std.debug.print("{s}\n", .{title});
+    std.debug.print("{s}\n", .{name});
 }
 ```
 
-This works for any ordering you need: sort by a username with a string key, by score with a big-endian integer key, or build several `SortedMap` indexes over the same primary `HashMap` to offer the data in different orders. With xitdb you "bring your own index". It takes a bit more effort than the declarative convenience of SQL databases, but it gives you more explicit control, and avoids the common problem in SQL where queries silently become inefficient due to not using indexes. In xitdb, inefficiency is hard to miss because you are always writing your queries as imperative code and the indexes are always explicit.
+Pagination by index is only half of what the ordering buys us. Because the index is sorted by username, we can also seek straight to a *key* (the first username greater than or equal to a prefix) and walk forward only as far as the prefix matches. That's a type-ahead search (think @-mention autocomplete), and it's the thing an `ArrayList` can't do: with no sorted index, there's nothing to seek into. We use `iteratorFrom` (which takes a key) instead of `iteratorFromIndex` (which takes a rank):
+
+```zig
+// the user typed "da" into an @-mention box; find everyone whose username
+// starts with it. iteratorFrom seeks to the first key >= "da" in O(log n),
+// then we walk forward until a username no longer starts with the prefix.
+const prefix = "da";
+var ac_iter = try username_to_id.iteratorFrom(prefix);
+while (try ac_iter.next()) |next_cursor| {
+    var id_cursor = next_cursor;
+    const id_kv = try id_cursor.readKeyValuePair();
+
+    // the key is the username; stop once we've walked past the prefix
+    var username_buf: [64]u8 = undefined;
+    const username = try id_kv.key_cursor.readBytes(&username_buf);
+    if (!std.mem.startsWith(u8, username, prefix)) break;
+
+    // a real app would offer this as a suggestion (here: "dan", then "dave")
+    std.debug.print("{s}\n", .{username});
+}
+```
+
+This works for any ordering you need: sort by a username with a string key like we did here, by score with a big-endian integer key (encode numbers big-endian so their byte order matches numeric order), or build several `SortedMap` indexes over the same primary `HashMap` to offer the data in different orders. When a sort key isn't unique (many users could share a score), append the id to keep every key distinct:
+
+```zig
+const user_id_size = 16;
+
+// build a SortedMap key that sorts by score. the big-endian score makes byte
+// order match numeric order; the user id is appended so two users with the
+// same score still get distinct keys.
+fn orderKey(score: u64, user_id: *const [user_id_size]u8) [@sizeOf(u64) + user_id_size]u8 {
+    var key: [@sizeOf(u64) + user_id_size]u8 = undefined;
+    std.mem.writeInt(u64, key[0..@sizeOf(u64)], score, .big);
+    @memcpy(key[@sizeOf(u64)..], user_id);
+    return key;
+}
+```
+
+With xitdb you "bring your own index". It takes a bit more effort than the declarative convenience of SQL databases, but it gives you more explicit control, and avoids the common problem in SQL where queries silently become inefficient due to not using indexes. In xitdb, inefficiency is hard to miss because you are always writing your queries as imperative code and the indexes are always explicit.
 
 ## Large Byte Arrays
 

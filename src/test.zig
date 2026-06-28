@@ -778,92 +778,103 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         // like the "Sorting and Paginating" section of the readme
         const history = try DB.ArrayList(.read_write).init(db.rootCursor());
 
-        const post_id_size = 16;
-        const Post = struct { id: *const [post_id_size]u8, title: []const u8, created_ts: u64 };
+        const user_id_size = 16;
+        const User = struct { id: *const [user_id_size]u8, username: []const u8, name: []const u8 };
 
-        // post ids are fixed-length so the timestamp tie-breaker stays aligned
-        const new_posts = [_]Post{
-            .{ .id = "post000000000001", .title = "Hello, world", .created_ts = 1_700_000_000 },
-            .{ .id = "post000000000002", .title = "Second post", .created_ts = 1_700_000_500 },
-            .{ .id = "post000000000003", .title = "Third post", .created_ts = 1_700_001_000 },
+        // inserted in arbitrary order; the index sorts them alphabetically
+        const new_users = [_]User{
+            .{ .id = "user000000000001", .username = "dave", .name = "Dave Smith" },
+            .{ .id = "user000000000002", .username = "alice", .name = "Alice Jones" },
+            .{ .id = "user000000000003", .username = "carol", .name = "Carol White" },
+            .{ .id = "user000000000004", .username = "dan", .name = "Dan Brown" },
+            .{ .id = "user000000000005", .username = "bob", .name = "Bob Lee" },
+            .{ .id = "user000000000006", .username = "eve", .name = "Eve Adams" },
         };
 
         const Ctx = struct {
-            posts: []const Post,
-
-            // build a SortedMap key that sorts by creation time. the big-endian
-            // timestamp makes byte order match chronological order; the post id
-            // is appended so two posts with the same timestamp stay distinct.
-            fn orderKey(timestamp: u64, post_id: *const [post_id_size]u8) [@sizeOf(u64) + post_id_size]u8 {
-                var key: [@sizeOf(u64) + post_id_size]u8 = undefined;
-                std.mem.writeInt(u64, key[0..@sizeOf(u64)], timestamp, .big);
-                @memcpy(key[@sizeOf(u64)..], post_id);
-                return key;
-            }
+            users: []const User,
 
             pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
                 const moment = try DB.HashMap(.read_write).init(cursor.*);
 
-                // the primary store: a HashMap from post id to the post's fields
-                const id_to_post_cursor = try moment.putCursor(hashInt("id->post"));
-                const id_to_post = try DB.HashMap(.read_write).init(id_to_post_cursor);
+                // the primary store: a HashMap from user id to the user's fields
+                const id_to_user_cursor = try moment.putCursor(hashInt("id->user"));
+                const id_to_user = try DB.HashMap(.read_write).init(id_to_user_cursor);
 
-                // the secondary index: a SortedMap ordered by creation time
-                const created_ts_to_post_id_cursor = try moment.putCursor(hashInt("created-ts->post-id"));
-                const created_ts_to_post_id = try DB.SortedMap(.read_write).init(created_ts_to_post_id_cursor);
+                // the secondary index: a SortedMap ordered alphabetically by username
+                const username_to_id_cursor = try moment.putCursor(hashInt("username->id"));
+                const username_to_id = try DB.SortedMap(.read_write).init(username_to_id_cursor);
 
-                for (self.posts) |post| {
-                    const post_cursor = try id_to_post.putCursor(hashInt(post.id));
-                    const post_map = try DB.HashMap(.read_write).init(post_cursor);
-                    try post_map.put(hashInt("title"), .{ .bytes = post.title });
-                    try post_map.put(hashInt("created-ts"), .{ .uint = post.created_ts });
+                for (self.users) |user| {
+                    const user_cursor = try id_to_user.putCursor(hashInt(user.id));
+                    const user_map = try DB.HashMap(.read_write).init(user_cursor);
+                    try user_map.put(hashInt("username"), .{ .bytes = user.username });
+                    try user_map.put(hashInt("name"), .{ .bytes = user.name });
 
-                    const order_key = orderKey(post.created_ts, post.id);
-                    try created_ts_to_post_id.put(&order_key, .{ .bytes = post.id });
+                    // the key is the username (the sort key); the value is the id
+                    try username_to_id.put(user.username, .{ .bytes = user.id });
                 }
             }
         };
-        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .posts = &new_posts });
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .users = &new_users });
 
         const moment_cursor = (try history.getCursor(-1)).?;
         const moment = try DB.HashMap(.read_only).init(moment_cursor);
 
-        const id_to_post_cursor = (try moment.getCursor(hashInt("id->post"))).?;
-        const id_to_post = try DB.HashMap(.read_only).init(id_to_post_cursor);
+        const id_to_user_cursor = (try moment.getCursor(hashInt("id->user"))).?;
+        const id_to_user = try DB.HashMap(.read_only).init(id_to_user_cursor);
 
-        const created_ts_to_post_id_cursor = (try moment.getCursor(hashInt("created-ts->post-id"))).?;
-        const created_ts_to_post_id = try DB.SortedMap(.read_only).init(created_ts_to_post_id_cursor);
+        const username_to_id_cursor = (try moment.getCursor(hashInt("username->id"))).?;
+        const username_to_id = try DB.SortedMap(.read_only).init(username_to_id_cursor);
 
-        try std.testing.expectEqual(new_posts.len, try created_ts_to_post_id.count());
+        try std.testing.expectEqual(new_users.len, try username_to_id.count());
 
-        // page through the index two at a time, oldest first, and check we get
-        // every post back in creation order
+        // page through the index two at a time and check we get every user back
+        // in alphabetical order by username (not the order they were inserted)
         const page_size = 2;
-        const expected_titles = [_][]const u8{ "Hello, world", "Second post", "Third post" };
+        const expected_names = [_][]const u8{ "Alice Jones", "Bob Lee", "Carol White", "Dan Brown", "Dave Smith", "Eve Adams" };
 
-        const count = try created_ts_to_post_id.count();
+        const count = try username_to_id.count();
         var seen: usize = 0;
         var after: u64 = 0;
         while (after < count) : (after += page_size) {
             const end = @min(after + page_size, count);
-            var iter = try created_ts_to_post_id.iteratorFromIndex(after);
+            var iter = try username_to_id.iteratorFromIndex(after);
             var i = after;
             while (i < end) : (i += 1) {
                 var id_cursor = (try iter.next()).?;
                 const id_kv = try id_cursor.readKeyValuePair();
-                var post_id: [post_id_size]u8 = undefined;
-                _ = try id_kv.value_cursor.readBytes(&post_id);
+                var user_id: [user_id_size]u8 = undefined;
+                _ = try id_kv.value_cursor.readBytes(&user_id);
 
-                const post_cursor = (try id_to_post.getCursor(hashInt(&post_id))).?;
-                const post_map = try DB.HashMap(.read_only).init(post_cursor);
-                const title_cursor = (try post_map.getCursor(hashInt("title"))).?;
-                var title_buf: [64]u8 = undefined;
-                const title = try title_cursor.readBytes(&title_buf);
-                try std.testing.expectEqualStrings(expected_titles[seen], title);
+                const user_cursor = (try id_to_user.getCursor(hashInt(&user_id))).?;
+                const user_map = try DB.HashMap(.read_only).init(user_cursor);
+                const name_cursor = (try user_map.getCursor(hashInt("name"))).?;
+                var name_buf: [64]u8 = undefined;
+                const name = try name_cursor.readBytes(&name_buf);
+                try std.testing.expectEqualStrings(expected_names[seen], name);
                 seen += 1;
             }
         }
-        try std.testing.expectEqual(new_posts.len, seen);
+        try std.testing.expectEqual(new_users.len, seen);
+
+        // autocomplete: seek straight to the first username >= "da", then walk
+        // forward only while the prefix matches. this lower-bound seek by key is
+        // the thing an ArrayList can't do.
+        const prefix = "da";
+        const expected_matches = [_][]const u8{ "dan", "dave" };
+        var matches: usize = 0;
+        var ac_iter = try username_to_id.iteratorFrom(prefix);
+        while (try ac_iter.next()) |next_cursor| {
+            var id_cursor = next_cursor;
+            const id_kv = try id_cursor.readKeyValuePair();
+            var username_buf: [64]u8 = undefined;
+            const username = try id_kv.key_cursor.readBytes(&username_buf);
+            if (!std.mem.startsWith(u8, username, prefix)) break;
+            try std.testing.expectEqualStrings(expected_matches[matches], username);
+            matches += 1;
+        }
+        try std.testing.expectEqual(expected_matches.len, matches);
     }
 }
 
