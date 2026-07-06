@@ -469,7 +469,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             opts.hash_id = target_opts.hash_id orelse self.header.hash_id;
             var target = try Database(target_db_kind, HashInt).init(opts);
 
-            if (self.header.tag == .none) return target;
+            if (self.header.tag == .none) {
+                try target.core.sync();
+                return target;
+            }
             if (self.header.tag != .array_list) return error.UnexpectedTag;
 
             // read source's top-level ArrayListHeader
@@ -477,7 +480,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try source_reader.seekTo(DATABASE_START);
             const source_header: ArrayListHeader = @bitCast(try takeInt(&source_reader.interface, ArrayListHeaderInt, .big));
 
-            if (source_header.size == 0) return target;
+            if (source_header.size == 0) {
+                try target.core.sync();
+                return target;
+            }
 
             // read the last moment's slot
             const last_key = source_header.size - 1;
@@ -517,6 +523,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try target_writer.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
             try target_writer.interface.writeInt(u64, file_size, .big);
             try target.core.flush();
+
+            // fsync so the compacted database is durable, since callers
+            // typically rename it over an existing database file
+            try target.core.sync();
 
             return target;
         }
