@@ -148,12 +148,14 @@ pub const InitOptsMemory = struct {
 };
 
 pub const InitOptsFile = struct {
+    fsync: bool = true,
     io: std.Io,
     file: std.Io.File,
     hash_id: ?HashId = null,
 };
 
 pub const InitOptsBufferedFile = struct {
+    fsync: bool = true,
     io: std.Io,
     file: std.Io.File,
     buffer: *std.Io.Writer.Allocating,
@@ -401,6 +403,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .core = .{
                         .io = opts.io,
                         .file = opts.file,
+                        .fsync = opts.fsync,
                     },
                     .header = undefined,
                     .tx_start = null,
@@ -415,6 +418,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         .file = .{
                             .io = opts.io,
                             .file = opts.file,
+                            .fsync = opts.fsync,
                         },
                     },
                     .header = undefined,
@@ -4573,6 +4577,7 @@ const CoreMemory = struct {
 const CoreFile = struct {
     io: std.Io,
     file: std.Io.File,
+    fsync: bool,
 
     pub const Reader = std.Io.File.Reader;
     pub const Writer = std.Io.File.Writer;
@@ -4600,6 +4605,7 @@ const CoreFile = struct {
     }
 
     pub fn sync(self: *const CoreFile) !void {
+        if (!self.fsync) return;
         try self.file.sync(self.io);
     }
 
