@@ -716,9 +716,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // if top level array list, put the file size in the header
                     if (is_top_level) {
-                        // it is very important that we flush before updating the header,
-                        // because updating the header is what completes the transaction
-                        try self.core.flush();
+                        // flush and fsync before updating the header, because updating
+                        // the header is what completes the transaction. without the
+                        // fsync, the OS could persist the header before the data it
+                        // points to, so a crash could commit a moment whose data never
+                        // reached disk. writePath does a second sync afterwards to make
+                        // the header itself durable.
+                        try self.core.sync();
 
                         const file_size = try self.core.length();
                         const header = TopLevelArrayListHeader{
@@ -752,6 +756,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // slice
                     const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size);
                     const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
+
+                    // if top level, updating the header below commits the transaction,
+                    // so make everything written so far durable first
+                    if (is_top_level) {
+                        try self.core.sync();
+                    }
 
                     // update header
                     var writer = self.core.writer();
