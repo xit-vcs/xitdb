@@ -4201,6 +4201,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
             for (&remapped_slots) |*s| {
                 const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                try child_slot.tag.validate();
                 s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
             }
 
@@ -4281,6 +4282,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var slots: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&slots) |*s| {
                         const value_slot: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        try value_slot.tag.validate();
                         s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, value_slot);
                     }
 
@@ -4301,6 +4303,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
                         const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        try child.tag.validate();
                         if (child.tag == .index) {
                             const remapped_ptr = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, child.value);
                             s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
@@ -4341,6 +4344,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
             for (&remapped_slots) |*s| {
                 const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                try child_slot.tag.validate();
                 s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
             }
 
@@ -4364,6 +4368,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             // read KeyValuePair
             try reader.seekTo(slot.value);
             const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
+            try kv_pair.key_slot.tag.validate();
+            try kv_pair.value_slot.tag.validate();
 
             // remap key_slot and value_slot
             const remapped_key = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.key_slot);
@@ -4422,6 +4428,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var entries: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&entries) |*s| {
                         const entry: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        try entry.tag.validate();
                         s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, entry);
                     }
 
@@ -4442,6 +4449,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
                         const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        try child.tag.validate();
                         if (child.tag == .index) {
                             const remapped_ptr = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, child.value);
                             s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
@@ -4452,6 +4460,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var separators: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&separators) |*s| {
                         const sep: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                        try sep.tag.validate();
                         s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, sep);
                     }
                     var counts: [BTREE_SLOT_COUNT]u64 = undefined;
