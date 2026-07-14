@@ -602,6 +602,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             try writer.seekTo(0);
                             self.header.tag = .array_list;
                             try writer.interface.writeInt(DatabaseHeaderInt, @bitCast(self.header), .big);
+                        } else if (self.header.tag != .array_list) {
+                            return error.UnexpectedTag;
                         }
 
                         var next_slot_ptr = slot_ptr;
@@ -1009,6 +1011,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             try writer.seekTo(0);
                             self.header.tag = tag;
                             try writer.interface.writeInt(DatabaseHeaderInt, @bitCast(self.header), .big);
+                        } else switch (self.header.tag) {
+                            .hash_map, .hash_set => if (hash_map_init.counted) return error.UnexpectedTag,
+                            .counted_hash_map, .counted_hash_set => if (!hash_map_init.counted) return error.UnexpectedTag,
+                            else => return error.UnexpectedTag,
                         }
 
                         var next_slot_ptr = slot_ptr;
