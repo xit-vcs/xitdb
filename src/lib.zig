@@ -4536,7 +4536,7 @@ const CoreMemory = struct {
                     }
                 }
                 var arr = self.parent.buffer.toArrayList();
-                try arr.ensureTotalCapacityPrecise(self.parent.buffer.allocator, new_size);
+                try arr.ensureTotalCapacity(self.parent.buffer.allocator, new_size);
                 arr.items.len = new_size;
                 self.parent.buffer.* = std.Io.Writer.Allocating.fromArrayList(self.parent.buffer.allocator, &arr);
             }
