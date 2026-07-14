@@ -3165,8 +3165,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     pub fn initSortedFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
-                        // an unwritten map is .none (like iterator()): yield nothing
-                        if (cursor.slot_ptr.slot.tag == .none) return emptyIter(cursor);
+                        switch (cursor.slot_ptr.slot.tag) {
+                            // an unwritten map is .none (like iterator()): yield nothing
+                            .none => return emptyIter(cursor),
+                            .sorted_map, .sorted_set => {},
+                            else => return error.UnexpectedTag,
+                        }
                         const total = try cursor.count();
                         const idx = resolveStartIndex(start_index, total) orelse return emptyIter(cursor);
                         const root_ptr = try sortedRootPtr(cursor);
@@ -3177,8 +3181,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     pub fn initSortedFromKey(cursor: Cursor(write_mode), start_key: []const u8) !Iter {
-                        if (cursor.slot_ptr.slot.tag == .none) {
-                            return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .none => return emptyIter(cursor),
+                            .sorted_map, .sorted_set => {},
+                            else => return error.UnexpectedTag,
                         }
                         const total = try cursor.count();
                         const root_ptr = try sortedRootPtr(cursor);
@@ -3190,7 +3196,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     pub fn initArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
-                        if (cursor.slot_ptr.slot.tag != .array_list) return emptyIter(cursor);
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .none => return emptyIter(cursor),
+                            .array_list => {},
+                            else => return error.UnexpectedTag,
+                        }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
@@ -3204,7 +3214,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     pub fn initLinkedArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
-                        if (cursor.slot_ptr.slot.tag != .linked_array_list) return emptyIter(cursor);
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .none => return emptyIter(cursor),
+                            .linked_array_list => {},
+                            else => return error.UnexpectedTag,
+                        }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
