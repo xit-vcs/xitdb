@@ -1325,7 +1325,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (path.len > 1) return error.PathPartMustBeAtEnd;
 
                     if (@TypeOf(ctx) == void) {
-                        return error.NotImplmented;
+                        return error.NotImplemented;
                     } else {
                         var next_cursor = Cursor(.read_write){
                             .slot_ptr = slot_ptr,
