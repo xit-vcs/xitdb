@@ -118,8 +118,9 @@ test "not using arraylist at the top level" {
 test "low level memory operations" {
     const allocator = std.testing.allocator;
 
-    var buffer = std.Io.Writer.Allocating.init(allocator);
+    var buffer = try std.Io.Writer.Allocating.initCapacity(allocator, 100);
     defer buffer.deinit();
+    @memset(buffer.writer.buffer, 0xaa);
     var db = try xitdb.Database(.memory, HashInt).init(.{ .buffer = &buffer, .max_size = 10000 });
 
     var writer = db.core.writer();
@@ -142,6 +143,11 @@ test "low level memory operations" {
 
     try reader.seekTo(try db.core.length() + 1);
     try std.testing.expectError(error.EndOfStream, reader.interface.readSliceAll(block[0..1]));
+
+    const size = try db.core.length();
+    try writer.seekTo(size + 3);
+    try writer.interface.writeAll("!");
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, '!' }, db.core.buffer.written()[size..]);
 }
 
 test "validate tag" {

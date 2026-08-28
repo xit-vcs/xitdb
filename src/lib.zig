@@ -4600,8 +4600,12 @@ const CoreMemory = struct {
             for (data) |buf| {
                 const n = buf.len;
                 if (n == 0) continue;
+                const old_size = w.parent.buffer.written().len;
                 const new_position = w.pos + @as(u64, @intCast(n));
                 w.resizeBuffer(new_position) catch return error.WriteFailed;
+                if (w.pos > old_size) {
+                    @memset(w.parent.buffer.written()[old_size..w.pos], 0);
+                }
                 @memcpy(w.parent.buffer.written()[w.pos..new_position], buf);
                 w.pos = new_position;
                 return io_w.consume(n);
