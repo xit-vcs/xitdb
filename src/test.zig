@@ -2861,6 +2861,18 @@ fn testCompaction(
                 pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
                     const moment = try DB.HashMap(.read_write).init(cursor.*);
                     try moment.put(hashInt("key1"), .{ .bytes = "final_value" });
+
+                    // cycles must survive compaction rather than causing the
+                    // remapper to recurse indefinitely.
+                    try moment.put(hashInt("self"), .{ .slot = moment.slot() });
+
+                    const cyclic_list = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("cyclic-list")));
+                    try cyclic_list.append(.{ .slot = cyclic_list.slot() });
+
+                    const map_a = try DB.HashMap(.read_write).init(try moment.putCursor(hashInt("map-a")));
+                    const map_b = try DB.HashMap(.read_write).init(try moment.putCursor(hashInt("map-b")));
+                    try map_a.put(hashInt("map-b"), .{ .slot = map_b.slot() });
+                    try map_b.put(hashInt("map-a"), .{ .slot = map_a.slot() });
                 }
             };
             try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx3{});
@@ -2885,6 +2897,21 @@ fn testCompaction(
         // verify all data from latest moment is correct
         const moment_cursor = (try history.getCursor(0)).?;
         const moment = try TargetDB.HashMap(.read_only).init(moment_cursor);
+
+        // self-references and mutual references point back to the same compacted
+        // objects rather than duplicate objects or dangling source offsets.
+        const self_cursor = (try moment.getCursor(hashInt("self"))).?;
+        try std.testing.expect(self_cursor.slot().eql(moment_cursor.slot()));
+
+        const cyclic_list_cursor = (try moment.getCursor(hashInt("cyclic-list"))).?;
+        const cyclic_list = try TargetDB.ArrayList(.read_only).init(cyclic_list_cursor);
+        try std.testing.expect((try cyclic_list.getSlot(0)).?.eql(cyclic_list_cursor.slot()));
+
+        const map_a_cursor = (try moment.getCursor(hashInt("map-a"))).?;
+        const map_a = try TargetDB.HashMap(.read_only).init(map_a_cursor);
+        const map_b_cursor = (try map_a.getCursor(hashInt("map-b"))).?;
+        const map_b = try TargetDB.HashMap(.read_only).init(map_b_cursor);
+        try std.testing.expect((try map_b.getSlot(hashInt("map-a"))).?.eql(map_a_cursor.slot()));
 
         // key1 should have the final value
         const key1_val = try (try moment.getCursor(hashInt("key1"))).?.readBytesAlloc(allocator, 1024);

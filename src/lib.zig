@@ -4121,6 +4121,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // compaction helpers
 
+        fn reserveBlock(comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), comptime size: usize) !u64 {
+            const offset = try target_core.length();
+            var writer = target_core.writer();
+            try writer.seekTo(offset);
+            const empty_block = [_]u8{0} ** size;
+            try writer.interface.writeAll(&empty_block);
+            return offset;
+        }
+
         fn remapSlot(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) anyerror!Slot {
             switch (slot.tag) {
                 .none, .uint, .int, .float, .short_bytes => return slot,
@@ -4128,8 +4137,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (offset_map.get(slot.value)) |mapped| {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
-                    const new_offset = try remapBytes(source_core, target_db_kind, target_core, slot);
-                    try offset_map.put(slot.value, new_offset);
+                    const new_offset = try remapBytes(source_core, target_db_kind, target_core, offset_map, slot);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .index => {
@@ -4137,7 +4145,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapIndex(source_core, target_db_kind, target_core, offset_map, slot);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .array_list => {
@@ -4145,7 +4152,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapArrayList(source_core, target_db_kind, target_core, offset_map, slot);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .linked_array_list => {
@@ -4153,7 +4159,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapBTree(source_core, target_db_kind, target_core, offset_map, slot);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .hash_map, .hash_set => {
@@ -4161,7 +4166,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, false);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .counted_hash_map, .counted_hash_set => {
@@ -4169,7 +4173,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, true);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .kv_pair => {
@@ -4177,7 +4180,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapKvPair(source_core, target_db_kind, target_core, offset_map, slot);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
                 .sorted_map, .sorted_set => {
@@ -4185,13 +4187,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
                     }
                     const new_offset = try remapSortedMap(source_core, target_db_kind, target_core, offset_map, slot);
-                    try offset_map.put(slot.value, new_offset);
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
                 },
             }
         }
 
-        fn remapBytes(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), slot: Slot) !u64 {
+        fn remapBytes(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -4216,6 +4217,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 remaining -= chunk;
             }
 
+            try offset_map.put(slot.value, new_offset);
             return new_offset;
         }
 
@@ -4228,6 +4230,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
             try reader.interface.readSliceAll(&block_bytes);
 
+            const new_offset = try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE);
+            try offset_map.put(slot.value, new_offset);
+
             // remap each slot
             var block_reader = std.Io.Reader.fixed(&block_bytes);
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
@@ -4238,7 +4243,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
 
             // write remapped block to target
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             for (remapped_slots) |s| {
                 try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
@@ -4255,12 +4259,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try reader.seekTo(slot.value);
             const header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
 
+            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(ArrayListHeader));
+            try offset_map.put(slot.value, new_offset);
+
             // remap root index block pointer via remapSlot as an .index slot
             const index_slot = Slot{ .value = header.ptr, .tag = .index };
             const remapped_index = try remapSlot(source_core, target_db_kind, target_core, offset_map, index_slot);
 
             // write new ArrayListHeader with remapped ptr
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(ArrayListHeader{
                 .ptr = remapped_index.value,
@@ -4277,9 +4283,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try reader.seekTo(slot.value);
             const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
+            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(BTreeHeader));
+            try offset_map.put(slot.value, new_offset);
+
             const remapped_root = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
 
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
                 .root_ptr = remapped_root,
@@ -4304,12 +4312,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const kind_int = try takeInt(&reader.interface, u8, .big);
             const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
             const num = try takeInt(&reader.interface, u8, .big);
+            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
 
             switch (kind) {
                 .leaf => {
                     var body = [_]u8{0} ** (BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
+
+                    const new_offset = try reserveBlock(target_db_kind, target_core, BTREE_LEAF_BLOCK_SIZE);
+                    try offset_map.put(node_offset, new_offset);
 
                     var slots: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&slots) |*s| {
@@ -4318,19 +4330,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, value_slot);
                     }
 
-                    const new_offset = try target_core.length();
                     try writer.seekTo(new_offset);
                     try writer.interface.writeInt(u8, kind_int, .big);
                     try writer.interface.writeInt(u8, num, .big);
                     for (slots) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
 
-                    try offset_map.put(node_offset, new_offset);
                     return new_offset;
                 },
                 .branch => {
                     var body = [_]u8{0} ** (BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
+
+                    const new_offset = try reserveBlock(target_db_kind, target_core, BTREE_BRANCH_BLOCK_SIZE);
+                    try offset_map.put(node_offset, new_offset);
 
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
@@ -4346,20 +4359,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var counts: [BTREE_SLOT_COUNT]u64 = undefined;
                     for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
-                    const new_offset = try target_core.length();
                     try writer.seekTo(new_offset);
                     try writer.interface.writeInt(u8, kind_int, .big);
                     try writer.interface.writeInt(u8, num, .big);
                     for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     for (counts) |c| try writer.interface.writeInt(u64, c, .big);
 
-                    try offset_map.put(node_offset, new_offset);
                     return new_offset;
                 },
             }
         }
 
-        fn remapHashMapOrSet(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot, counted: bool) !u64 {
+        fn remapHashMapOrSet(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot, comptime counted: bool) !u64 {
             var reader = source_core.reader();
             var writer = target_core.writer();
 
@@ -4371,6 +4382,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
             try reader.interface.readSliceAll(&block_bytes);
 
+            const new_offset = if (counted)
+                try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE + byteSizeOf(u64))
+            else
+                try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE);
+            try offset_map.put(slot.value, new_offset);
+
             // remap each child slot in the block
             var block_reader = std.Io.Reader.fixed(&block_bytes);
             var remapped_slots: [SLOT_COUNT]Slot = undefined;
@@ -4381,7 +4398,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
 
             // write [optional count][remapped block] contiguously to target
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             if (count_value) |c| {
                 try writer.interface.writeInt(u64, c, .big);
@@ -4403,12 +4419,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try kv_pair.key_slot.tag.validate();
             try kv_pair.value_slot.tag.validate();
 
+            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(KeyValuePair));
+            try offset_map.put(slot.value, new_offset);
+
             // remap key_slot and value_slot
             const remapped_key = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.key_slot);
             const remapped_value = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.value_slot);
 
             // write remapped KV pair (hash stays unchanged)
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             try writer.interface.writeInt(KeyValuePairInt, @bitCast(KeyValuePair{
                 .value_slot = remapped_value,
@@ -4426,9 +4444,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try reader.seekTo(slot.value);
             const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
+            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(BTreeHeader));
+            try offset_map.put(slot.value, new_offset);
+
             const remapped_root = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
 
-            const new_offset = try target_core.length();
             try writer.seekTo(new_offset);
             try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
                 .root_ptr = remapped_root,
@@ -4450,12 +4470,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const kind_int = try takeInt(&reader.interface, u8, .big);
             const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
             const num = try takeInt(&reader.interface, u8, .big);
+            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
 
             switch (kind) {
                 .leaf => {
                     var body = [_]u8{0} ** (SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
+
+                    const new_offset = try reserveBlock(target_db_kind, target_core, SORTED_LEAF_BLOCK_SIZE);
+                    try offset_map.put(node_offset, new_offset);
 
                     var entries: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&entries) |*s| {
@@ -4464,19 +4488,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, entry);
                     }
 
-                    const new_offset = try target_core.length();
                     try writer.seekTo(new_offset);
                     try writer.interface.writeInt(u8, kind_int, .big);
                     try writer.interface.writeInt(u8, num, .big);
                     for (entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
 
-                    try offset_map.put(node_offset, new_offset);
                     return new_offset;
                 },
                 .branch => {
                     var body = [_]u8{0} ** (SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
+
+                    const new_offset = try reserveBlock(target_db_kind, target_core, SORTED_BRANCH_BLOCK_SIZE);
+                    try offset_map.put(node_offset, new_offset);
 
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
@@ -4498,7 +4523,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var counts: [BTREE_SLOT_COUNT]u64 = undefined;
                     for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
-                    const new_offset = try target_core.length();
                     try writer.seekTo(new_offset);
                     try writer.interface.writeInt(u8, kind_int, .big);
                     try writer.interface.writeInt(u8, num, .big);
@@ -4506,7 +4530,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     for (separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     for (counts) |c| try writer.interface.writeInt(u64, c, .big);
 
-                    try offset_map.put(node_offset, new_offset);
                     return new_offset;
                 },
             }
