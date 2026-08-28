@@ -2705,7 +2705,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
                         const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
 
-                        if (r.size == r.pos) return error.EndOfStream;
+                        if (r.pos >= r.size) return error.EndOfStream;
 
                         const new_limit: std.Io.Limit = @enumFromInt(@min(@intFromEnum(limit), r.size - r.pos));
                         const dest = new_limit.slice(try io_w.writableSliceGreedy(1));
@@ -4553,7 +4553,7 @@ const CoreMemory = struct {
         fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
 
-            if (r.parent.buffer.written().len == r.pos) return error.EndOfStream;
+            if (r.pos >= r.parent.buffer.written().len) return error.EndOfStream;
 
             const max_size = @min(@intFromEnum(limit), r.parent.buffer.written().len - r.pos);
             if (max_size == 0) return 0;

@@ -139,6 +139,9 @@ test "low level memory operations" {
     try reader.interface.readSliceAll(&block);
     try std.testing.expectEqualStrings("Hello", &block);
     try std.testing.expectEqual(42, try takeInt(&reader.interface, u64, .big));
+
+    try reader.seekTo(try db.core.length() + 1);
+    try std.testing.expectError(error.EndOfStream, reader.interface.readSliceAll(block[0..1]));
 }
 
 test "validate tag" {
@@ -1397,6 +1400,9 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
                         try bar_reader.seekTo(0);
                         try std.testing.expectEqual('b', try bar_reader.interface.takeInt(u8, .big));
+
+                        try bar_reader.seekTo(4);
+                        try std.testing.expectError(error.EndOfStream, bar_reader.interface.readSliceAll(&char));
                     }
                 }
             };
