@@ -506,7 +506,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try target_writer.interface.writeAll(&index_block);
 
             // recursively remap the moment slot
-            const remapped_moment = try remapSlot(&self.core, target_db_kind, &target.core, offset_map, moment_slot);
+            var compactor = Compactor(target_db_kind){
+                .source_core = &self.core,
+                .target_core = &target.core,
+                .offset_map = offset_map,
+            };
+            const remapped_moment = try compactor.remapSlot(moment_slot);
 
             // write remapped moment slot into position 0 of target's root index block
             try target_writer.seekTo(target_array_list_ptr);
@@ -4121,236 +4126,207 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // compaction helpers
 
-        fn reserveBlock(comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), comptime size: usize) !u64 {
-            const offset = try target_core.length();
-            var writer = target_core.writer();
-            try writer.seekTo(offset);
-            const empty_block = [_]u8{0} ** size;
-            try writer.interface.writeAll(&empty_block);
-            return offset;
-        }
+        fn Compactor(comptime target_db_kind: DatabaseKind) type {
+            return struct {
+                source_core: *Core(db_kind),
+                target_core: *Core(target_db_kind),
+                offset_map: *std.AutoHashMap(u64, u64),
 
-        fn remapSlot(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) anyerror!Slot {
-            switch (slot.tag) {
-                .none, .uint, .int, .float, .short_bytes => return slot,
-                .bytes => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                const Self = @This();
+                const NodeHeader = struct {
+                    kind_int: u8,
+                    num: u8,
+                };
+
+                fn reserveBlock(self: *Self, comptime size: usize) !u64 {
+                    const offset = try self.target_core.length();
+                    var writer = self.target_core.writer();
+                    try writer.seekTo(offset);
+                    const empty_block = [_]u8{0} ** size;
+                    try writer.interface.writeAll(&empty_block);
+                    return offset;
+                }
+
+                fn visitObject(self: *Self, source_offset: u64, comptime size: usize, context: anytype, comptime populate: anytype) anyerror!u64 {
+                    if (self.offset_map.get(source_offset)) |target_offset| {
+                        return target_offset;
                     }
-                    const new_offset = try remapBytes(source_core, target_db_kind, target_core, offset_map, slot);
+
+                    const target_offset = try self.reserveBlock(size);
+                    try self.offset_map.put(source_offset, target_offset);
+                    try populate(self, source_offset, target_offset, context);
+                    return target_offset;
+                }
+
+                fn remapSlot(self: *Self, slot: Slot) anyerror!Slot {
+                    const new_offset = switch (slot.tag) {
+                        .none, .uint, .int, .float, .short_bytes => return slot,
+                        .bytes => try self.remapBytes(slot),
+                        .index => try self.visitObject(slot.value, INDEX_BLOCK_SIZE, {}, populateIndex),
+                        .array_list => try self.visitObject(slot.value, byteSizeOf(ArrayListHeader), {}, populateArrayList),
+                        .linked_array_list => try self.visitObject(slot.value, byteSizeOf(BTreeHeader), {}, populateBTree),
+                        .hash_map, .hash_set => try self.visitObject(slot.value, INDEX_BLOCK_SIZE, {}, populateHashMapOrSet),
+                        .counted_hash_map, .counted_hash_set => try self.visitObject(slot.value, INDEX_BLOCK_SIZE + byteSizeOf(u64), {}, populateCountedHashMapOrSet),
+                        .kv_pair => try self.visitObject(slot.value, byteSizeOf(KeyValuePair), {}, populateKvPair),
+                        .sorted_map, .sorted_set => try self.visitObject(slot.value, byteSizeOf(BTreeHeader), {}, populateSortedMap),
+                    };
                     return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .index => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                }
+
+                fn remapBytes(self: *Self, slot: Slot) !u64 {
+                    if (self.offset_map.get(slot.value)) |target_offset| {
+                        return target_offset;
                     }
-                    const new_offset = try remapIndex(source_core, target_db_kind, target_core, offset_map, slot);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .array_list => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+
+                    try reader.seekTo(slot.value);
+                    const length = try takeInt(&reader.interface, u64, .big);
+
+                    // total size: u64 length + bytes + optional 2-byte format_tag
+                    const format_tag_size: u64 = if (slot.full) 2 else 0;
+                    const total_payload = length + format_tag_size;
+
+                    const new_offset = try self.target_core.length();
+                    try writer.seekTo(new_offset);
+                    try writer.interface.writeInt(u64, length, .big);
+
+                    // copy bytes in chunks
+                    var remaining = total_payload;
+                    var buf: [4096]u8 = undefined;
+                    while (remaining > 0) {
+                        const chunk = @min(remaining, buf.len);
+                        try reader.interface.readSliceAll(buf[0..chunk]);
+                        try writer.interface.writeAll(buf[0..chunk]);
+                        remaining -= chunk;
                     }
-                    const new_offset = try remapArrayList(source_core, target_db_kind, target_core, offset_map, slot);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .linked_array_list => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+
+                    // bytes contain no references, so they can be streamed before they
+                    // are memoized without opening a recursive cycle.
+                    try self.offset_map.put(slot.value, new_offset);
+                    return new_offset;
+                }
+
+                fn populateIndex(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+
+                    // read 144-byte block (16 slots)
+                    try reader.seekTo(source_offset);
+                    var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                    try reader.interface.readSliceAll(&block_bytes);
+
+                    // remap each slot
+                    var block_reader = std.Io.Reader.fixed(&block_bytes);
+                    var remapped_slots: [SLOT_COUNT]Slot = undefined;
+                    for (&remapped_slots) |*s| {
+                        const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                        try child_slot.tag.validate();
+                        s.* = try self.remapSlot(child_slot);
                     }
-                    const new_offset = try remapBTree(source_core, target_db_kind, target_core, offset_map, slot);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .hash_map, .hash_set => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+
+                    // write remapped block to target
+                    try writer.seekTo(target_offset);
+                    for (remapped_slots) |s| {
+                        try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     }
-                    const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, false);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .counted_hash_map, .counted_hash_set => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
+                }
+
+                fn populateArrayList(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+
+                    // read ArrayListHeader (16 bytes)
+                    try reader.seekTo(source_offset);
+                    const header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
+
+                    // remap root index block pointer via remapSlot as an .index slot
+                    const index_slot = Slot{ .value = header.ptr, .tag = .index };
+                    const remapped_index = try self.remapSlot(index_slot);
+
+                    // write new ArrayListHeader with remapped ptr
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(ArrayListHeader{
+                        .ptr = remapped_index.value,
+                        .size = header.size,
+                    }), .big);
+                }
+
+                fn populateBTree(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+
+                    try reader.seekTo(source_offset);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+
+                    const remapped_root = try self.remapBTreeNode(header.root_ptr);
+
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
+                        .root_ptr = remapped_root,
+                        .size = header.size,
+                    }), .big);
+                }
+
+                fn remapBTreeNode(self: *Self, node_offset: u64) anyerror!u64 {
+                    if (self.offset_map.get(node_offset)) |target_offset| {
+                        return target_offset;
                     }
-                    const new_offset = try remapHashMapOrSet(source_core, target_db_kind, target_core, offset_map, slot, true);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .kv_pair => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
-                    }
-                    const new_offset = try remapKvPair(source_core, target_db_kind, target_core, offset_map, slot);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-                .sorted_map, .sorted_set => {
-                    if (offset_map.get(slot.value)) |mapped| {
-                        return .{ .value = mapped, .tag = slot.tag, .full = slot.full };
-                    }
-                    const new_offset = try remapSortedMap(source_core, target_db_kind, target_core, offset_map, slot);
-                    return .{ .value = new_offset, .tag = slot.tag, .full = slot.full };
-                },
-            }
-        }
 
-        fn remapBytes(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
+                    var reader = self.source_core.reader();
 
-            try reader.seekTo(slot.value);
-            const length = try takeInt(&reader.interface, u64, .big);
+                    // read the header first because the node kind determines its size
+                    try reader.seekTo(node_offset);
+                    const kind_int = try takeInt(&reader.interface, u8, .big);
+                    const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+                    const num = try takeInt(&reader.interface, u8, .big);
+                    if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
 
-            // total size: u64 length + bytes + optional 2-byte format_tag
-            const format_tag_size: u64 = if (slot.full) 2 else 0;
-            const total_payload = length + format_tag_size;
+                    const header = NodeHeader{ .kind_int = kind_int, .num = num };
+                    return switch (kind) {
+                        .leaf => self.visitObject(node_offset, BTREE_LEAF_BLOCK_SIZE, header, populateBTreeLeaf),
+                        .branch => self.visitObject(node_offset, BTREE_BRANCH_BLOCK_SIZE, header, populateBTreeBranch),
+                    };
+                }
 
-            const new_offset = try target_core.length();
-            try writer.seekTo(new_offset);
-            try writer.interface.writeInt(u64, length, .big);
+                fn populateBTreeLeaf(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+                    try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-            // copy bytes in chunks
-            var remaining = total_payload;
-            var buf: [4096]u8 = undefined;
-            while (remaining > 0) {
-                const chunk = @min(remaining, buf.len);
-                try reader.interface.readSliceAll(buf[0..chunk]);
-                try writer.interface.writeAll(buf[0..chunk]);
-                remaining -= chunk;
-            }
-
-            try offset_map.put(slot.value, new_offset);
-            return new_offset;
-        }
-
-        fn remapIndex(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
-
-            // read 144-byte block (16 slots)
-            try reader.seekTo(slot.value);
-            var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
-            try reader.interface.readSliceAll(&block_bytes);
-
-            const new_offset = try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE);
-            try offset_map.put(slot.value, new_offset);
-
-            // remap each slot
-            var block_reader = std.Io.Reader.fixed(&block_bytes);
-            var remapped_slots: [SLOT_COUNT]Slot = undefined;
-            for (&remapped_slots) |*s| {
-                const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                try child_slot.tag.validate();
-                s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
-            }
-
-            // write remapped block to target
-            try writer.seekTo(new_offset);
-            for (remapped_slots) |s| {
-                try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-            }
-
-            return new_offset;
-        }
-
-        fn remapArrayList(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
-
-            // read ArrayListHeader (16 bytes)
-            try reader.seekTo(slot.value);
-            const header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
-
-            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(ArrayListHeader));
-            try offset_map.put(slot.value, new_offset);
-
-            // remap root index block pointer via remapSlot as an .index slot
-            const index_slot = Slot{ .value = header.ptr, .tag = .index };
-            const remapped_index = try remapSlot(source_core, target_db_kind, target_core, offset_map, index_slot);
-
-            // write new ArrayListHeader with remapped ptr
-            try writer.seekTo(new_offset);
-            try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(ArrayListHeader{
-                .ptr = remapped_index.value,
-                .size = header.size,
-            }), .big);
-
-            return new_offset;
-        }
-
-        fn remapBTree(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
-
-            try reader.seekTo(slot.value);
-            const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
-
-            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(BTreeHeader));
-            try offset_map.put(slot.value, new_offset);
-
-            const remapped_root = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
-
-            try writer.seekTo(new_offset);
-            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
-                .root_ptr = remapped_root,
-                .size = header.size,
-            }), .big);
-
-            return new_offset;
-        }
-
-        fn remapBTreeNode(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), node_offset: u64) anyerror!u64 {
-            // dedup check (subtrees are shared by pointer)
-            if (offset_map.get(node_offset)) |mapped| {
-                return mapped;
-            }
-
-            var reader = source_core.reader();
-            var writer = target_core.writer();
-
-            // read the whole node into memory first, so the recursion below can
-            // freely create its own readers/writers
-            try reader.seekTo(node_offset);
-            const kind_int = try takeInt(&reader.interface, u8, .big);
-            const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
-            const num = try takeInt(&reader.interface, u8, .big);
-            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
-
-            switch (kind) {
-                .leaf => {
                     var body = [_]u8{0} ** (BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
-
-                    const new_offset = try reserveBlock(target_db_kind, target_core, BTREE_LEAF_BLOCK_SIZE);
-                    try offset_map.put(node_offset, new_offset);
 
                     var slots: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&slots) |*s| {
                         const value_slot: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
                         try value_slot.tag.validate();
-                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, value_slot);
+                        s.* = try self.remapSlot(value_slot);
                     }
 
-                    try writer.seekTo(new_offset);
-                    try writer.interface.writeInt(u8, kind_int, .big);
-                    try writer.interface.writeInt(u8, num, .big);
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(u8, header.kind_int, .big);
+                    try writer.interface.writeInt(u8, header.num, .big);
                     for (slots) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                }
 
-                    return new_offset;
-                },
-                .branch => {
+                fn populateBTreeBranch(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+                    try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
+
                     var body = [_]u8{0} ** (BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
-
-                    const new_offset = try reserveBlock(target_db_kind, target_core, BTREE_BRANCH_BLOCK_SIZE);
-                    try offset_map.put(node_offset, new_offset);
 
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
                         const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
                         try child.tag.validate();
                         if (child.tag == .index) {
-                            const remapped_ptr = try remapBTreeNode(source_core, target_db_kind, target_core, offset_map, child.value);
+                            const remapped_ptr = try self.remapBTreeNode(child.value);
                             s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
                         } else {
                             s.* = child;
@@ -4359,156 +4335,148 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var counts: [BTREE_SLOT_COUNT]u64 = undefined;
                     for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
-                    try writer.seekTo(new_offset);
-                    try writer.interface.writeInt(u8, kind_int, .big);
-                    try writer.interface.writeInt(u8, num, .big);
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(u8, header.kind_int, .big);
+                    try writer.interface.writeInt(u8, header.num, .big);
                     for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     for (counts) |c| try writer.interface.writeInt(u64, c, .big);
+                }
 
-                    return new_offset;
-                },
-            }
-        }
+                fn populateHashMapOrSet(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    return self.populateHashMapOrSetCounted(source_offset, target_offset, false);
+                }
 
-        fn remapHashMapOrSet(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot, comptime counted: bool) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
+                fn populateCountedHashMapOrSet(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    return self.populateHashMapOrSetCounted(source_offset, target_offset, true);
+                }
 
-            try reader.seekTo(slot.value);
+                fn populateHashMapOrSetCounted(self: *Self, source_offset: u64, target_offset: u64, comptime counted: bool) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
 
-            const count_value: ?u64 = if (counted) try takeInt(&reader.interface, u64, .big) else null;
+                    try reader.seekTo(source_offset);
 
-            // read 144-byte root index block
-            var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
-            try reader.interface.readSliceAll(&block_bytes);
+                    const count_value: ?u64 = if (counted) try takeInt(&reader.interface, u64, .big) else null;
 
-            const new_offset = if (counted)
-                try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE + byteSizeOf(u64))
-            else
-                try reserveBlock(target_db_kind, target_core, INDEX_BLOCK_SIZE);
-            try offset_map.put(slot.value, new_offset);
+                    // read 144-byte root index block
+                    var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                    try reader.interface.readSliceAll(&block_bytes);
 
-            // remap each child slot in the block
-            var block_reader = std.Io.Reader.fixed(&block_bytes);
-            var remapped_slots: [SLOT_COUNT]Slot = undefined;
-            for (&remapped_slots) |*s| {
-                const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                try child_slot.tag.validate();
-                s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, child_slot);
-            }
+                    // remap each child slot in the block
+                    var block_reader = std.Io.Reader.fixed(&block_bytes);
+                    var remapped_slots: [SLOT_COUNT]Slot = undefined;
+                    for (&remapped_slots) |*s| {
+                        const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                        try child_slot.tag.validate();
+                        s.* = try self.remapSlot(child_slot);
+                    }
 
-            // write [optional count][remapped block] contiguously to target
-            try writer.seekTo(new_offset);
-            if (count_value) |c| {
-                try writer.interface.writeInt(u64, c, .big);
-            }
-            for (remapped_slots) |s| {
-                try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-            }
+                    // write [optional count][remapped block] contiguously to target
+                    try writer.seekTo(target_offset);
+                    if (count_value) |c| {
+                        try writer.interface.writeInt(u64, c, .big);
+                    }
+                    for (remapped_slots) |s| {
+                        try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    }
+                }
 
-            return new_offset;
-        }
+                fn populateKvPair(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
 
-        fn remapKvPair(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
+                    // read KeyValuePair
+                    try reader.seekTo(source_offset);
+                    const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
+                    try kv_pair.key_slot.tag.validate();
+                    try kv_pair.value_slot.tag.validate();
 
-            // read KeyValuePair
-            try reader.seekTo(slot.value);
-            const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
-            try kv_pair.key_slot.tag.validate();
-            try kv_pair.value_slot.tag.validate();
+                    // remap key_slot and value_slot
+                    const remapped_key = try self.remapSlot(kv_pair.key_slot);
+                    const remapped_value = try self.remapSlot(kv_pair.value_slot);
 
-            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(KeyValuePair));
-            try offset_map.put(slot.value, new_offset);
+                    // write remapped KV pair (hash stays unchanged)
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(KeyValuePairInt, @bitCast(KeyValuePair{
+                        .value_slot = remapped_value,
+                        .key_slot = remapped_key,
+                        .hash = kv_pair.hash,
+                    }), .big);
+                }
 
-            // remap key_slot and value_slot
-            const remapped_key = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.key_slot);
-            const remapped_value = try remapSlot(source_core, target_db_kind, target_core, offset_map, kv_pair.value_slot);
+                fn populateSortedMap(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
 
-            // write remapped KV pair (hash stays unchanged)
-            try writer.seekTo(new_offset);
-            try writer.interface.writeInt(KeyValuePairInt, @bitCast(KeyValuePair{
-                .value_slot = remapped_value,
-                .key_slot = remapped_key,
-                .hash = kv_pair.hash,
-            }), .big);
+                    try reader.seekTo(source_offset);
+                    const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-            return new_offset;
-        }
+                    const remapped_root = try self.remapSortedMapNode(header.root_ptr);
 
-        fn remapSortedMap(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), slot: Slot) !u64 {
-            var reader = source_core.reader();
-            var writer = target_core.writer();
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
+                        .root_ptr = remapped_root,
+                        .size = header.size,
+                    }), .big);
+                }
 
-            try reader.seekTo(slot.value);
-            const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+                fn remapSortedMapNode(self: *Self, node_offset: u64) anyerror!u64 {
+                    if (self.offset_map.get(node_offset)) |target_offset| {
+                        return target_offset;
+                    }
 
-            const new_offset = try reserveBlock(target_db_kind, target_core, byteSizeOf(BTreeHeader));
-            try offset_map.put(slot.value, new_offset);
+                    var reader = self.source_core.reader();
 
-            const remapped_root = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, header.root_ptr);
+                    try reader.seekTo(node_offset);
+                    const kind_int = try takeInt(&reader.interface, u8, .big);
+                    const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+                    const num = try takeInt(&reader.interface, u8, .big);
+                    if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
 
-            try writer.seekTo(new_offset);
-            try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{
-                .root_ptr = remapped_root,
-                .size = header.size,
-            }), .big);
+                    const header = NodeHeader{ .kind_int = kind_int, .num = num };
+                    return switch (kind) {
+                        .leaf => self.visitObject(node_offset, SORTED_LEAF_BLOCK_SIZE, header, populateSortedMapLeaf),
+                        .branch => self.visitObject(node_offset, SORTED_BRANCH_BLOCK_SIZE, header, populateSortedMapBranch),
+                    };
+                }
 
-            return new_offset;
-        }
+                fn populateSortedMapLeaf(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+                    try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-        fn remapSortedMapNode(source_core: *Core(db_kind), comptime target_db_kind: DatabaseKind, target_core: *Core(target_db_kind), offset_map: *std.AutoHashMap(u64, u64), node_offset: u64) anyerror!u64 {
-            if (offset_map.get(node_offset)) |mapped| {
-                return mapped;
-            }
-
-            var reader = source_core.reader();
-            var writer = target_core.writer();
-
-            try reader.seekTo(node_offset);
-            const kind_int = try takeInt(&reader.interface, u8, .big);
-            const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
-            const num = try takeInt(&reader.interface, u8, .big);
-            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
-
-            switch (kind) {
-                .leaf => {
                     var body = [_]u8{0} ** (SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
-
-                    const new_offset = try reserveBlock(target_db_kind, target_core, SORTED_LEAF_BLOCK_SIZE);
-                    try offset_map.put(node_offset, new_offset);
 
                     var entries: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&entries) |*s| {
                         const entry: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
                         try entry.tag.validate();
-                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, entry);
+                        s.* = try self.remapSlot(entry);
                     }
 
-                    try writer.seekTo(new_offset);
-                    try writer.interface.writeInt(u8, kind_int, .big);
-                    try writer.interface.writeInt(u8, num, .big);
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(u8, header.kind_int, .big);
+                    try writer.interface.writeInt(u8, header.num, .big);
                     for (entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                }
 
-                    return new_offset;
-                },
-                .branch => {
+                fn populateSortedMapBranch(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
+                    var reader = self.source_core.reader();
+                    var writer = self.target_core.writer();
+                    try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
+
                     var body = [_]u8{0} ** (SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
-
-                    const new_offset = try reserveBlock(target_db_kind, target_core, SORTED_BRANCH_BLOCK_SIZE);
-                    try offset_map.put(node_offset, new_offset);
 
                     var children: [BTREE_SLOT_COUNT]Slot = undefined;
                     for (&children) |*s| {
                         const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
                         try child.tag.validate();
                         if (child.tag == .index) {
-                            const remapped_ptr = try remapSortedMapNode(source_core, target_db_kind, target_core, offset_map, child.value);
+                            const remapped_ptr = try self.remapSortedMapNode(child.value);
                             s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
                         } else {
                             s.* = child;
@@ -4518,21 +4486,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     for (&separators) |*s| {
                         const sep: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
                         try sep.tag.validate();
-                        s.* = try remapSlot(source_core, target_db_kind, target_core, offset_map, sep);
+                        s.* = try self.remapSlot(sep);
                     }
                     var counts: [BTREE_SLOT_COUNT]u64 = undefined;
                     for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
-                    try writer.seekTo(new_offset);
-                    try writer.interface.writeInt(u8, kind_int, .big);
-                    try writer.interface.writeInt(u8, num, .big);
+                    try writer.seekTo(target_offset);
+                    try writer.interface.writeInt(u8, header.kind_int, .big);
+                    try writer.interface.writeInt(u8, header.num, .big);
                     for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     for (separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
                     for (counts) |c| try writer.interface.writeInt(u64, c, .big);
-
-                    return new_offset;
-                },
-            }
+                }
+            };
         }
     };
 }
