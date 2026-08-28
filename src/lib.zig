@@ -536,22 +536,24 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn truncate(self: *Database(db_kind, HashInt)) !void {
             if (self.header.tag != .array_list) return;
 
-            const root_cursor = self.rootCursor();
-            const list_size = try root_cursor.count();
-
-            if (list_size == 0) return;
-
             var core_reader = self.core.reader();
-            try core_reader.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
-            const header_file_size = try takeInt(&core_reader.interface, u64, .big);
+            try core_reader.seekTo(DATABASE_START);
+            const header: TopLevelArrayListHeader = @bitCast(try takeInt(&core_reader.interface, TopLevelArrayListHeaderInt, .big));
 
-            if (header_file_size == 0) return;
+            const minimum_size = DATABASE_START + byteSizeOf(TopLevelArrayListHeader) + INDEX_BLOCK_SIZE;
+            const committed_size = if (header.file_size == 0) blk: {
+                if (header.parent.size != 0) return error.InvalidDatabase;
+                break :blk minimum_size;
+            } else header.file_size;
+
+            if (committed_size < minimum_size) return error.InvalidDatabase;
 
             const file_size = try self.core.length();
 
-            if (file_size == header_file_size) return;
+            if (file_size < committed_size) return error.TruncatedDatabase;
+            if (file_size == committed_size) return;
 
-            try self.core.setLength(header_file_size);
+            try self.core.setLength(committed_size);
         }
 
         fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer) !SlotPointer {
