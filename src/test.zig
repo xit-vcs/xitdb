@@ -619,17 +619,16 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         try std.testing.expectEqualStrings("Pay the bills", todo_value);
     }
 
-    // the db size remains the same after writing junk data
-    // and then reinitializing the db. this is useful because
-    // there could be data from a transaction that never
-    // completed due to an unclean shutdown.
+    // opening the db leaves trailing data alone, because it may
+    // belong to another writer's unfinished transaction.
     {
         const size_before = try db.core.length();
 
         var writer = db.core.writer();
         try writer.seekTo(size_before);
-        try writer.interface.writeAll("this is junk data that will be deleted during init");
+        try writer.interface.writeAll("this is trailing data from an unfinished transaction");
         try db.core.flush();
+        const size_with_tail = try db.core.length();
 
         // no error is thrown if db file is opened in read-only mode
         switch (db_kind) {
@@ -655,7 +654,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
         const size_after = try db.core.length();
 
-        try std.testing.expectEqual(size_before, size_after);
+        try std.testing.expectEqual(size_with_tail, size_after);
     }
 
     // cloning

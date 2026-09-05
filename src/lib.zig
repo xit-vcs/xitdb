@@ -443,7 +443,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 if (self.header.hash_size != byteSizeOf(HashInt)) {
                     return error.InvalidHashSize;
                 }
-                try self.truncate();
+                _ = try self.validateCommittedSize();
             }
 
             return self;
@@ -541,8 +541,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // private
 
-        fn truncate(self: *Database(db_kind, HashInt)) !void {
-            if (self.header.tag != .array_list) return;
+        fn validateCommittedSize(self: *Database(db_kind, HashInt)) !u64 {
+            if (self.header.tag != .array_list) return self.core.length();
 
             var core_reader = self.core.reader();
             try core_reader.seekTo(DATABASE_START);
@@ -559,9 +559,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const file_size = try self.core.length();
 
             if (file_size < committed_size) return error.TruncatedDatabase;
-            if (file_size == committed_size) return;
+            return committed_size;
+        }
 
-            try self.core.setLength(committed_size);
+        fn truncate(self: *Database(db_kind, HashInt)) !void {
+            const committed_size = try self.validateCommittedSize();
+            if (try self.core.length() > committed_size) {
+                try self.core.setLength(committed_size);
+            }
         }
 
         fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer) !SlotPointer {
@@ -2796,12 +2801,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
                         const n = bytes.len;
+                        const new_position = self.pos + @as(u64, @intCast(n));
+
+                        // another allocation may now follow this byte array.
+                        // extending it would overwrite that allocation.
+                        if (new_position > self.size) {
+                            const end = self.parent.db.core.length() catch return error.WriteFailed;
+                            if (end != self.start_position + self.size) return error.WriteFailed;
+                        }
 
                         var core_writer = self.parent.db.core.writer();
                         core_writer.seekTo(self.start_position + self.pos) catch return error.WriteFailed;
                         try core_writer.interface.writeAll(bytes);
 
-                        const new_position = self.pos + @as(u64, @intCast(n));
                         self.pos = new_position;
                         if (self.pos > self.size) {
                             self.size = self.pos;
