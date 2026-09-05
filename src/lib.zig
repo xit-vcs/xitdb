@@ -465,6 +465,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: *std.AutoHashMap(u64, u64)) !Database(target_db_kind, HashInt) {
+            // cached offsets only apply to this compaction's target.
+            offset_map.clearRetainingCapacity();
+
             var opts = target_opts;
             opts.hash_id = target_opts.hash_id orelse self.header.hash_id;
             var target = try Database(target_db_kind, HashInt).init(opts);
@@ -2729,6 +2732,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         var core_reader = r.parent.db.core.reader();
                         core_reader.seekTo(r.start_position + r.pos) catch return error.ReadFailed;
                         const size = try core_reader.interface.readSliceShort(dest);
+                        if (size == 0 and dest.len > 0) return error.EndOfStream;
                         r.pos += size;
                         io_w.advance(size);
                         return size;
@@ -4599,10 +4603,8 @@ const CoreMemory = struct {
                         return error.MaxSizeExceeded;
                     }
                 }
-                var arr = self.parent.buffer.toArrayList();
-                try arr.ensureTotalCapacity(self.parent.buffer.allocator, new_size);
-                arr.items.len = new_size;
-                self.parent.buffer.* = std.Io.Writer.Allocating.fromArrayList(self.parent.buffer.allocator, &arr);
+                try self.parent.buffer.ensureTotalCapacity(new_size);
+                self.parent.buffer.writer.end = new_size;
             }
         }
 
@@ -4748,6 +4750,7 @@ const CoreBufferedFile = struct {
                 file_reader.seekTo(r.pos) catch return error.ReadFailed;
                 const max_size = if (r.pos < r.parent.memory_pos) @min(dest.len, r.parent.memory_pos - r.pos) else dest.len;
                 const size = file_reader.interface.readSliceShort(dest[0..max_size]) catch return error.ReadFailed;
+                if (size == 0 and max_size > 0) return error.EndOfStream;
                 r.pos += size;
                 io_w.advance(size);
                 return size;
