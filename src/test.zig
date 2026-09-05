@@ -2465,9 +2465,9 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             var iter = try inner_cursor.iterator();
             var i: u64 = 0;
             while (try iter.next()) |kv_pair_cursor| {
-                var kv_pair = try kv_pair_cursor.readKeyValuePair();
+                const kv_pair = try kv_pair_cursor.readKeyValuePair();
                 if (kv_pair.hash == foo_key) {
-                    try kv_pair.key_cursor.write(.{ .bytes = "bar" });
+                    try std.testing.expectEqual(42, try kv_pair.value_cursor.readUint());
                 }
                 i += 1;
             }

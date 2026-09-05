@@ -3365,7 +3365,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         }
                     }
 
-                    pub fn next(self: *Iter) !?Cursor(write_mode) {
+                    // iterators don't copy shared nodes, so their cursors must
+                    // be read-only. this also prevents changes to sorted keys.
+                    pub fn next(self: *Iter) !?Cursor(.read_only) {
                         switch (self.cursor.slot_ptr.slot.tag) {
                             .none => return null,
                             .array_list => {
@@ -3411,7 +3413,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return stack;
                     }
 
-                    fn nextInternal(self: *Iter, comptime node_offset: u64) !?Cursor(write_mode) {
+                    fn nextInternal(self: *Iter, comptime node_offset: u64) !?Cursor(.read_only) {
                         while (self.core.stack.slice().len > 0) {
                             const level = self.core.stack.slice()[self.core.stack.slice().len - 1];
                             if (level.index == level.block.len) {
