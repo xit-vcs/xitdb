@@ -761,7 +761,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const orig_header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
 
                     // slice
-                    const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size);
+                    const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size, is_top_level);
                     const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
                     // if top level, updating the header below commits the transaction,
@@ -1725,7 +1725,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        fn readArrayListSlice(self: *Database(db_kind, HashInt), header: ArrayListHeader, size: u64) !ArrayListHeader {
+        fn readArrayListSlice(self: *Database(db_kind, HashInt), header: ArrayListHeader, size: u64, is_top_level: bool) !ArrayListHeader {
             var core_reader = self.core.reader();
 
             if (size > header.size) {
@@ -1751,6 +1751,22 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try slot.tag.validate();
                     shift -= 1;
                     index_pos = slot.value;
+                }
+
+                // the new root may still belong to a past moment. unlike child
+                // nodes, root nodes are written directly, so copy it now.
+                if (!is_top_level) {
+                    if (self.tx_start) |tx_start| {
+                        if (index_pos < tx_start) {
+                            var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            try core_reader.seekTo(index_pos);
+                            try core_reader.interface.readSliceAll(&index_block);
+                            index_pos = try self.core.length();
+                            var writer = self.core.writer();
+                            try writer.seekTo(index_pos);
+                            try writer.interface.writeAll(&index_block);
+                        }
+                    }
                 }
                 return .{
                     .ptr = index_pos,
@@ -4235,6 +4251,44 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
                 }
 
+                fn remapArrayListIndex(self: *Self, source_offset: u64, size: u64, shift: u6) anyerror!u64 {
+                    const child_size = @as(u64, 1) << (shift * BIT_COUNT);
+
+                    // full blocks can use the normal cache. partial blocks may
+                    // be shared by lists with different sizes, so copy them
+                    // separately and leave the slots beyond the size empty.
+                    if (@as(u128, size) == @as(u128, child_size) * SLOT_COUNT) {
+                        return (try self.remapSlot(.{ .value = source_offset, .tag = .index })).value;
+                    }
+
+                    const target_offset = try self.reserveBlock(INDEX_BLOCK_SIZE);
+                    var reader = self.source_core.reader();
+                    try reader.seekTo(source_offset);
+                    var slots = [_]Slot{.{}} ** SLOT_COUNT;
+                    var remaining = size;
+                    for (&slots) |*slot| {
+                        if (remaining == 0) break;
+                        const child_slot: Slot = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        try child_slot.tag.validate();
+                        const count = @min(remaining, child_size);
+                        if (shift == 0) {
+                            slot.* = try self.remapSlot(child_slot);
+                        } else {
+                            if (child_slot.tag != .index) return error.UnexpectedTag;
+                            slot.* = child_slot;
+                            slot.value = try self.remapArrayListIndex(child_slot.value, count, shift - 1);
+                        }
+                        remaining -= count;
+                    }
+
+                    var writer = self.target_core.writer();
+                    try writer.seekTo(target_offset);
+                    for (slots) |slot| {
+                        try writer.interface.writeInt(SlotInt, @bitCast(slot), .big);
+                    }
+                    return target_offset;
+                }
+
                 fn populateArrayList(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
                     var reader = self.source_core.reader();
                     var writer = self.target_core.writer();
@@ -4243,14 +4297,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(source_offset);
                     const header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
 
-                    // remap root index block pointer via remapSlot as an .index slot
-                    const index_slot = Slot{ .value = header.ptr, .tag = .index };
-                    const remapped_index = try self.remapSlot(index_slot);
+                    const shift: u6 = @intCast(if (header.size <= SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, header.size - 1));
+                    const remapped_index = try self.remapArrayListIndex(header.ptr, header.size, shift);
 
                     // write new ArrayListHeader with remapped ptr
                     try writer.seekTo(target_offset);
                     try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(ArrayListHeader{
-                        .ptr = remapped_index.value,
+                        .ptr = remapped_index,
                         .size = header.size,
                     }), .big);
                 }
