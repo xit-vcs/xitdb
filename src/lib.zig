@@ -1354,12 +1354,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             .slot_ptr = slot_ptr,
                             .db = self,
                         };
-                        ctx.run(&next_cursor) catch |err| {
-                            // since an error occurred, there may be inaccessible
-                            // junk at the end of the db, so delete it if possible
-                            self.truncate() catch {};
-                            return err;
-                        };
+                        try ctx.run(&next_cursor);
                         return next_cursor.slot_ptr;
                     }
                 },
@@ -2847,7 +2842,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writePath(self: Cursor(.read_write), comptime Ctx: type, path: []const PathPart(Ctx)) !Cursor(.read_write) {
-                    const slot_ptr = try self.db.readSlotPointer(.read_write, Ctx, path, self.slot_ptr);
+                    const slot_ptr = self.db.readSlotPointer(.read_write, Ctx, path, self.slot_ptr) catch |err| {
+                        // only truncate when the error escapes the outer write.
+                        // a nested callback's caller may still commit its work.
+                        if (self.db.tx_start == null) {
+                            self.db.truncate() catch {};
+                        }
+                        return err;
+                    };
                     if (self.db.tx_start == null) {
                         try self.db.core.sync();
                     }
