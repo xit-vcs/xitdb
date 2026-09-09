@@ -745,7 +745,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
         const Ctx = struct {
             pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
-                const moment = try DB.HashMap(.read_write).init(cursor.*);
+                var moment = try DB.HashMap(.read_write).init(cursor.*);
 
                 const big_cities_cursor = try moment.putCursor(hashInt("big-cities"));
                 const big_cities = try DB.ArrayList(.read_write).init(big_cities_cursor);
@@ -754,6 +754,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
                 // freeze here, so big-cities won't be mutated
                 try cursor.db.freeze();
+                moment = try DB.HashMap(.read_write).init(moment.cursor);
 
                 // create a new key called "cities" whose initial value is
                 // based on the "big-cities" list
@@ -779,6 +780,43 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         const big_cities_cursor = (try moment.getCursor(hashInt("big-cities"))).?;
         const big_cities = try DB.ArrayList(.read_only).init(big_cities_cursor);
         try std.testing.expectEqual(2, try big_cities.count());
+
+        // callbacks must see complete headers before freezing their collections
+        inline for (.{ .append, .slice, .linked_get }) |op| {
+            const FreezeCtx = struct {
+                list: DB.Cursor(.read_only),
+
+                pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    try cursor.db.freeze();
+                    try std.testing.expectEqual(if (op == .append) 2 else 1, try self.list.count());
+                    const get: DB.PathPart(void) = if (op == .linked_get) .{ .linked_array_list_get = 0 } else .{ .array_list_get = -1 };
+                    const value = (try self.list.readPath(void, &.{get})).?;
+                    try std.testing.expectEqual(if (op == .slice) 1 else 2, try value.readUint());
+                }
+            };
+            const CallbackCtx = struct {
+                pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    var map = try DB.HashMap(.read_write).init(cursor.*);
+                    try map.put(hashInt("freeze-callback"), .{ .slot = null });
+                    const List = if (op == .linked_get) DB.LinkedArrayList(.read_write) else DB.ArrayList(.read_write);
+                    var list = try List.init(try map.putCursor(hashInt("freeze-callback")));
+                    try list.append(.{ .uint = 1 });
+                    if (op == .slice) try list.append(.{ .uint = 2 });
+                    try cursor.db.freeze();
+                    map = try DB.HashMap(.read_write).init(map.cursor);
+                    list = try List.init(try map.putCursor(hashInt("freeze-callback")));
+                    const ctx: DB.PathPart(FreezeCtx) = .{ .ctx = .{ .list = list.cursor.readOnly() } };
+                    const path: []const DB.PathPart(FreezeCtx) = switch (op) {
+                        .append => &.{ .array_list_append, .{ .write = .{ .uint = 2 } }, ctx },
+                        .slice => &.{ .{ .array_list_slice = .{ .size = 1 } }, ctx },
+                        .linked_get => &.{ .{ .linked_array_list_get = 0 }, .{ .write = .{ .uint = 2 } }, ctx },
+                        else => unreachable,
+                    };
+                    _ = try list.cursor.writePath(FreezeCtx, path);
+                }
+            };
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, CallbackCtx{});
+        }
     }
 
     {

@@ -456,6 +456,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
+        /// finish byte writers before freezing; reinitialize writable collections and
+        /// reacquire nested write cursors from the moment root before further writes
         pub fn freeze(self: *Database(db_kind, HashInt)) !void {
             if (self.tx_start != null) {
                 self.tx_start = try self.core.length();
@@ -725,9 +727,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // append
                     const append_result = try self.readArrayListSlotAppend(orig_header, write_mode, is_top_level);
-                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], append_result.slot_ptr);
-
                     var writer = self.core.writer();
+                    // update nested headers before callbacks can freeze them
+                    if (!is_top_level) {
+                        try writer.seekTo(next_array_list_start);
+                        try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(append_result.header), .big);
+                    }
+                    const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], append_result.slot_ptr);
 
                     // if top level array list, put the file size in the header
                     if (is_top_level) {
@@ -748,10 +754,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         // update header
                         try writer.seekTo(next_array_list_start);
                         try writer.interface.writeInt(TopLevelArrayListHeaderInt, @bitCast(header), .big);
-                    } else {
-                        // update header
-                        try writer.seekTo(next_array_list_start);
-                        try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(append_result.header), .big);
                     }
 
                     return final_slot_ptr;
@@ -770,18 +772,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // slice
                     const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size, is_top_level);
+                    var writer = self.core.writer();
+                    // update nested headers before callbacks can freeze them
+                    if (!is_top_level) {
+                        try writer.seekTo(next_array_list_start);
+                        try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(slice_header), .big);
+                    }
                     const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
 
-                    // if top level, updating the header below commits the transaction,
-                    // so make everything written so far durable first
+                    // commit the top-level header after the callback's writes are durable
                     if (is_top_level) {
                         try self.core.sync();
+                        try writer.seekTo(next_array_list_start);
+                        try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(slice_header), .big);
                     }
-
-                    // update header
-                    var writer = self.core.writer();
-                    try writer.seekTo(next_array_list_start);
-                    try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(slice_header), .big);
 
                     return final_slot_ptr;
                 },
@@ -857,15 +861,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     } else {
                         // path-copy down to the value slot so the write is persistent
                         const write_slot = try self.btreeGetForWrite(header.root_ptr, rank);
-                        const final_slot_ptr = try self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = write_slot.value_position, .slot = write_slot.slot });
-                        // the header only needs rewriting if the root actually moved
-                        // (it stays put when the whole path was already this-transaction)
+                        // update the header before callbacks can freeze it
                         if (write_slot.node_ptr != header.root_ptr) {
                             var writer = self.core.writer();
                             try writer.seekTo(header_ptr);
                             try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = write_slot.node_ptr, .size = header.size }), .big);
                         }
-                        return final_slot_ptr;
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = write_slot.value_position, .slot = write_slot.slot });
                     }
                 },
                 .linked_array_list_append => {
