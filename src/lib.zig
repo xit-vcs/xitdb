@@ -2860,6 +2860,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writePath(self: Cursor(.read_write), comptime Ctx: type, path: []const PathPart(Ctx)) !Cursor(.read_write) {
+                    // nested top-level writes could commit before the outer transaction ends
+                    if (self.db.tx_start != null and self.db.header.tag == .array_list and
+                        self.slot_ptr.position == null and self.slot_ptr.slot.value == DATABASE_START and path.len > 0)
+                    {
+                        return error.NestedTopLevelWrite;
+                    }
                     const slot_ptr = self.db.readSlotPointer(.read_write, Ctx, path, self.slot_ptr) catch |err| {
                         // only truncate when the error escapes the outer write.
                         // a nested callback's caller may still commit its work.

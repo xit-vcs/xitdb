@@ -1375,6 +1375,9 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     var writer = try cursor.writer(&.{});
                     try writer.interface.writeAll("bar");
                     try writer.finish();
+                    const root = cursor.db.rootCursor();
+                    try std.testing.expectError(error.NestedTopLevelWrite, root.writePath(void, &.{.array_list_append}));
+                    try std.testing.expectError(error.NestedTopLevelWrite, root.writePath(void, &.{.{ .array_list_slice = .{ .size = 0 } }}));
                 }
             };
             _ = try root_cursor.writePath(Ctx, &.{
@@ -1385,6 +1388,17 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 .{ .hash_map_get = .{ .value = foo_key } },
                 .{ .ctx = Ctx{} },
             });
+        }
+
+        // a callback at the history root must not start another transaction either
+        {
+            const Ctx = struct {
+                pub fn run(_: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
+                    _ = try cursor.db.rootCursor().writePath(void, &.{.array_list_append});
+                }
+            };
+            try std.testing.expectError(error.NestedTopLevelWrite, root_cursor.writePath(Ctx, &.{.{ .ctx = Ctx{} }}));
+            try std.testing.expectEqual(1, try db.rootCursor().count());
         }
 
         // read foo
