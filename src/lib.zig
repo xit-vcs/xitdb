@@ -579,7 +579,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             const is_top_level = slot_ptr.slot.value == DATABASE_START;
 
-            const is_tx_start = is_top_level and self.header.tag == .array_list and self.tx_start == null;
+            const is_tx_start = write_mode == .read_write and is_top_level and self.header.tag == .array_list and self.tx_start == null;
             if (is_tx_start) {
                 self.tx_start = try self.core.length();
             }
