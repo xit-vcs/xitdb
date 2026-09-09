@@ -1547,6 +1547,18 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             // verify that the db is properly truncated back to its original size after error
             const size_after = try db.core.length();
             try std.testing.expectEqual(size_before, size_after);
+
+            // appending must clear the failed moment's slot, including its stored value
+            const history = try xitdb.Database(db_kind, HashInt).ArrayList(.read_write).init(db.rootCursor());
+            const count_before = try history.count();
+            try std.testing.expect((try history.appendCursor()).slot().empty());
+            try std.testing.expectEqual(null, try history.getSlot(-1));
+            try history.slice(count_before);
+            try history.append(.{ .uint = 999 });
+            try history.slice(count_before);
+            try std.testing.expect((try history.appendCursor()).slot().empty());
+            try std.testing.expectEqual(null, try history.getSlot(-1));
+            try history.slice(count_before);
         }
 
         // write bar -> longstring

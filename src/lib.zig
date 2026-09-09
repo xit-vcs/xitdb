@@ -564,6 +564,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return committed_size;
         }
 
+        // TODO: retain frozen data on rollback to keep its read cursors valid
         fn truncate(self: *Database(db_kind, HashInt)) !void {
             const committed_size = try self.validateCommittedSize();
             if (try self.core.length() > committed_size) {
@@ -1651,7 +1652,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 index_pos = next_index_pos;
             }
 
-            const slot_ptr = try self.readArrayListSlot(index_pos, key, next_shift, write_mode, is_top_level);
+            var slot_ptr = try self.readArrayListSlot(index_pos, key, next_shift, write_mode, is_top_level);
+            // clear values left by a rollback or slice
+            slot_ptr.slot = .{};
+            try writer.seekTo(slot_ptr.position orelse unreachable);
+            try writer.interface.writeInt(SlotInt, @bitCast(slot_ptr.slot), .big);
 
             return .{
                 .header = .{
