@@ -527,21 +527,22 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try target_writer.seekTo(0);
             try target.header.write(&target_writer.interface);
 
-            // flush, update file_size, flush again
-            try target.core.flush();
-            const file_size = try target.core.length();
-            try target_writer.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
-            try target_writer.interface.writeInt(u64, file_size, .big);
-            try target.core.flush();
-
             // fsync so the compacted database is durable, since callers
             // typically rename it over an existing database file
-            try target.core.sync();
+            try target.updateCommittedSize();
 
             return target;
         }
 
         // private
+
+        // TODO: retain frozen data on rollback to keep its read cursors valid
+        fn truncate(self: *Database(db_kind, HashInt)) !void {
+            const committed_size = try self.validateCommittedSize();
+            if (try self.core.length() > committed_size) {
+                try self.core.setLength(committed_size);
+            }
+        }
 
         fn validateCommittedSize(self: *Database(db_kind, HashInt)) !u64 {
             if (self.header.tag != .array_list) return self.core.length();
@@ -564,11 +565,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return committed_size;
         }
 
-        // TODO: retain frozen data on rollback to keep its read cursors valid
-        fn truncate(self: *Database(db_kind, HashInt)) !void {
-            const committed_size = try self.validateCommittedSize();
-            if (try self.core.length() > committed_size) {
-                try self.core.setLength(committed_size);
+        fn updateCommittedSize(self: *Database(db_kind, HashInt)) !void {
+            try self.core.sync();
+            if (self.header.tag == .array_list) {
+                var reader = self.core.reader();
+                try reader.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
+                const committed_size = try takeInt(&reader.interface, u64, .big);
+                const file_size = try self.core.length();
+                if (file_size == committed_size) return;
+                var writer = self.core.writer();
+                try writer.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
+                try writer.interface.writeInt(u64, file_size, .big);
+                try self.core.sync();
             }
         }
 
@@ -584,6 +592,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             const is_tx_start = write_mode == .read_write and is_top_level and self.header.tag == .array_list and self.tx_start == null;
             if (is_tx_start) {
+                // discard data left by an unfinished transaction after a crash.
+                try self.truncate();
                 self.tx_start = try self.core.length();
             }
             defer {
@@ -711,7 +721,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
                     const final_slot_ptr = try self.readArrayListSlot(header.ptr, key, shift, write_mode, is_top_level);
 
-                    return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr) catch |err| {
+                        if (write_mode == .read_write and is_top_level) {
+                            // restore the moment before truncating its copied data.
+                            var writer = self.core.writer();
+                            try writer.seekTo(final_slot_ptr.position orelse unreachable);
+                            try writer.interface.writeInt(SlotInt, @bitCast(final_slot_ptr.slot), .big);
+                            try self.core.sync();
+                        }
+                        return err;
+                    };
                 },
                 .array_list_append => {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1697,9 +1716,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             // if top level array list, update the file size in the list
                             // header to prevent truncation from destroying this block
                             if (is_top_level) {
-                                const file_size = try self.core.length();
-                                try writer.seekTo(DATABASE_START + byteSizeOf(ArrayListHeader));
-                                try writer.interface.writeInt(u64, file_size, .big);
+                                try self.updateCommittedSize();
                             }
                             try writer.seekTo(slot_pos);
                             try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_index_pos, .tag = .index }), .big);
@@ -2781,6 +2798,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         try core_writer.interface.writeInt(SlotInt, @bitCast(self.slot), .big);
 
                         self.parent.slot_ptr.slot = self.slot;
+                        if (self.parent.db.tx_start == null) {
+                            try self.parent.db.updateCommittedSize();
+                        }
                     }
 
                     pub fn seekTo(self: *Writer, offset: u64) !void {
@@ -2880,7 +2900,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return err;
                     };
                     if (self.db.tx_start == null) {
-                        try self.db.core.sync();
+                        // writes through returned cursors may also allocate new data.
+                        try self.db.updateCommittedSize();
                     }
                     return .{
                         .slot_ptr = slot_ptr,

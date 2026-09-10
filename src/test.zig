@@ -620,7 +620,8 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
     }
 
     // opening the db leaves trailing data alone, because it may
-    // belong to another writer's unfinished transaction.
+    // belong to another writer's unfinished transaction. the next
+    // write transaction truncates it before allocating new data.
     {
         const size_before = try db.core.length();
 
@@ -655,6 +656,9 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         const size_after = try db.core.length();
 
         try std.testing.expectEqual(size_with_tail, size_after);
+
+        _ = try DB.ArrayList(.read_write).init(db.rootCursor());
+        try std.testing.expectEqual(size_before, try db.core.length());
     }
 
     // cloning
