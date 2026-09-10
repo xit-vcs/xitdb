@@ -1394,14 +1394,14 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             });
         }
 
-        // a callback at the history root must not start another transaction either
+        // callbacks must run inside an appended moment
         {
             const Ctx = struct {
                 pub fn run(_: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
                     _ = try cursor.db.rootCursor().writePath(void, &.{.array_list_append});
                 }
             };
-            try std.testing.expectError(error.NestedTopLevelWrite, root_cursor.writePath(Ctx, &.{.{ .ctx = Ctx{} }}));
+            try std.testing.expectError(error.CursorNotWriteable, root_cursor.writePath(Ctx, &.{.{ .ctx = Ctx{} }}));
             try std.testing.expectEqual(1, try db.rootCursor().count());
         }
 
@@ -1568,14 +1568,14 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         // write bar -> longstring
         const bar_key = hashInt("bar");
         {
-            var bar_cursor = try root_cursor.writePath(void, &.{
+            const bar_cursor = try root_cursor.writePath(void, &.{
                 .array_list_init,
                 .array_list_append,
                 .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                 .{ .hash_map_init = .{} },
                 .{ .hash_map_get = .{ .value = bar_key } },
+                .{ .write = .{ .bytes = "longstring" } },
             });
-            try bar_cursor.write(.{ .bytes = "longstring" });
 
             // the slot tag is .bytes because the byte array is > 8 bytes long
             try std.testing.expectEqual(.bytes, bar_cursor.slot().tag);
@@ -1595,14 +1595,14 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
             // writing with write returns a new slot
             {
-                var next_bar_cursor = try root_cursor.writePath(void, &.{
+                const next_bar_cursor = try root_cursor.writePath(void, &.{
                     .array_list_init,
                     .array_list_append,
                     .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                     .{ .hash_map_init = .{} },
                     .{ .hash_map_get = .{ .value = bar_key } },
+                    .{ .write = .{ .bytes = "longstring" } },
                 });
-                try next_bar_cursor.write(.{ .bytes = "longstring" });
                 try std.testing.expect(!bar_cursor.slot_ptr.slot.eql(next_bar_cursor.slot_ptr.slot));
             }
 
@@ -1626,8 +1626,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                 .{ .hash_map_init = .{} },
                 .{ .hash_map_get = .{ .value = bar_key } },
+                .{ .write = .{ .bytes = "shortstr" } },
             });
-            try bar_cursor.write(.{ .bytes = "shortstr" });
 
             // the slot tag is .short_bytes because the byte array is <= 8 bytes long
             try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
@@ -1650,8 +1650,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                     .{ .hash_map_init = .{} },
                     .{ .hash_map_get = .{ .value = bar_key } },
+                    .{ .write = .{ .bytes_object = .{ .value = "shortstr", .format_tag = "st".* } } },
                 });
-                try bar_cursor.write(.{ .bytes_object = .{ .value = "shortstr", .format_tag = "st".* } });
 
                 // the slot tag is .bytes because the byte array is > 8 bytes long including the format tag
                 try std.testing.expectEqual(.bytes, bar_cursor.slot().tag);
@@ -1682,8 +1682,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                     .{ .hash_map_init = .{} },
                     .{ .hash_map_get = .{ .value = bar_key } },
+                    .{ .write = .{ .bytes_object = .{ .value = "shorts", .format_tag = "st".* } } },
                 });
-                try bar_cursor.write(.{ .bytes_object = .{ .value = "shorts", .format_tag = "st".* } });
 
                 // the slot tag is .short_bytes because the byte array is <= 8 bytes long including the format tag
                 try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
@@ -1714,8 +1714,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                     .{ .hash_map_init = .{} },
                     .{ .hash_map_get = .{ .value = bar_key } },
+                    .{ .write = .{ .bytes_object = .{ .value = "short", .format_tag = "st".* } } },
                 });
-                try bar_cursor.write(.{ .bytes_object = .{ .value = "short", .format_tag = "st".* } });
 
                 // the slot tag is .short_bytes because the byte array is <= 8 bytes long including the format tag
                 try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
@@ -2288,7 +2288,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         // so we have the old root again
         _ = try root_cursor.writePath(void, &.{
             .array_list_init,
-            .{ .array_list_get = -1 },
+            .array_list_append,
+            .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
             .array_list_init,
             .{ .array_list_slice = .{ .size = xitdb.SLOT_COUNT } },
         });
@@ -2418,7 +2419,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         {
             _ = try root_cursor.writePath(void, &.{
                 .array_list_init,
-                .{ .array_list_get = -1 },
+                .array_list_append,
+                .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
                 .array_list_init,
                 .{ .array_list_get = 0 },
                 .{ .write = .{ .slot = null } },

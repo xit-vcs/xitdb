@@ -588,7 +588,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 return slot_ptr;
             };
 
-            const is_top_level = slot_ptr.slot.value == DATABASE_START;
+            const is_top_level = slot_ptr.position == null and slot_ptr.slot.value == DATABASE_START;
 
             const is_tx_start = write_mode == .read_write and is_top_level and self.header.tag == .array_list and self.tx_start == null;
             if (is_tx_start) {
@@ -697,6 +697,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
                 },
                 .array_list_get => |index| {
+                    if (write_mode == .read_write and is_top_level and self.header.tag == .array_list) return error.WriteNotAllowed;
+
                     const tag = if (is_top_level) self.header.tag else slot_ptr.slot.tag;
                     switch (tag) {
                         .none => return error.KeyNotFound,
@@ -721,16 +723,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
                     const final_slot_ptr = try self.readArrayListSlot(header.ptr, key, shift, write_mode, is_top_level);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr) catch |err| {
-                        if (write_mode == .read_write and is_top_level) {
-                            // restore the moment before truncating its copied data.
-                            var writer = self.core.writer();
-                            try writer.seekTo(final_slot_ptr.position orelse unreachable);
-                            try writer.interface.writeInt(SlotInt, @bitCast(final_slot_ptr.slot), .big);
-                            try self.core.sync();
-                        }
-                        return err;
-                    };
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr);
                 },
                 .array_list_append => {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1374,6 +1367,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 },
                 .ctx => |ctx| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
+                    if (is_top_level and self.header.tag == .array_list) return error.CursorNotWriteable;
 
                     if (path.len > 1) return error.PathPartMustBeAtEnd;
 
@@ -2778,6 +2772,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     format_tag: ?[2]u8,
 
                     pub fn finish(self: *Writer) !void {
+                        if (self.parent.db.header.tag == .array_list and self.parent.db.tx_start == null) return error.ExpectedTxStart;
                         try self.interface.flush();
 
                         var core_writer = self.parent.db.core.writer();
@@ -2799,7 +2794,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                         self.parent.slot_ptr.slot = self.slot;
                         if (self.parent.db.tx_start == null) {
-                            try self.parent.db.updateCommittedSize();
+                            try self.parent.db.core.sync();
                         }
                     }
 
@@ -2827,6 +2822,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
+                        if (self.parent.db.header.tag == .array_list and self.parent.db.tx_start == null) return error.WriteFailed;
                         const n = bytes.len;
                         const new_position = self.pos + @as(u64, @intCast(n));
 
@@ -2885,6 +2881,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writePath(self: Cursor(.read_write), comptime Ctx: type, path: []const PathPart(Ctx)) !Cursor(.read_write) {
+                    // writes to moments must run inside a transaction.
+                    if (self.db.header.tag == .array_list and self.db.tx_start == null and
+                        self.slot_ptr.position != null and path.len > 0)
+                    {
+                        return error.ExpectedTxStart;
+                    }
                     // nested top-level writes could commit before the outer transaction ends
                     if (self.db.tx_start != null and self.db.header.tag == .array_list and
                         self.slot_ptr.position == null and self.slot_ptr.slot.value == DATABASE_START and path.len > 0)
@@ -2900,8 +2902,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return err;
                     };
                     if (self.db.tx_start == null) {
-                        // writes through returned cursors may also allocate new data.
-                        try self.db.updateCommittedSize();
+                        try self.db.core.sync();
                     }
                     return .{
                         .slot_ptr = slot_ptr,
@@ -3128,6 +3129,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writer(self: *Cursor(.read_write), buffer: []u8) !Writer {
+                    if (self.db.header.tag == .array_list and self.db.tx_start == null) return error.ExpectedTxStart;
                     var core_writer = self.db.core.writer();
                     const ptr_pos = try self.db.core.length();
                     try core_writer.seekTo(ptr_pos);
