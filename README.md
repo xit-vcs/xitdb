@@ -37,8 +37,12 @@ In this example, we create a new database, write some data in a transaction, and
 
 ```zig
 // create db file
-const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
+const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = false });
 defer file.close(io);
+
+// acquire an exclusive file lock (only needed when writing)
+try file.lock(io, .exclusive);
+defer file.unlock(io);
 
 // init the buffer (optional, but better for performance)
 var buffer = std.Io.Writer.Allocating.init(allocator);
@@ -606,4 +610,4 @@ This compacted database will be in a separate file. If you want to delete the or
 
 ## Thread Safety
 
-It is possible to read a database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. Also, keep in mind that writes still need to come from one thread at a time.
+It is possible to read a database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. Also, keep in mind that writes still need to come from one thread at a time; see the example at the top of this file, where it acquires an exclusive file lock.
