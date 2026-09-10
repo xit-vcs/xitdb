@@ -4888,7 +4888,11 @@ const CoreBufferedFile = struct {
     }
 
     pub fn length(self: *const CoreBufferedFile) !u64 {
-        return @max(self.memory_pos + self.memory.buffer.written().len, try self.file.length());
+        const buffer_size = self.memory.buffer.written().len;
+        // a failed allocation after seeking past eof can leave an empty
+        // buffer beyond the file's end, even after rollback.
+        if (buffer_size == 0) return self.file.length();
+        return @max(self.memory_pos + buffer_size, try self.file.length());
     }
 
     pub fn setLength(self: *CoreBufferedFile, len: u64) !void {
