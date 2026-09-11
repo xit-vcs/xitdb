@@ -4715,9 +4715,8 @@ const CoreMemory = struct {
     }
 
     pub fn setLength(self: *CoreMemory, len: u64) !void {
-        var arr = self.buffer.toArrayList();
-        arr.shrinkAndFree(self.buffer.allocator, len);
-        self.buffer.* = std.Io.Writer.Allocating.fromArrayList(self.buffer.allocator, &arr);
+        if (len > self.buffer.written().len) return error.InvalidLength;
+        self.buffer.shrinkRetainingCapacity(@intCast(len));
     }
 
     pub fn sync(_: *const CoreMemory) !void {}

@@ -148,6 +148,39 @@ test "low level memory operations" {
     try writer.seekTo(size + 3);
     try writer.interface.writeAll("!");
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, '!' }, db.core.buffer.written()[size..]);
+
+    try db.core.setLength(0);
+    try writer.seekTo(0);
+    try writer.interface.writeAll(&.{ 1, 2, 3, 4 });
+    try reader.seekTo(1);
+    try writer.seekTo(1);
+
+    // invalid lengths must leave the contents and positions alone
+    for ([_]u64{ 5, std.math.maxInt(u64) }) |len| {
+        try std.testing.expectError(error.InvalidLength, db.core.setLength(len));
+        try std.testing.expectEqual(1, reader.pos);
+        try std.testing.expectEqual(1, writer.logicalPos());
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, buffer.written());
+    }
+
+    // memory readers and writers keep independent positions across truncation
+    try db.core.setLength(3);
+    try std.testing.expectEqual(1, reader.pos);
+    try std.testing.expectEqual(1, writer.logicalPos());
+    try db.core.setLength(3);
+    try std.testing.expectEqual(1, reader.pos);
+    try std.testing.expectEqual(1, writer.logicalPos());
+    try reader.seekTo(3);
+    try writer.seekTo(3);
+    try db.core.setLength(2);
+    try std.testing.expectEqual(2, try db.core.length());
+    try std.testing.expectEqual(3, reader.pos);
+    try std.testing.expectEqual(3, writer.logicalPos());
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, buffer.written());
+    try std.testing.expectError(error.EndOfStream, reader.interface.readSliceAll(block[0..1]));
+    try writer.seekTo(2);
+    try writer.interface.writeByte(9);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 9 }, buffer.written());
 }
 
 test "validate tag" {
