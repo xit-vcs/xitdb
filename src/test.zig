@@ -2779,6 +2779,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 test "compaction" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
+    var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+    defer offset_map.deinit();
 
     // memory
     {
@@ -2792,6 +2794,7 @@ test "compaction" {
             .{ .buffer = &source_buffer, .max_size = 5_000_000 },
             .memory,
             .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+            &offset_map,
         );
     }
 
@@ -2813,6 +2816,7 @@ test "compaction" {
             .{ .io = io, .file = source_file },
             .file,
             .{ .io = io, .file = target_file },
+            &offset_map,
         );
     }
 
@@ -2838,6 +2842,7 @@ test "compaction" {
             .{ .io = io, .file = source_file, .buffer = &source_buffer },
             .buffered_file,
             .{ .io = io, .file = target_file, .buffer = &target_buffer },
+            &offset_map,
         );
     }
 
@@ -2858,7 +2863,92 @@ test "compaction" {
             .{ .io = io, .file = source_file, .buffer = &source_buffer },
             .memory,
             .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+            &offset_map,
         );
+    }
+}
+
+test "compaction with disk-backed offsets map" {
+    const io = std.testing.io;
+
+    // a custom offsets map only needs reset, get, and put. store offsets
+    // directly as u64 hashes in a separate, mutable top-level xitdb hash map.
+    const DiskOffsets = struct {
+        const DB = xitdb.Database(.file, u64);
+
+        io: std.Io,
+        file: std.Io.File,
+        db: DB = undefined, // initialized by compact's call to reset
+
+        pub fn reset(self: *@This()) !void {
+            try self.file.setLength(self.io, 0);
+            self.db = try DB.init(.{ .io = self.io, .file = self.file, .fsync = false });
+        }
+
+        pub fn get(self: *@This(), source_offset: u64) !?u64 {
+            const map = try DB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
+            const cursor = (try map.getCursor(source_offset)) orelse return null;
+            return try cursor.readUint();
+        }
+
+        pub fn put(self: *@This(), source_offset: u64, target_offset: u64) !void {
+            const map = try DB.HashMap(.read_write).init(self.db.rootCursor());
+            try map.put(source_offset, .{ .uint = target_offset });
+        }
+    };
+
+    const offsets_file = try std.Io.Dir.cwd().createFile(io, "compact_offsets.db", .{ .read = true, .truncate = true });
+    defer {
+        offsets_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, "compact_offsets.db") catch {};
+    }
+    var offset_map = DiskOffsets{ .io = io, .file = offsets_file };
+
+    // reusing a scratch map must discard offsets from previous compactions.
+    try offset_map.reset();
+    try offset_map.put(0, 123);
+
+    const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+    defer {
+        source_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+    }
+    const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
+    defer {
+        target_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
+    }
+
+    // exercise the same data types, cycles, sharing, and reopening checks
+    // as the in-memory offsets map, reusing the scratch file between runs.
+    try testCompaction(
+        std.testing.allocator,
+        .file,
+        .{ .io = io, .file = source_file, .fsync = false },
+        .file,
+        .{ .io = io, .file = target_file, .fsync = false },
+        &offset_map,
+    );
+    try std.testing.expectEqual(null, try offset_map.get(0));
+}
+
+test "hash map with u64 hashes" {
+    const DB = xitdb.Database(.memory, u64);
+    var buffer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer buffer.deinit();
+    var db = try DB.init(.{ .buffer = &buffer });
+    const map = try DB.HashMap(.read_write).init(db.rootCursor());
+
+    // the first two keys share all but their highest nibble, exercising
+    // the full trie depth with the narrower shift type required by u64.
+    const hashes = [_]u64{ 0, @as(u64, 1) << 60, std.math.maxInt(u64) };
+    for (hashes, 0..) |hash, i| try map.put(hash, .{ .uint = i });
+    for (hashes, 0..) |hash, i| {
+        try std.testing.expectEqual(i, try (try map.getCursor(hash)).?.readUint());
+    }
+    for (hashes) |hash| {
+        try std.testing.expect(try map.remove(hash));
+        try std.testing.expectEqual(null, try map.getCursor(hash));
     }
 }
 
@@ -2868,6 +2958,7 @@ fn testCompaction(
     source_opts: xitdb.InitOpts(db_kind),
     comptime target_db_kind: xitdb.DatabaseKind,
     target_opts: xitdb.InitOpts(target_db_kind),
+    offset_map: anytype,
 ) !void {
     const DB = xitdb.Database(db_kind, HashInt);
     const TargetDB = xitdb.Database(target_db_kind, HashInt);
@@ -2877,9 +2968,7 @@ fn testCompaction(
         try clearStorage(db_kind, source_opts);
         try clearStorage(target_db_kind, target_opts);
         var source = try DB.init(source_opts);
-        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
-        defer offset_map.deinit();
-        const compacted = try source.compact(target_db_kind, target_opts, &offset_map);
+        const compacted = try source.compact(target_db_kind, target_opts, offset_map);
         try std.testing.expectEqual(.none, compacted.header.tag);
     }
 
@@ -2995,9 +3084,7 @@ fn testCompaction(
         const source_size = try source.core.length();
 
         // compact
-        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
-        defer offset_map.deinit();
-        var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
+        var compacted = try source.compact(target_db_kind, target_opts, offset_map);
 
         const target_size = try compacted.core.length();
 
@@ -3153,9 +3240,7 @@ fn testCompaction(
             try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .round_val = round });
         }
 
-        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
-        defer offset_map.deinit();
-        var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
+        var compacted = try source.compact(target_db_kind, target_opts, offset_map);
 
         const history = try TargetDB.ArrayList(.read_only).init(compacted.rootCursor().readOnly());
         try std.testing.expectEqual(1, try history.count());
@@ -3197,9 +3282,7 @@ fn testCompaction(
             }
 
             // compact
-            var offset_map = std.AutoHashMap(u64, u64).init(allocator);
-            defer offset_map.deinit();
-            var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
+            var compacted = try source.compact(target_db_kind, target_opts, offset_map);
             _ = &compacted;
 
             // re-open the target
@@ -3235,9 +3318,7 @@ fn testCompaction(
             }
 
             // compact
-            var offset_map = std.AutoHashMap(u64, u64).init(allocator);
-            defer offset_map.deinit();
-            var compacted = try source.compact(target_db_kind, target_opts, &offset_map);
+            var compacted = try source.compact(target_db_kind, target_opts, offset_map);
 
             // add new moment to compacted DB
             {

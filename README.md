@@ -608,6 +608,54 @@ try std.testing.expectEqual(1, try history.count());
 
 This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. It is not possible to compact a database in-place (using the same file as the target database); doing so would fail and would render your original database unreadable.
 
+The offsets map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. It grows with the number of live objects copied, so it could theoretically OOM. To avoid this, you can instead use a temporary on-disk xitdb file to track the offsets:
+
+```zig
+const DiskOffsets = struct {
+    const OffsetDB = xitdb.Database(.file, u64);
+
+    io: std.Io,
+    file: std.Io.File,
+    db: OffsetDB = undefined, // initialized by compact's call to reset
+
+    pub fn reset(self: *@This()) !void {
+        try self.file.setLength(self.io, 0);
+        self.db = try OffsetDB.init(.{ .io = self.io, .file = self.file, .fsync = false });
+    }
+
+    pub fn get(self: *@This(), source_offset: u64) !?u64 {
+        const map = try OffsetDB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
+        const cursor = (try map.getCursor(source_offset)) orelse return null;
+        return try cursor.readUint();
+    }
+
+    pub fn put(self: *@This(), source_offset: u64, target_offset: u64) !void {
+        const map = try OffsetDB.HashMap(.read_write).init(self.db.rootCursor());
+        try map.put(source_offset, .{ .uint = target_offset });
+    }
+};
+
+// create a scratch file and delete it when compaction is finished
+const offsets_file = try std.Io.Dir.cwd().createFile(io, "compact_offsets.db", .{ .read = true });
+defer {
+    offsets_file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, "compact_offsets.db") catch {};
+}
+var offset_map = DiskOffsets{ .io = io, .file = offsets_file };
+
+// create the buffer and file for the new database
+var compact_buffer = std.Io.Writer.Allocating.init(allocator);
+defer compact_buffer.deinit();
+const compact_file = try std.Io.Dir.cwd().createFile(io, "compact.db", .{ .read = true });
+defer compact_file.close(io);
+
+var compact_db = try db.compact(.buffered_file, .{ .io = io, .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+
+// read from the new compacted db
+const history = try DB.ArrayList(.read_only).init(compact_db.rootCursor().readOnly());
+try std.testing.expectEqual(1, try history.count());
+```
+
 ## Thread Safety
 
 It is possible to read a database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. Also, keep in mind that writes still need to come from one thread at a time; see the example at the top of this file, where it acquires an exclusive file lock.

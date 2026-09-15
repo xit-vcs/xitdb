@@ -466,9 +466,21 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: *std.AutoHashMap(u64, u64)) !Database(target_db_kind, HashInt) {
+        /// offset_map may be `*std.AutoHashMap(u64, u64)` or a custom map exposing:
+        ///
+        /// reset() !void
+        /// get(u64) !?u64
+        /// put(u64, u64) !void
+        ///
+        /// all mappings must remain available until compaction finishes to preserve
+        /// sharing and cycles.
+        pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: anytype) !Database(target_db_kind, HashInt) {
             // cached offsets only apply to this compaction's target.
-            offset_map.clearRetainingCapacity();
+            if (@TypeOf(offset_map) == *std.AutoHashMap(u64, u64)) {
+                offset_map.clearRetainingCapacity();
+            } else {
+                try offset_map.reset();
+            }
 
             var opts = target_opts;
             opts.hash_id = target_opts.hash_id orelse self.header.hash_id;
@@ -511,7 +523,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try target_writer.interface.writeAll(&index_block);
 
             // recursively remap the moment slot
-            var compactor = Compactor(target_db_kind){
+            var compactor = Compactor(target_db_kind, @TypeOf(offset_map)){
                 .source_core = &self.core,
                 .target_core = &target.core,
                 .offset_map = offset_map,
@@ -1400,7 +1412,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var reader = self.core.reader();
             var writer = self.core.writer();
 
-            const i: u4 = @intCast((key_hash >> key_offset * BIT_COUNT) & MASK);
+            const i: u4 = @intCast((key_hash >> @intCast(key_offset * BIT_COUNT)) & MASK);
             const slot_pos = index_pos + (byteSizeOf(Slot) * i);
             try reader.seekTo(slot_pos);
             const slot: Slot = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
@@ -1516,7 +1528,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 if (key_offset + 1 >= (HASH_SIZE * 8) / BIT_COUNT) {
                                     return error.KeyOffsetExceeded;
                                 }
-                                const next_i: u4 = @intCast((kv_pair.hash >> (key_offset + 1) * BIT_COUNT) & MASK);
+                                const next_i: u4 = @intCast((kv_pair.hash >> @intCast((key_offset + 1) * BIT_COUNT)) & MASK);
                                 const next_index_pos = try self.core.length();
                                 var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
                                 try writer.seekTo(next_index_pos);
@@ -1555,7 +1567,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
 
             // get the current slot
-            const i: u4 = @intCast((key_hash >> key_offset * BIT_COUNT) & MASK);
+            const i: u4 = @intCast((key_hash >> @intCast(key_offset * BIT_COUNT)) & MASK);
             const slot_pos = index_pos + (byteSizeOf(Slot) * i);
             const slot = slot_block[i];
 
@@ -4198,17 +4210,21 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // compaction helpers
 
-        fn Compactor(comptime target_db_kind: DatabaseKind) type {
+        fn Compactor(comptime target_db_kind: DatabaseKind, comptime OffsetMap: type) type {
             return struct {
                 source_core: *Core(db_kind),
                 target_core: *Core(target_db_kind),
-                offset_map: *std.AutoHashMap(u64, u64),
+                offset_map: OffsetMap,
 
                 const Self = @This();
                 const NodeHeader = struct {
                     kind_int: u8,
                     num: u8,
                 };
+
+                fn getOffset(self: *Self, source_offset: u64) !?u64 {
+                    return self.offset_map.get(source_offset);
+                }
 
                 fn reserveBlock(self: *Self, comptime size: usize) !u64 {
                     const offset = try self.target_core.length();
@@ -4220,7 +4236,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn visitObject(self: *Self, source_offset: u64, comptime size: usize, context: anytype, comptime populate: anytype) anyerror!u64 {
-                    if (self.offset_map.get(source_offset)) |target_offset| {
+                    if (try self.getOffset(source_offset)) |target_offset| {
                         return target_offset;
                     }
 
@@ -4246,7 +4262,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn remapBytes(self: *Self, slot: Slot) !u64 {
-                    if (self.offset_map.get(slot.value)) |target_offset| {
+                    if (try self.getOffset(slot.value)) |target_offset| {
                         return target_offset;
                     }
 
@@ -4379,7 +4395,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn remapBTreeNode(self: *Self, node_offset: u64) anyerror!u64 {
-                    if (self.offset_map.get(node_offset)) |target_offset| {
+                    if (try self.getOffset(node_offset)) |target_offset| {
                         return target_offset;
                     }
 
@@ -4530,7 +4546,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn remapSortedMapNode(self: *Self, node_offset: u64) anyerror!u64 {
-                    if (self.offset_map.get(node_offset)) |target_offset| {
+                    if (try self.getOffset(node_offset)) |target_offset| {
                         return target_offset;
                     }
 
