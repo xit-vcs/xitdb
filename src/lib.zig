@@ -594,7 +594,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer) !SlotPointer {
             const part = if (path.len > 0) path[0] else {
-                if (write_mode == .read_only and slot_ptr.slot.tag == .none) {
+                if (write_mode == .read_only and slot_ptr.slot.empty()) {
                     return error.KeyNotFound;
                 }
                 return slot_ptr;
