@@ -390,6 +390,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // init
 
         pub fn init(opts: InitOpts(db_kind)) !Database(db_kind, HashInt) {
+            // the buffer only holds writes that haven't been flushed yet, so it
+            // must start empty. anything left in it from an earlier use would be
+            // treated as unflushed data at the start of the file.
+            if (db_kind == .buffered_file) {
+                opts.buffer.clearRetainingCapacity();
+            }
+
             var self: Database(db_kind, HashInt) = switch (db_kind) {
                 .memory => .{
                     .core = .{
