@@ -2818,19 +2818,28 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
                         const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
 
-                        if (splat != 1) unreachable; // splat isn't supported
-
                         const bytes = io_w.buffered();
                         if (bytes.len > 0) {
                             return try w.writeAll(bytes);
                         }
 
-                        for (data) |buf| {
+                        for (data[0 .. data.len - 1]) |buf| {
                             if (buf.len == 0) continue;
                             return try w.writeAll(buf);
                         }
 
-                        return error.WriteFailed;
+                        // the last element is repeated `splat` times, which may be zero.
+                        // a partial write is fine; the caller will call again for the rest.
+                        const pattern = data[data.len - 1];
+                        if (pattern.len == 0 or splat == 0) return 0;
+                        if (pattern.len == 1 and splat > 1) {
+                            // padding from `print` arrives here one byte at a time
+                            var chunk: [256]u8 = undefined;
+                            const n = @min(splat, chunk.len);
+                            @memset(chunk[0..n], pattern[0]);
+                            return try w.writeAll(chunk[0..n]);
+                        }
+                        return try w.writeAll(pattern);
                     }
 
                     fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
