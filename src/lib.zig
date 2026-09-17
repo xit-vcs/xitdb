@@ -4920,7 +4920,15 @@ const CoreBufferedFile = struct {
     }
 
     pub fn setLength(self: *CoreBufferedFile, len: u64) !void {
-        try self.flush();
+        // discard buffered bytes past the new end rather than flushing them.
+        // a rollback must not depend on writing the data it is throwing away,
+        // because that write may be what failed (e.g. the disk is full).
+        const buffer_size = self.memory.buffer.written().len;
+        if (len <= self.memory_pos) {
+            self.memory.buffer.clearRetainingCapacity();
+        } else if (len < self.memory_pos + buffer_size) {
+            self.memory.buffer.shrinkRetainingCapacity(@intCast(len - self.memory_pos));
+        }
         try self.file.setLength(len);
     }
 
