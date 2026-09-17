@@ -436,13 +436,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 try self.header.write(&writer.interface);
                 try self.core.flush();
             } else {
-                var reader = self.core.reader();
-                try reader.seekTo(0);
-                self.header = try DatabaseHeader.read(&reader.interface);
-                try self.header.validate();
-                if (self.header.hash_size != byteSizeOf(HashInt)) {
-                    return error.InvalidHashSize;
-                }
+                self.header = try self.readAndValidateHeader();
                 _ = try self.validateCommittedSize();
             }
 
@@ -450,6 +444,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         pub fn rootCursor(self: *Database(db_kind, HashInt)) Cursor(.read_write) {
+            // another instance may have initialized the top-level data since we
+            // read the header. if this fails, the cursor sees an empty database,
+            // and the error will be returned when it is written to.
+            if (self.header.tag == .none) {
+                self.header = self.readAndValidateHeader() catch self.header;
+            }
             return .{
                 .slot_ptr = .{ .position = null, .slot = .{ .value = DATABASE_START, .tag = self.header.tag } },
                 .db = self,
@@ -548,6 +548,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // private
 
+        fn readAndValidateHeader(self: *Database(db_kind, HashInt)) !DatabaseHeader {
+            var reader = self.core.reader();
+            try reader.seekTo(0);
+            const header = try DatabaseHeader.read(&reader.interface);
+            try header.validate();
+            if (header.hash_size != byteSizeOf(HashInt)) {
+                return error.InvalidHashSize;
+            }
+            return header;
+        }
+
         // TODO: retain frozen data on rollback to keep its read cursors valid
         fn truncate(self: *Database(db_kind, HashInt)) !void {
             const committed_size = try self.validateCommittedSize();
@@ -601,6 +612,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
 
             const is_top_level = slot_ptr.position == null and slot_ptr.slot.value == DATABASE_START;
+
+            // the root tag only changes once, when the top-level data is initialized.
+            // if we haven't seen that happen, another instance may have done it since
+            // we read the header. initializing it again would discard its data.
+            // `rootCursor` checks as well, but this cursor may be older than that.
+            if (write_mode == .read_write and is_top_level and self.header.tag == .none) {
+                self.header = try self.readAndValidateHeader();
+            }
 
             const is_tx_start = write_mode == .read_write and is_top_level and self.header.tag == .array_list and self.tx_start == null;
             if (is_tx_start) {
