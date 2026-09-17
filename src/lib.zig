@@ -159,7 +159,7 @@ pub const InitOptsBufferedFile = struct {
     io: std.Io,
     file: std.Io.File,
     buffer: *std.Io.Writer.Allocating,
-    max_size: u64 = 2 * 1024 * 1024, // flushes when the memory is >= this size
+    max_size: u64 = 2 * 1024 * 1024, // flushes before the memory would grow beyond this size
     hash_id: ?HashId = null,
 };
 
@@ -4792,6 +4792,11 @@ const CoreBufferedFile = struct {
     memory_max_size: u64,
     memory_pos: u64 = 0,
     file: CoreFile,
+    // the file's length, cached so that `length` doesn't need to ask the OS
+    // every time data is allocated. another process may write to the file
+    // whenever this one isn't, so it is only set once we begin writing, and
+    // it is cleared when the writes are flushed.
+    file_len: ?u64 = null,
 
     pub const Reader = struct {
         parent: *CoreBufferedFile,
@@ -4836,21 +4841,12 @@ const CoreBufferedFile = struct {
         pos: u64 = 0,
 
         pub fn seekTo(self: *Writer, offset: u64) !void {
-            // flush if we are going past the end of the in-memory buffer
-            if (offset > self.parent.memory_pos + self.parent.memory.buffer.written().len) {
-                try self.parent.flush();
-            }
-
             self.pos = offset;
-
-            // if the buffer is empty, set its position to this offset as well
-            if (self.parent.memory.buffer.written().len == 0) {
-                self.parent.memory_pos = offset;
-            }
         }
 
         fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+            const parent = w.parent;
 
             if (splat != 1) unreachable; // splat isn't supported
             if (io_w.buffered().len > 0) unreachable; // buffering isn't supported
@@ -4859,26 +4855,37 @@ const CoreBufferedFile = struct {
                 const n = buf.len;
                 if (n == 0) continue;
 
-                if (w.parent.memory.buffer.written().len + n > w.parent.memory_max_size) {
-                    w.parent.flush() catch return error.WriteFailed;
+                // the in-memory buffer is a single contiguous window of the file
+                // starting at memory_pos. start a new window at this position if
+                // the buffer is empty, the write is past the end of the window,
+                // or the write would grow the window beyond the max size.
+                const buffer_size = parent.memory.buffer.written().len;
+                if (buffer_size == 0 or
+                    w.pos > parent.memory_pos + buffer_size or
+                    (w.pos >= parent.memory_pos and w.pos - parent.memory_pos + n > parent.memory_max_size))
+                {
+                    parent.flush() catch return error.WriteFailed;
+                    parent.memory_pos = w.pos;
+                }
+
+                if (parent.file_len == null) {
+                    parent.file_len = parent.file.length() catch return error.WriteFailed;
                 }
 
                 // write to the in-memory buffer
-                if (w.pos >= w.parent.memory_pos and w.pos <= w.parent.memory_pos + w.parent.memory.buffer.written().len) {
-                    var memory_writer = w.parent.memory.writer();
-                    memory_writer.seekTo(w.pos - w.parent.memory_pos) catch return error.WriteFailed;
+                if (w.pos >= parent.memory_pos and w.pos - parent.memory_pos + n <= parent.memory_max_size) {
+                    var memory_writer = parent.memory.writer();
+                    memory_writer.seekTo(w.pos - parent.memory_pos) catch return error.WriteFailed;
                     memory_writer.interface.writeAll(buf) catch return error.WriteFailed;
                 }
                 // write to the disk
                 else {
                     // a direct disk write that overlaps the buffered region would be
                     // clobbered by a later flush of stale buffer bytes, so flush first
-                    if (w.pos < w.parent.memory_pos + w.parent.memory.buffer.written().len and w.pos + n > w.parent.memory_pos) {
-                        w.parent.flush() catch return error.WriteFailed;
+                    if (w.pos < parent.memory_pos + parent.memory.buffer.written().len and w.pos + n > parent.memory_pos) {
+                        parent.flush() catch return error.WriteFailed;
                     }
-                    var file_writer = w.parent.file.writer();
-                    file_writer.seekTo(w.pos) catch return error.WriteFailed;
-                    file_writer.interface.writeAll(buf) catch return error.WriteFailed;
+                    parent.writeToFile(w.pos, buf) catch return error.WriteFailed;
                 }
 
                 w.pos += n;
@@ -4912,11 +4919,12 @@ const CoreBufferedFile = struct {
     }
 
     pub fn length(self: *const CoreBufferedFile) !u64 {
+        const file_len = self.file_len orelse try self.file.length();
         const buffer_size = self.memory.buffer.written().len;
-        // a failed allocation after seeking past eof can leave an empty
-        // buffer beyond the file's end, even after rollback.
-        if (buffer_size == 0) return self.file.length();
-        return @max(self.memory_pos + buffer_size, try self.file.length());
+        // a failed allocation or a rollback can leave an empty
+        // buffer positioned beyond the file's end.
+        if (buffer_size == 0) return file_len;
+        return @max(self.memory_pos + buffer_size, file_len);
     }
 
     pub fn setLength(self: *CoreBufferedFile, len: u64) !void {
@@ -4929,6 +4937,7 @@ const CoreBufferedFile = struct {
         } else if (len < self.memory_pos + buffer_size) {
             self.memory.buffer.shrinkRetainingCapacity(@intCast(len - self.memory_pos));
         }
+        self.file_len = null;
         try self.file.setLength(len);
     }
 
@@ -4938,14 +4947,23 @@ const CoreBufferedFile = struct {
     }
 
     pub fn flush(self: *CoreBufferedFile) !void {
+        self.file_len = null;
         if (self.memory.buffer.written().len > 0) {
-            var file_writer = self.file.writer();
-            try file_writer.seekTo(self.memory_pos);
-            try file_writer.interface.writeAll(self.memory.buffer.written());
-
-            self.memory_pos = 0;
+            try self.writeToFile(self.memory_pos, self.memory.buffer.written());
             self.memory.buffer.clearRetainingCapacity();
         }
+    }
+
+    fn writeToFile(self: *CoreBufferedFile, pos: u64, bytes: []const u8) !void {
+        // if the write fails partway, the file's length is unknown
+        const file_len = self.file_len;
+        self.file_len = null;
+
+        var file_writer = self.file.writer();
+        try file_writer.seekTo(pos);
+        try file_writer.interface.writeAll(bytes);
+
+        if (file_len) |len| self.file_len = @max(len, pos + bytes.len);
     }
 };
 
