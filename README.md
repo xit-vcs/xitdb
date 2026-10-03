@@ -395,7 +395,7 @@ const end = @min(after + page_size, count);
 // finds rank `after` in O(log n) without scanning the entries it skips, so
 // jumping to page 500 is just as cheap as page 1.
 var iter = try username_to_id.iteratorFromIndex(after);
-var i = after;
+var i: u64 = after;
 while (i < end) : (i += 1) {
     var id_cursor = (try iter.next()) orelse break;
     const id_kv = try id_cursor.readKeyValuePair();
@@ -510,8 +510,8 @@ while (try people_iter.next()) |person_cursor| {
                 std.debug.print("{s}: {s}\n", .{ key, val });
             },
             .uint => std.debug.print("{s}: {}\n", .{ key, try kv_pair.value_cursor.readUint() }),
-            .int => std.debug.print("{s}: {}\n", .{ key, _ = try kv_pair.value_cursor.readInt() }),
-            .float => std.debug.print("{s}: {}\n", .{ key, _ = try kv_pair.value_cursor.readFloat() }),
+            .int => std.debug.print("{s}: {}\n", .{ key, try kv_pair.value_cursor.readInt() }),
+            .float => std.debug.print("{s}: {}\n", .{ key, try kv_pair.value_cursor.readFloat() }),
             else => return error.UnexpectedTagType,
         }
     }
@@ -548,7 +548,7 @@ const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file });
 The size of the hash in bytes will be stored in the database's header. If you try opening it later with the wrong hash size, it will return an error. If you are unsure what hash size the database uses, this creates a chicken-and-egg problem. You can read the header before initializing the database like this:
 
 ```zig
-var reader = file.reader(&.{});
+var reader = file.reader(io, &.{});
 const header = try xitdb.DatabaseHeader.read(&reader.interface);
 try std.testing.expectEqual(20, header.hash_size);
 ```
@@ -562,7 +562,7 @@ const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file, .hash
 The hash id is only written to the database header when it is first initialized. When you open it later, that init option is ignored. You can read the hash id of an existing database like this:
 
 ```zig
-var reader = file.reader(&.{});
+var reader = file.reader(io, &.{});
 const header = try xitdb.DatabaseHeader.read(&reader.interface);
 try std.testing.expectEqualStrings("sha1", &header.hash_id.toBytes());
 ```
