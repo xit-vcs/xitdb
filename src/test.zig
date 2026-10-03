@@ -128,15 +128,15 @@ test "low level memory operations" {
     try writer.interface.writeAll("Hello");
     try std.testing.expectEqualStrings("Hello", db.core.buffer.written()[0..5]);
     try writer.interface.writeInt(u64, 42, .big);
-    var bytes = [_]u8{0} ** (@bitSizeOf(u64) / 8);
+    var bytes: [@bitSizeOf(u64) / 8]u8 = @splat(0);
     std.mem.writeInt(u64, &bytes, 42, .big);
-    const hello = try std.fmt.allocPrint(allocator, "Hello{s}", .{bytes});
+    const hello = try allocator.print("Hello{s}", .{bytes});
     defer allocator.free(hello);
     try std.testing.expectEqualStrings(hello, db.core.buffer.written()[0..13]);
 
     var reader = db.core.reader();
     try reader.seekTo(0);
-    var block = [_]u8{0} ** 5;
+    var block: [5]u8 = @splat(0);
     try reader.interface.readSliceAll(&block);
     try std.testing.expectEqualStrings("Hello", &block);
     try std.testing.expectEqual(42, try takeInt(&reader.interface, u64, .big));
@@ -199,7 +199,7 @@ fn hashInt(buffer: []const u8) HashInt {
     return std.mem.readInt(HashInt, &hash, .big);
 }
 
-fn takeInt(reader: *std.Io.Reader, comptime T: type, endian: std.builtin.Endian) !T {
+fn takeInt(reader: *std.Io.Reader, comptime T: type, endian: std.lang.Endian) !T {
     var buffer: [@bitSizeOf(T) / 8]u8 = undefined;
     try reader.readSliceAll(&buffer);
     return std.mem.readInt(T, &buffer, endian);
@@ -396,7 +396,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             var count: usize = 0;
             while (try iter.next()) |kv_pair_cursor| {
                 const kv_pair = try kv_pair_cursor.readKeyValuePair();
-                var letter_buf = [_]u8{0} ** 8;
+                var letter_buf: [8]u8 = @splat(0);
                 _ = try kv_pair.key_cursor.readBytes(&letter_buf);
                 count += 1;
             }
@@ -413,7 +413,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             var count: usize = 0;
             while (try iter.next()) |kv_pair_cursor| {
                 const kv_pair = try kv_pair_cursor.readKeyValuePair();
-                var letter_buf = [_]u8{0} ** 8;
+                var letter_buf: [8]u8 = @splat(0);
                 _ = try kv_pair.key_cursor.readBytes(&letter_buf);
                 count += 1;
             }
@@ -429,7 +429,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             var count: usize = 0;
             while (try iter.next()) |kv_pair_cursor| {
                 const kv_pair = try kv_pair_cursor.readKeyValuePair();
-                var letter_buf = [_]u8{0} ** 8;
+                var letter_buf: [8]u8 = @splat(0);
                 _ = try kv_pair.key_cursor.readBytes(&letter_buf);
                 count += 1;
             }
@@ -1466,7 +1466,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     var bar_reader = try cursor.reader(&read_buffer);
 
                     // read into buffer
-                    var bar_bytes = [_]u8{0} ** 10;
+                    var bar_bytes: [10]u8 = @splat(0);
                     try bar_reader.interface.readSliceAll(bar_bytes[0..3]);
                     try std.testing.expectEqualStrings("bar", bar_bytes[0..3]);
                     try bar_reader.seekTo(0);
@@ -1475,7 +1475,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
                     // read one char at a time
                     {
-                        var char = [_]u8{0} ** 1;
+                        var char: [1]u8 = @splat(0);
                         try bar_reader.seekTo(0);
 
                         try bar_reader.interface.readSliceAll(&char);
@@ -1668,7 +1668,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
             // make sure .short_bytes can be read with a reader
             var bar_reader = try bar_cursor.reader(&.{});
-            const bar_value = try bar_reader.interface.allocRemaining(allocator, @enumFromInt(MAX_READ_BYTES));
+            const bar_value = try bar_reader.interface.allocRemaining(allocator, .limited(MAX_READ_BYTES));
             defer allocator.free(bar_value);
             try std.testing.expectEqualStrings("shortstr", bar_value);
         }
@@ -1702,7 +1702,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
                 // make sure .bytes can be read with a reader
                 var bar_reader = try bar_cursor.reader(&.{});
-                const bar_value = try bar_reader.interface.allocRemaining(allocator, @enumFromInt(MAX_READ_BYTES));
+                const bar_value = try bar_reader.interface.allocRemaining(allocator, .limited(MAX_READ_BYTES));
                 defer allocator.free(bar_value);
                 try std.testing.expectEqualStrings("shortstr", bar_value);
             }
@@ -1727,14 +1727,14 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     .{ .array_list_get = -1 },
                     .{ .hash_map_get = .{ .value = bar_key } },
                 })).?;
-                var buffer = [_]u8{0} ** MAX_READ_BYTES;
+                var buffer: [MAX_READ_BYTES]u8 = @splat(0);
                 const bytes = try read_bar_cursor.readBytesObject(&buffer);
                 try std.testing.expectEqualStrings("shorts", bytes.value);
                 try std.testing.expectEqualStrings("st", &bytes.format_tag.?);
 
                 // make sure .short_bytes can be read with a reader
                 var bar_reader = try bar_cursor.reader(&.{});
-                const bar_value = try bar_reader.interface.allocRemaining(allocator, @enumFromInt(MAX_READ_BYTES));
+                const bar_value = try bar_reader.interface.allocRemaining(allocator, .limited(MAX_READ_BYTES));
                 defer allocator.free(bar_value);
                 try std.testing.expectEqualStrings("shorts", bar_value);
             }
@@ -1759,14 +1759,14 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     .{ .array_list_get = -1 },
                     .{ .hash_map_get = .{ .value = bar_key } },
                 })).?;
-                var buffer = [_]u8{0} ** MAX_READ_BYTES;
+                var buffer: [MAX_READ_BYTES]u8 = @splat(0);
                 const bytes = try read_bar_cursor.readBytesObject(&buffer);
                 try std.testing.expectEqualStrings("short", bytes.value);
                 try std.testing.expectEqualStrings("st", &bytes.format_tag.?);
 
                 // make sure .short_bytes can be read with a reader
                 var bar_reader = try bar_cursor.reader(&.{});
-                const bar_value = try bar_reader.interface.allocRemaining(allocator, @enumFromInt(MAX_READ_BYTES));
+                const bar_value = try bar_reader.interface.allocRemaining(allocator, .limited(MAX_READ_BYTES));
                 defer allocator.free(bar_value);
                 try std.testing.expectEqualStrings("short", bar_value);
             }
@@ -1778,7 +1778,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 .{ .array_list_get = -1 },
                 .{ .hash_map_get = .{ .value = foo_key } },
             })).?;
-            var bar_buffer = [_]u8{0} ** 3;
+            var bar_buffer: [3]u8 = @splat(0);
             const bar_buffer_value = try bar_cursor.readBytes(&bar_buffer);
             try std.testing.expectEqualStrings("baz", bar_buffer_value);
         }
@@ -2188,7 +2188,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         const wat_key = hashInt("wat");
         for (0..xitdb.SLOT_COUNT + 1) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             _ = try root_cursor.writePath(void, &.{
                 .array_list_init,
@@ -2201,7 +2201,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         }
 
         for (0..xitdb.SLOT_COUNT + 1) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             const cursor = (try root_cursor.readPath(void, &.{
                 .{ .array_list_get = i },
@@ -2221,7 +2221,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         // see `readArrayListSlot` for more.
         {
             for (xitdb.SLOT_COUNT + 1..xitdb.SLOT_COUNT * 2 + 1) |i| {
-                const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+                const value = try allocator.print("wat{}", .{i});
                 defer allocator.free(value);
 
                 const Ctx = struct {
@@ -2269,7 +2269,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // we can iterate over the remaining slots
         for (0..xitdb.SLOT_COUNT) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             const cursor = (try root_cursor.readPath(void, &.{
                 .{ .array_list_get = i },
@@ -2293,7 +2293,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         var root_cursor = db.rootCursor();
 
         for (0..xitdb.SLOT_COUNT + 1) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             _ = try root_cursor.writePath(void, &.{
                 .array_list_init,
@@ -2306,7 +2306,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         }
 
         for (0..xitdb.SLOT_COUNT + 1) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             const cursor = (try root_cursor.readPath(void, &.{
                 .{ .array_list_get = -1 },
@@ -2329,7 +2329,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // we can iterate over the remaining slots
         for (0..xitdb.SLOT_COUNT) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             const cursor = (try root_cursor.readPath(void, &.{
                 .{ .array_list_get = -1 },
@@ -2408,7 +2408,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // add wats
         for (0..10) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             _ = try root_cursor.writePath(void, &.{
                 .array_list_init,
@@ -2436,7 +2436,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             var iter = try inner_cursor.iterator();
             var i: u64 = 0;
             while (try iter.next()) |*next_cursor| {
-                const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+                const value = try allocator.print("wat{}", .{i});
                 defer allocator.free(value);
                 const value2 = try next_cursor.readBytesAlloc(allocator, MAX_READ_BYTES);
                 defer allocator.free(value2);
@@ -2484,7 +2484,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // add wats
         for (0..10) |i| {
-            const value = try std.fmt.allocPrint(allocator, "wat{}", .{i});
+            const value = try allocator.print("wat{}", .{i});
             defer allocator.free(value);
             const wat_key = hashInt(value);
             _ = try root_cursor.writePath(void, &.{
@@ -3219,7 +3219,7 @@ fn testCompaction(
                     const moment = try DB.HashMap(.read_write).init(cursor.*);
                     for (0..20) |i| {
                         var key_buf: [32]u8 = undefined;
-                        const key = std.fmt.bufPrint(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
+                        const key = std.mem.print(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
                         try moment.put(hashInt(key), .{ .uint = i });
                     }
                 }
@@ -3251,7 +3251,7 @@ fn testCompaction(
         // verify shared keys are intact
         for (0..20) |i| {
             var key_buf: [32]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
+            const key = std.mem.print(&key_buf, "shared_key_{d}", .{i}) catch unreachable;
             try std.testing.expectEqual(i, try (try moment.getCursor(hashInt(key))).?.readUint());
         }
 
@@ -3409,7 +3409,7 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
             while (i > 0) {
                 i -= 1;
                 var kbuf: [8]u8 = undefined;
-                const key = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+                const key = try std.mem.print(&kbuf, "k{d:0>4}", .{i});
                 try map.put(key, .{ .uint = @intCast(i) });
             }
             try std.testing.expectEqual(COUNT, try map.count());
@@ -3428,7 +3428,7 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     const kv = try c.readKeyValuePair();
                     var kbuf: [8]u8 = undefined;
                     var ebuf: [8]u8 = undefined;
-                    const expect = try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{n});
+                    const expect = try std.mem.print(&ebuf, "k{d:0>4}", .{n});
                     try std.testing.expectEqualStrings(expect, try kv.key_cursor.readBytes(&kbuf));
                     try std.testing.expectEqual(n, try kv.value_cursor.readUint());
                     n += 1;
@@ -3447,7 +3447,7 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     var kbuf: [8]u8 = undefined;
                     var ebuf: [8]u8 = undefined;
                     const key = try kv.key_cursor.readBytes(&kbuf);
-                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{idx}), key);
+                    try std.testing.expectEqualStrings(try std.mem.print(&ebuf, "k{d:0>4}", .{idx}), key);
                     try std.testing.expectEqual(idx, try map.rank(key));
                 }
                 var kbuf: [8]u8 = undefined;
@@ -3498,7 +3498,7 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 var j: usize = 0;
                 while (j < COUNT) : (j += 2) {
                     var kbuf: [8]u8 = undefined;
-                    try std.testing.expect(try map.remove(try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{j})));
+                    try std.testing.expect(try map.remove(try std.mem.print(&kbuf, "k{d:0>4}", .{j})));
                 }
                 try std.testing.expectEqual(COUNT / 2, try map.count());
                 try std.testing.expect(!try map.remove("k0000")); // already gone
@@ -3510,7 +3510,7 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     const kv = try c.readKeyValuePair();
                     var kbuf: [8]u8 = undefined;
                     var ebuf: [8]u8 = undefined;
-                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ebuf, "k{d:0>4}", .{expect_i}), try kv.key_cursor.readBytes(&kbuf));
+                    try std.testing.expectEqualStrings(try std.mem.print(&ebuf, "k{d:0>4}", .{expect_i}), try kv.key_cursor.readBytes(&kbuf));
                     expect_i += 2;
                     seen += 1;
                 }

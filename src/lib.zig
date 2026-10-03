@@ -63,7 +63,7 @@ pub const Tag = enum(u7) {
     sorted_set,
 
     pub fn validate(self: Tag) !void {
-        if (null == std.enums.fromInt(Tag, @intFromEnum(self))) {
+        if (null == std.enums.fromInt(Tag, @backingInt(self))) {
             return error.InvalidEnumTag;
         }
     }
@@ -124,7 +124,7 @@ pub const HashId = packed struct(u32) {
     }
 
     pub fn toBytes(self: HashId) [4]u8 {
-        var bytes = [_]u8{0} ** 4;
+        var bytes: [4]u8 = @splat(0);
         std.mem.writeInt(u32, &bytes, self.id, .big);
         return bytes;
     }
@@ -235,9 +235,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         const BTreeNode = struct {
             kind: BTreeNodeKind,
             num: u8,
-            values: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // leaf
-            children: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
-            counts: [BTREE_SLOT_COUNT]u64 = [_]u64{0} ** BTREE_SLOT_COUNT, // branch
+            values: [BTREE_SLOT_COUNT]Slot = @splat(.{}), // leaf
+            children: [BTREE_SLOT_COUNT]Slot = @splat(.{}), // branch
+            counts: [BTREE_SLOT_COUNT]u64 = @splat(0), // branch
 
             fn subtreeCount(self: *const BTreeNode) u64 {
                 if (self.kind == .leaf) return self.num;
@@ -281,10 +281,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         const SortedNode = struct {
             kind: SortedNodeKind,
             num: u8,
-            entries: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // leaf
-            children: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
-            separators: [BTREE_SLOT_COUNT]Slot = [_]Slot{.{}} ** BTREE_SLOT_COUNT, // branch
-            counts: [BTREE_SLOT_COUNT]u64 = [_]u64{0} ** BTREE_SLOT_COUNT, // branch
+            entries: [BTREE_SLOT_COUNT]Slot = @splat(.{}), // leaf
+            children: [BTREE_SLOT_COUNT]Slot = @splat(.{}), // branch
+            separators: [BTREE_SLOT_COUNT]Slot = @splat(.{}), // branch
+            counts: [BTREE_SLOT_COUNT]u64 = @splat(0), // branch
 
             fn subtreeCount(self: *const SortedNode) u64 {
                 if (self.kind == .leaf) return self.num;
@@ -329,7 +329,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             pub fn isShort(self: Bytes) bool {
                 const total_size = if (self.format_tag != null) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                return self.value.len <= total_size and null == std.mem.indexOfScalar(u8, self.value, 0);
+                return self.value.len <= total_size and null == std.mem.findScalar(u8, self.value, 0);
             }
         };
 
@@ -526,7 +526,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .size = 1,
                 },
             }), .big);
-            const index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+            const index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
             try target_writer.interface.writeAll(&index_block);
 
             // recursively remap the moment slot
@@ -661,7 +661,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             }), .big);
 
                             // write the first block
-                            const index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            const index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try writer.interface.writeAll(&index_block);
 
                             // update db header
@@ -690,7 +690,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 .ptr = array_list_ptr,
                                 .size = 0,
                             }), .big);
-                            const array_list_index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            const array_list_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try writer.interface.writeAll(&array_list_index_block);
                             // make slot point to list
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = array_list_start, .tag = .array_list } };
@@ -711,7 +711,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     try reader.seekTo(array_list_start);
                                     var header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
                                     try reader.seekTo(header.ptr);
-                                    var array_list_index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                                    var array_list_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                                     try reader.interface.readSliceAll(&array_list_index_block);
                                     // copy to the end
                                     array_list_start = try self.core.length();
@@ -1082,7 +1082,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             }
 
                             // write the first block
-                            const map_index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            const map_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try writer.interface.writeAll(&map_index_block);
 
                             // update db header
@@ -1111,7 +1111,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             if (hash_map_init.counted) {
                                 try writer.interface.writeInt(u64, 0, .big);
                             }
-                            const map_index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            const map_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try writer.interface.writeAll(&map_index_block);
                             // make slot point to map
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = map_start, .tag = tag } };
@@ -1143,7 +1143,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     // read existing block
                                     try reader.seekTo(map_start);
                                     const map_count_maybe = if (hash_map_init.counted) try takeInt(&reader.interface, u64, .big) else null;
-                                    var map_index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                                    var map_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                                     try reader.interface.readSliceAll(&map_index_block);
                                     // copy to the end
                                     map_start = try self.core.length();
@@ -1370,7 +1370,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         .bytes => |bytes| continue :write_switch .{ .bytes_object = .{ .value = bytes } },
                         .bytes_object => |bytes| blk: {
                             if (bytes.isShort()) {
-                                var value = [_]u8{0} ** byteSizeOf(u64);
+                                var value: [byteSizeOf(u64)]u8 = @splat(0);
                                 @memcpy(value[0..bytes.value.len], bytes.value);
                                 if (bytes.format_tag) |format_tag| {
                                     @memcpy(value[value.len - 2 ..], &format_tag);
@@ -1486,7 +1486,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             if (next_ptr < tx_start) {
                                 // read existing block
                                 try reader.seekTo(ptr);
-                                var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                                 try reader.interface.readSliceAll(&index_block);
                                 // copy it to the end
                                 next_ptr = try self.core.length();
@@ -1556,7 +1556,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 }
                                 const next_i: u4 = @intCast((kv_pair.hash >> @intCast((key_offset + 1) * BIT_COUNT)) & MASK);
                                 const next_index_pos = try self.core.length();
-                                var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                                 try writer.seekTo(next_index_pos);
                                 try writer.interface.writeAll(&index_block);
                                 try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * next_i));
@@ -1582,9 +1582,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var writer = self.core.writer();
 
             // read block
-            var slot_block = [_]Slot{.{}} ** SLOT_COUNT;
+            var slot_block: [SLOT_COUNT]Slot = @splat(.{});
             try reader.seekTo(index_pos);
-            var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
             try reader.interface.readSliceAll(&index_block);
             var block_reader = std.Io.Reader.fixed(&index_block);
             for (&slot_block) |*block_slot| {
@@ -1695,7 +1695,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             if (prev_shift != next_shift) {
                 // root overflow
                 const next_index_pos = try self.core.length();
-                var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                 try writer.seekTo(next_index_pos);
                 try writer.interface.writeAll(&index_block);
                 try writer.seekTo(next_index_pos);
@@ -1742,7 +1742,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         .read_write => {
                             var writer = self.core.writer();
                             const next_index_pos = try self.core.length();
-                            var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try writer.seekTo(next_index_pos);
                             try writer.interface.writeAll(&index_block);
                             // if top level array list, update the file size in the list
@@ -1763,7 +1763,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             if (next_ptr < tx_start) {
                                 // read existing block
                                 try reader.seekTo(ptr);
-                                var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                                 try reader.interface.readSliceAll(&index_block);
                                 // copy it to the end
                                 var writer = self.core.writer();
@@ -1817,7 +1817,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 if (!is_top_level) {
                     if (self.tx_start) |tx_start| {
                         if (index_pos < tx_start) {
-                            var index_block = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                             try core_reader.seekTo(index_pos);
                             try core_reader.interface.readSliceAll(&index_block);
                             index_pos = try self.core.length();
@@ -1870,7 +1870,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn writeBTreeNodeAt(self: *Database(db_kind, HashInt), node: BTreeNode, ptr: u64) !void {
             var writer = self.core.writer();
             try writer.seekTo(ptr);
-            try writer.interface.writeInt(u8, @intFromEnum(node.kind), .big);
+            try writer.interface.writeInt(u8, @backingInt(node.kind), .big);
             try writer.interface.writeInt(u8, node.num, .big);
             switch (node.kind) {
                 .leaf => {
@@ -1945,7 +1945,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // the placeholder is a `.none` slot marked `full` so that, if the
                     // caller never writes a value (e.g. appendCursor), iteration still
                     // counts it as an element rather than skipping it as padding.
-                    var vals = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    var vals: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
                     const r: usize = @intCast(rank);
                     @memcpy(vals[0..r], node.values[0..r]);
                     vals[r] = .{ .full = true };
@@ -1994,8 +1994,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const child = try self.btreeInsert(node.children[i].value, rem);
 
                     // rebuild this branch with the (possibly split) child
-                    var children = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
-                    var counts = [_]u64{0} ** (BTREE_SLOT_COUNT + 1);
+                    var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
+                    var counts: [BTREE_SLOT_COUNT + 1]u64 = @splat(0);
                     @memcpy(children[0..node.num], node.children[0..node.num]);
                     @memcpy(counts[0..node.num], node.counts[0..node.num]);
                     children[i] = .{ .value = child.node_ptr, .tag = .index };
@@ -2342,7 +2342,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn writeSortedNodeAt(self: *Database(db_kind, HashInt), node: SortedNode, ptr: u64) !void {
             var writer = self.core.writer();
             try writer.seekTo(ptr);
-            try writer.interface.writeInt(u8, @intFromEnum(node.kind), .big);
+            try writer.interface.writeInt(u8, @backingInt(node.kind), .big);
             try writer.interface.writeInt(u8, node.num, .big);
             switch (node.kind) {
                 .leaf => {
@@ -2385,10 +2385,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn compareKey(self: *Database(db_kind, HashInt), key_slot: Slot, target: []const u8) !std.math.Order {
             switch (key_slot.tag) {
                 .short_bytes => {
-                    var buf = [_]u8{0} ** byteSizeOf(u64);
+                    var buf: [byteSizeOf(u64)]u8 = @splat(0);
                     std.mem.writeInt(u64, &buf, key_slot.value, .big);
                     const total = if (key_slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                    const len = std.mem.indexOfScalar(u8, buf[0..total], 0) orelse total;
+                    const len = std.mem.findScalar(u8, buf[0..total], 0) orelse total;
                     return std.mem.order(u8, buf[0..len], target);
                 },
                 .bytes => {
@@ -2495,8 +2495,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // write a byte key as a short_bytes (inline, <=8 bytes, no interior zero) or
         // external bytes slot
         fn writeKey(self: *Database(db_kind, HashInt), key: []const u8) !Slot {
-            if (key.len <= byteSizeOf(u64) and std.mem.indexOfScalar(u8, key, 0) == null) {
-                var value = [_]u8{0} ** byteSizeOf(u64);
+            if (key.len <= byteSizeOf(u64) and std.mem.findScalar(u8, key, 0) == null) {
+                var value: [byteSizeOf(u64)]u8 = @splat(0);
                 @memcpy(value[0..key.len], key);
                 return .{ .value = std.mem.readInt(u64, &value, .big), .tag = .short_bytes };
             }
@@ -2580,7 +2580,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // insert a new entry at idx
                     const entry = try self.sortedNewEntry(key);
-                    var entries = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
+                    var entries: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
                     @memcpy(entries[0..idx], node.entries[0..idx]);
                     entries[idx] = entry.kv_slot;
                     @memcpy(entries[idx + 1 .. node.num + 1], node.entries[idx..node.num]);
@@ -2617,9 +2617,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
                     const child = try self.sortedPut(node.children[i].value, key);
 
-                    var children = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
-                    var separators = [_]Slot{.{}} ** (BTREE_SLOT_COUNT + 1);
-                    var counts = [_]u64{0} ** (BTREE_SLOT_COUNT + 1);
+                    var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
+                    var separators: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
+                    var counts: [BTREE_SLOT_COUNT + 1]u64 = @splat(0);
                     @memcpy(children[0..node.num], node.children[0..node.num]);
                     @memcpy(separators[0..node.num], node.separators[0..node.num]);
                     @memcpy(counts[0..node.num], node.counts[0..node.num]);
@@ -2787,7 +2787,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                         if (r.pos >= r.size) return error.EndOfStream;
 
-                        const new_limit: std.Io.Limit = @enumFromInt(@min(@intFromEnum(limit), r.size - r.pos));
+                        const new_limit: std.Io.Limit = .limited64(@min(@backingInt(limit), r.size - r.pos));
                         const dest = new_limit.slice(try io_w.writableSliceGreedy(1));
 
                         var core_reader = r.parent.db.core.reader();
@@ -3010,7 +3010,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                             const format_tag = if (self.slot_ptr.slot.full) blk: {
                                 try core_reader.seekTo(start_position + value_size);
-                                var buf = [_]u8{0} ** 2;
+                                var buf: [2]u8 = @splat(0);
                                 try core_reader.interface.readSliceAll(&buf);
                                 break :blk buf;
                             } else null;
@@ -3018,10 +3018,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             return .{ .value = value, .format_tag = format_tag };
                         },
                         .short_bytes => {
-                            var bytes = [_]u8{0} ** byteSizeOf(u64);
+                            var bytes: [byteSizeOf(u64)]u8 = @splat(0);
                             std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
                             const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                            const value_size = std.mem.indexOfScalar(u8, bytes[0..total_size], 0) orelse total_size;
+                            const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
 
                             if (max_size_maybe) |max_size| {
                                 if (value_size > max_size) {
@@ -3034,7 +3034,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             @memcpy(value, bytes[0..value_size]);
 
                             const format_tag = if (self.slot_ptr.slot.full) blk: {
-                                var buf = [_]u8{0} ** 2;
+                                var buf: [2]u8 = @splat(0);
                                 @memcpy(&buf, bytes[total_size..]);
                                 break :blk buf;
                             } else null;
@@ -3065,7 +3065,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                             const format_tag = if (self.slot_ptr.slot.full) blk: {
                                 try core_reader.seekTo(start_position + value_size);
-                                var buf = [_]u8{0} ** 2;
+                                var buf: [2]u8 = @splat(0);
                                 try core_reader.interface.readSliceAll(&buf);
                                 break :blk buf;
                             } else null;
@@ -3073,10 +3073,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             return .{ .value = value, .format_tag = format_tag };
                         },
                         .short_bytes => {
-                            var bytes = [_]u8{0} ** byteSizeOf(u64);
+                            var bytes: [byteSizeOf(u64)]u8 = @splat(0);
                             std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
                             const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                            const value_size = std.mem.indexOfScalar(u8, bytes[0..total_size], 0) orelse total_size;
+                            const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
 
                             if (value_size > buffer.len) {
                                 return error.StreamTooLong;
@@ -3086,7 +3086,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const value = buffer[0..value_size];
 
                             const format_tag = if (self.slot_ptr.slot.full) blk: {
-                                var buf = [_]u8{0} ** 2;
+                                var buf: [2]u8 = @splat(0);
                                 @memcpy(&buf, bytes[total_size..]);
                                 break :blk buf;
                             } else null;
@@ -3153,10 +3153,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             };
                         },
                         .short_bytes => {
-                            var bytes = [_]u8{0} ** byteSizeOf(u64);
+                            var bytes: [byteSizeOf(u64)]u8 = @splat(0);
                             std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
                             const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                            const value_size = std.mem.indexOfScalar(u8, bytes[0..total_size], 0) orelse total_size;
+                            const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
                             return .{
                                 .parent = self,
                                 .interface = .{
@@ -3220,10 +3220,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             return try takeInt(&core_reader.interface, u64, .big);
                         },
                         .short_bytes => {
-                            var bytes = [_]u8{0} ** byteSizeOf(u64);
+                            var bytes: [byteSizeOf(u64)]u8 = @splat(0);
                             std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
                             const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
-                            return std.mem.indexOfScalar(u8, bytes[0..total_size], 0) orelse total_size;
+                            return std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
                         },
                         .counted_hash_map, .counted_hash_set => {
                             try core_reader.seekTo(self.slot_ptr.slot.value);
@@ -3509,9 +3509,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(position);
-                        var index_block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                        var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                         try core_reader.interface.readSliceAll(&index_block_bytes);
-                        var index_block = [_]Slot{undefined} ** SLOT_COUNT;
+                        var index_block: [SLOT_COUNT]Slot = undefined;
                         var block_reader = std.Io.Reader.fixed(&index_block_bytes);
                         for (&index_block) |*block_slot| {
                             block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
@@ -4265,7 +4265,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const offset = try self.target_core.length();
                     var writer = self.target_core.writer();
                     try writer.seekTo(offset);
-                    const empty_block = [_]u8{0} ** size;
+                    const empty_block: [size]u8 = @splat(0);
                     try writer.interface.writeAll(&empty_block);
                     return offset;
                 }
@@ -4337,7 +4337,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // read 144-byte block (16 slots)
                     try reader.seekTo(source_offset);
-                    var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                    var block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&block_bytes);
 
                     // remap each slot
@@ -4369,7 +4369,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const target_offset = try self.reserveBlock(INDEX_BLOCK_SIZE);
                     var reader = self.source_core.reader();
                     try reader.seekTo(source_offset);
-                    var slots = [_]Slot{.{}} ** SLOT_COUNT;
+                    var slots: [SLOT_COUNT]Slot = @splat(.{});
                     var remaining = size;
                     for (&slots) |*slot| {
                         if (remaining == 0) break;
@@ -4455,7 +4455,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body = [_]u8{0} ** (BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    var body: [BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
 
@@ -4477,7 +4477,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body = [_]u8{0} ** (BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    var body: [BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
 
@@ -4519,7 +4519,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const count_value: ?u64 = if (counted) try takeInt(&reader.interface, u64, .big) else null;
 
                     // read 144-byte root index block
-                    var block_bytes = [_]u8{0} ** INDEX_BLOCK_SIZE;
+                    var block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&block_bytes);
 
                     // remap each child slot in the block
@@ -4605,7 +4605,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body = [_]u8{0} ** (SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    var body: [SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
 
@@ -4627,7 +4627,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body = [_]u8{0} ** (SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE);
+                    var body: [SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
                     try reader.interface.readSliceAll(&body);
                     var body_reader = std.Io.Reader.fixed(&body);
 
@@ -4681,7 +4681,7 @@ const CoreMemory = struct {
 
             if (r.pos >= r.parent.buffer.written().len) return error.EndOfStream;
 
-            const max_size = @min(@intFromEnum(limit), r.parent.buffer.written().len - r.pos);
+            const max_size = @min(@backingInt(limit), r.parent.buffer.written().len - r.pos);
             if (max_size == 0) return 0;
 
             const size = try io_w.write(r.parent.buffer.written()[r.pos..(r.pos + max_size)]);
@@ -4997,7 +4997,7 @@ fn byteSizeOf(T: type) u16 {
     return @bitSizeOf(T) / 8;
 }
 
-fn takeInt(reader: *std.Io.Reader, comptime T: type, endian: std.builtin.Endian) !T {
+fn takeInt(reader: *std.Io.Reader, comptime T: type, endian: std.lang.Endian) !T {
     var buffer: [byteSizeOf(T)]u8 = undefined;
     try reader.readSliceAll(&buffer);
     return std.mem.readInt(T, &buffer, endian);
