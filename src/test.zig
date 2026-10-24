@@ -4253,6 +4253,15 @@ fn testStreamingRoots(
             try expectAppendOnlyAndReplicate(allocator, &source, &replica, &committed);
         }
 
+        // a key is written in the same transaction as the lookup, so it works on a root map
+        try map.putKey(hashInt("key-1"), .{ .bytes = "key-1" });
+        {
+            const kv = (try map.getKeyValuePair(hashInt("key-1"))).?;
+            var buffer: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("key-1", try kv.key_cursor.readBytes(&buffer));
+            try std.testing.expectEqual(1, try kv.value_cursor.readUint());
+        }
+
         // nested collections are written inside one transaction
         const Ctx = struct {
             pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
@@ -4402,6 +4411,20 @@ fn testStreamingRoots(
         const map = try DB.HashMap(.read_write).init(db.rootCursor());
         try map.put(hashInt("foo"), .{ .uint = 1 });
         try std.testing.expectEqual(1, try (try map.getCursor(hashInt("foo"))).?.readUint());
+    }
+
+    // a hash set root
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try DB.init(std.testing.io, source_opts);
+
+        const set = try DB.HashSet(.read_write).init(db.rootCursor());
+        try set.put(hashInt("a"), .{ .bytes = "a" });
+        try set.put(hashInt("a"), .{ .bytes = "a" });
+        try set.put(hashInt("b"), .{ .bytes = "b" });
+        var buffer: [8]u8 = undefined;
+        try std.testing.expectEqualStrings("a", try (try set.getCursor(hashInt("a"))).?.readBytes(&buffer));
+        try std.testing.expectEqualStrings("b", try (try set.getCursor(hashInt("b"))).?.readBytes(&buffer));
     }
 
     // a sorted map root

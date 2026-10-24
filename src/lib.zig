@@ -3961,6 +3961,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // high level API
 
+        // writes a hash map key if its slot is empty, as the last part of a path.
+        // keys are only written if empty, because their value should always be
+        // the same at a given hash. writing it in the same path keeps it in the
+        // same transaction, which matters when the map is the root.
+        const WriteKeyIfEmpty = struct {
+            data: WriteableData,
+
+            pub fn run(self: @This(), cursor: *Cursor(.read_write)) !void {
+                try cursor.writeIfEmpty(self.data);
+            }
+        };
+
         pub fn HashMap(comptime write_mode: WriteMode) type {
             return struct {
                 cursor: Database(db_kind, HashInt).Cursor(write_mode),
@@ -4034,12 +4046,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn putKey(self: HashMap(.read_write), hash: HashInt, data: WriteableData) !void {
-                    var cursor = try self.cursor.writePath(void, &.{
+                    _ = try self.cursor.writePath(WriteKeyIfEmpty, &.{
                         .{ .hash_map_get = .{ .key = hash } },
+                        .{ .ctx = .{ .data = data } },
                     });
-                    // keys are only written if empty, because their value should always
-                    // be the same at a given hash.
-                    try cursor.writeIfEmpty(data);
                 }
 
                 pub fn putKeyCursor(self: HashMap(.read_write), hash: HashInt) !Cursor(.read_write) {
@@ -4175,12 +4185,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn put(self: HashSet(.read_write), hash: HashInt, data: WriteableData) !void {
-                    var cursor = try self.cursor.writePath(void, &.{
+                    _ = try self.cursor.writePath(WriteKeyIfEmpty, &.{
                         .{ .hash_map_get = .{ .key = hash } },
+                        .{ .ctx = .{ .data = data } },
                     });
-                    // keys are only written if empty, because their value should always
-                    // be the same at a given hash.
-                    try cursor.writeIfEmpty(data);
                 }
 
                 pub fn putCursor(self: HashSet(.read_write), hash: HashInt) !Cursor(.read_write) {
