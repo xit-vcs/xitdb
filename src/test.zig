@@ -3688,6 +3688,10 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
         try std.testing.expectEqual(COUNT / 2, try map.count());
         var kbuf: [8]u8 = undefined;
         try std.testing.expectEqualStrings("k0001", try (try map.getIndexKeyValuePair(0)).?.key_cursor.readBytes(&kbuf));
+
+        // entries have no hash, except in version 0 databases
+        const entry = (try map.cursor.readPathSlot(void, &.{.{ .sorted_map_get = .{ .kv_pair = "k0001" } }})).?;
+        try std.testing.expectEqual(@as(xitdb.Tag, if (legacy) .kv_pair else .sorted_kv_pair), entry.tag);
     }
 
     // a second moment that inherits and mutates the map must not disturb the first
