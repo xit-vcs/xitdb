@@ -29,6 +29,7 @@ This database was originally made for the [xit version control system](https://g
 * [Iterators](#iterators)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
+* [Replication](#replication)
 * [Thread Safety](#thread-safety)
 
 ## Example
@@ -50,10 +51,10 @@ defer buffer.deinit();
 
 // init the db
 const DB = xitdb.Database(.buffered_file, HashInt);
-var db = try DB.init(.{ .io = io, .file = file, .buffer = &buffer });
+var db = try DB.init(io, .{ .file = file, .buffer = &buffer });
 
-// to get the benefits of immutability, the top-level data structure
-// must be an ArrayList, so each transaction is stored as an item in it
+// the top-level data structure is an ArrayList, so each transaction is
+// stored as an item in it, and past copies of the db stay readable
 const history = try DB.ArrayList(.read_write).init(db.rootCursor());
 
 // this is how a transaction is executed. we call history.appendContext,
@@ -135,9 +136,11 @@ There are three kinds of `Database` you can create: `.buffered_file`, `.file`, a
 * `.file` databases use no buffering when reading and writing data. You can initialize it like in the example above, except without providing a buffer. This is almost never necessary but it's useful as a benchmark comparison with `.buffered_file` databases.
 * `.memory` databases work completely in memory. You can initialize it like in the example above, except without providing a file.
 
-Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"). This is how it supports transactions, despite not having any rollback journal or write-ahead log. It's an append-only database, so the data you are writing is invisible to any reader until the very last step, when the top-level list's header is updated.
+Since xitdb is an append-only database, the data you are writing is invisible to any reader until the very last step, when a small header at the start of the file is updated to point at it. This is how it supports transactions, despite not having any rollback journal or write-ahead log: if a transaction fails, the data it appended is simply discarded.
 
-You can also use a top-level `HashMap`, which is useful for ephemeral databases where immutability or transaction safety isn't necessary. Since xitdb supports in-memory databases, you could use it as an over-the-wire serialization format. Much like "Cap'n Proto", xitdb has no encoding/decoding step: you just give the buffer to xitdb and it can immediately read from it.
+Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"), so past copies stay readable and can be reverted to. If you don't need to keep past copies, you can also use a top-level `HashMap`. Keep in mind that each write to a top-level `HashMap` is its own transaction, so if you make many writes, group them into one transaction with `runContext`.
+
+Since xitdb supports in-memory databases, you could use it as an over-the-wire serialization format. Much like "Cap'n Proto", xitdb has no encoding/decoding step: you just give the buffer to xitdb and it can immediately read from it. You can send it over a network and read it with xitdb on the other end.
 
 ## Types
 
@@ -197,7 +200,7 @@ const Ctx = struct {
         // create a new key called "food" whose initial value is
         // based on the "fruits" list
         var food_cursor = try moment.putCursor(hashInt("food"));
-        try food_cursor.write(.{ .slot = fruits.slot() });
+        try food_cursor.write(.{ .slot = try fruits.slot() });
 
         const food = try DB.ArrayList(.read_write).init(food_cursor);
         try food.append(.{ .bytes = "eggs" });
@@ -242,7 +245,7 @@ const Ctx = struct {
         // create a new key called "cities" whose initial value is
         // based on the "big-cities" list
         var cities_cursor = try moment.putCursor(hashInt("cities"));
-        try cities_cursor.write(.{ .slot = big_cities.slot() });
+        try cities_cursor.write(.{ .slot = try big_cities.slot() });
 
         const cities = try DB.ArrayList(.read_write).init(cities_cursor);
         try cities.append(.{ .bytes = "Charleston, SC" });
@@ -291,7 +294,7 @@ const Ctx = struct {
         // create a new key called "cities" whose initial value is
         // based on the "big-cities" list
         var cities_cursor = try moment.putCursor(hashInt("cities"));
-        try cities_cursor.write(.{ .slot = big_cities.slot() });
+        try cities_cursor.write(.{ .slot = try big_cities.slot() });
 
         const cities = try DB.ArrayList(.read_write).init(cities_cursor);
         try cities.append(.{ .bytes = "Charleston, SC" });
@@ -503,7 +506,7 @@ while (try people_iter.next()) |person_cursor| {
         var key_buffer: [100]u8 = undefined;
         const key = try kv_pair.key_cursor.readBytes(&key_buffer);
 
-        switch (kv_pair.value_cursor.slot().tag) {
+        switch ((try kv_pair.value_cursor.slot()).tag) {
             .short_bytes, .bytes => {
                 var val_buffer: [100]u8 = undefined;
                 const val = try kv_pair.value_cursor.readBytes(&val_buffer);
@@ -542,7 +545,7 @@ When initializing a database, you only tell xitdb the size of the hash via the `
 const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true });
 defer file.close(io);
 
-const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file });
+const db = try xitdb.Database(.file, u160).init(io, .{ .file = file });
 ```
 
 The size of the hash in bytes will be stored in the database's header. If you try opening it later with the wrong hash size, it will return an error. If you are unsure what hash size the database uses, this creates a chicken-and-egg problem. You can read the header before initializing the database like this:
@@ -556,7 +559,7 @@ try std.testing.expectEqual(20, header.hash_size);
 The hash size alone does not disambiguate hashing algorithms, though. In addition, xitdb reserves four bytes in the header that you can use to put the name of the algorithm. You must provide it in the init options:
 
 ```zig
-const db = try xitdb.Database(.file, u160).init(.{ .io = io, .file = file, .hash_id = .fromBytes("sha1") });
+const db = try xitdb.Database(.file, u160).init(io, .{ .file = file, .hash_id = .fromBytes("sha1") });
 ```
 
 The hash id is only written to the database header when it is first initialized. When you open it later, that init option is ignored. You can read the hash id of an existing database like this:
@@ -599,49 +602,46 @@ defer compact_file.close(io);
 var offset_map = std.AutoHashMap(u64, u64).init(allocator);
 defer offset_map.deinit();
 
-var compact_db = try db.compact(.buffered_file, .{ .io = io, .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+var compact_db = try db.compact(.buffered_file, .{ .file = compact_file, .buffer = &compact_buffer }, &offset_map);
 
 // read from the new compacted db
 const history = try DB.ArrayList(.read_write).init(compact_db.rootCursor());
 try std.testing.expectEqual(1, try history.count());
 ```
 
-This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. It is not possible to compact a database in-place (using the same file as the target database); doing so would fail and would render your original database unreadable.
+This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. The target must be a new or empty database, so compaction returns `error.TargetNotEmpty` if it already has data, including when it is the original database's own file.
 
-The offsets map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. It grows with the number of live objects copied, so it could theoretically OOM. To avoid this, you can instead use a temporary on-disk xitdb file to track the offsets:
+The offsets map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. It grows with the number of live objects copied, so it could theoretically OOM. To avoid this, you can instead use a temporary on-disk xitdb file to track the offsets. Run the compaction inside a single transaction on it, so the offsets aren't each committed separately:
 
 ```zig
-const DiskOffsets = struct {
-    const OffsetDB = xitdb.Database(.file, u64);
+const OffsetDB = xitdb.Database(.file, u64);
 
-    io: std.Io,
-    file: std.Io.File,
-    db: OffsetDB = undefined, // initialized by compact's call to reset
+const DiskOffsets = struct {
+    map: OffsetDB.HashMap(.read_write),
 
     pub fn reset(self: *@This()) !void {
-        try self.file.setLength(self.io, 0);
-        self.db = try OffsetDB.init(.{ .io = self.io, .file = self.file, .fsync = false });
+        var cursor = self.map.cursor;
+        try cursor.write(.{ .slot = null });
+        self.map = try OffsetDB.HashMap(.read_write).init(cursor);
     }
 
     pub fn get(self: *@This(), source_offset: u64) !?u64 {
-        const map = try OffsetDB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
-        const cursor = (try map.getCursor(source_offset)) orelse return null;
+        const cursor = (try self.map.getCursor(source_offset)) orelse return null;
         return try cursor.readUint();
     }
 
     pub fn put(self: *@This(), source_offset: u64, target_offset: u64) !void {
-        const map = try OffsetDB.HashMap(.read_write).init(self.db.rootCursor());
-        try map.put(source_offset, .{ .uint = target_offset });
+        try self.map.put(source_offset, .{ .uint = target_offset });
     }
 };
 
-// create a scratch file and delete it when compaction is finished
+// create a scratch database and delete it when compaction is finished
 const offsets_file = try std.Io.Dir.cwd().createFile(io, "compact_offsets.db", .{ .read = true });
 defer {
     offsets_file.close(io);
     std.Io.Dir.cwd().deleteFile(io, "compact_offsets.db") catch {};
 }
-var offset_map = DiskOffsets{ .io = io, .file = offsets_file };
+var offsets_db = try OffsetDB.init(io, .{ .file = offsets_file, .fsync = false });
 
 // create the buffer and file for the new database
 var compact_buffer = std.Io.Writer.Allocating.init(allocator);
@@ -649,12 +649,60 @@ defer compact_buffer.deinit();
 const compact_file = try std.Io.Dir.cwd().createFile(io, "compact.db", .{ .read = true });
 defer compact_file.close(io);
 
-var compact_db = try db.compact(.buffered_file, .{ .io = io, .file = compact_file, .buffer = &compact_buffer }, &offset_map);
+// compact inside a transaction on the scratch database
+const Ctx = struct {
+    db: *DB,
+    compact_opts: xitdb.InitOpts(.buffered_file),
+    compact_db: *DB,
+
+    pub fn run(self: @This(), cursor: *OffsetDB.Cursor(.read_write)) !void {
+        var offset_map = DiskOffsets{ .map = try OffsetDB.HashMap(.read_write).init(cursor.*) };
+        self.compact_db.* = try self.db.compact(.buffered_file, self.compact_opts, &offset_map);
+    }
+};
+var compact_db: DB = undefined;
+try offsets_db.runContext(Ctx{
+    .db = &db,
+    .compact_opts = .{ .file = compact_file, .buffer = &compact_buffer },
+    .compact_db = &compact_db,
+});
 
 // read from the new compacted db
 const history = try DB.ArrayList(.read_only).init(compact_db.rootCursor().readOnly());
 try std.testing.expectEqual(1, try history.count());
 ```
+
+## Replication
+
+Since xitdb files are append-only, it is absurdly easy to replicate them: just copy the bytes that the destination doesn't have yet! Other databases like SQLite require complex external tools to replicate. In xitdb, once a transaction is committed, its bytes never change, except for a small header that points at the latest commit. That makes it easy to keep a copy of a database (a "replica") up to date, whether it's another file on the same machine or on another machine across a network.
+
+A sync takes four steps:
+
+```zig
+// on the replica: describe what it already has
+const state = try replica.replicaState();
+
+// on the source: decide which bytes to send
+const start = try source.replicationStart(state);
+const end = try source.committedSize();
+
+// on the source: write those bytes
+var buffer = std.Io.Writer.Allocating.init(allocator);
+defer buffer.deinit();
+try source.readCommitted(start, end, &buffer.writer);
+
+// on the replica: apply them
+var reader = std.Io.Reader.fixed(buffer.written());
+try replica.applyReplicated(start, &reader, end - start);
+```
+
+Over a network, the replica sends its `ReplicaState` (two integers: its committed size and a checksum of its latest commit), and the source replies with `start`, the length, and then the bytes. Since `readCommitted` takes a writer and `applyReplicated` takes a reader, the bytes can be streamed directly over the connection without buffering them in memory.
+
+A replica can start out as any new database. Each database has a random file ID, so the first sync sees that the replica isn't a copy of the source and sends the entire source file, replacing the replica. The same happens if the replica can no longer be extended, such as when the source is replaced by a compacted copy (which is a new file) or restored from an older backup: `replicationStart` returns 0, and the replica is replaced with a full copy.
+
+If a sync is interrupted, such as by a dropped connection, the replica stays at its last commit, and the next sync discards whatever was partially written. The exception is when `start` is 0: the replica is truncated before the copy begins, so an interrupted copy leaves it unusable until the next sync succeeds. If that matters to you, check whether `start` is 0, and if so, write the copy to a new file and only replace the old replica after `applyReplicated` succeeds.
+
+Only change a replica with `applyReplicated`. If you write to it directly, it no longer matches the source, and the next sync will replace it.
 
 ## Thread Safety
 

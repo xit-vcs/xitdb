@@ -71,7 +71,7 @@ pub const Tag = enum(u7) {
 
 const DATABASE_START = byteSizeOf(DatabaseHeader);
 const MAGIC_NUMBER: u24 = std.mem.readInt(u24, "xit", .big);
-pub const VERSION: u16 = 0;
+pub const VERSION: u16 = 1;
 
 const DatabaseHeaderInt = u96;
 pub const DatabaseHeader = packed struct {
@@ -82,12 +82,12 @@ pub const DatabaseHeader = packed struct {
     hash_id: HashId,
     // the size in bytes of all hashes used by the database.
     hash_size: u16,
-    // increment this number when the file format changes,
-    // such as when a new Tag member is added.
-    version: u16 = VERSION,
+    // the file format version. any version above 0 is streaming mode.
+    version: u16,
     // the root tag, representing the type of the top-level data.
-    // it starts as .none but will be changed to .array_list
-    // once `array_list_init` is called for the first time.
+    // in version 0 databases, it starts as .none and becomes .array_list
+    // once `array_list_init` is first called. in streaming mode it stays
+    // .none, because the root slot carries the type instead.
     tag: Tag = .none,
     // currently unused
     padding: u1 = 0,
@@ -113,6 +113,19 @@ pub const DatabaseHeader = packed struct {
         if (self.version > VERSION) {
             return error.InvalidVersion;
         }
+        if (self.streaming() and self.tag != .none) {
+            return error.InvalidDatabase;
+        }
+    }
+
+    // whether the database is in streaming mode, which every version above 0
+    // is (new databases always are). the top-level data is a root slot of any
+    // type, and every write to it is a copy-on-write transaction that appends
+    // a trailer holding the new root slot. the root header only caches the
+    // latest trailer, so every other committed byte is immutable, and a
+    // replica stays in sync by copying the bytes it doesn't have.
+    pub fn streaming(self: DatabaseHeader) bool {
+        return self.version > 0;
     }
 };
 
@@ -130,6 +143,16 @@ pub const HashId = packed struct(u32) {
     }
 };
 
+/// what a streaming replica sends its source, so the source knows which
+/// bytes to send back (see `Database.replicationStart`)
+pub const ReplicaState = struct {
+    committed_size: u64,
+    // the checksum of the trailer that ends the committed bytes. it covers the
+    // file ID and the commit's random ID, so it identifies both the file and the
+    // history that led to the commit.
+    checksum: u64,
+};
+
 pub const WriteMode = enum {
     read_only,
     read_write,
@@ -145,22 +168,23 @@ pub const InitOptsMemory = struct {
     buffer: *std.Io.Writer.Allocating,
     max_size: ?u64 = null,
     hash_id: ?HashId = null,
+    file_id: ?u64 = null, // the file ID of a new database. if null, a random one is used.
 };
 
 pub const InitOptsFile = struct {
     fsync: bool = true,
-    io: std.Io,
     file: std.Io.File,
     hash_id: ?HashId = null,
+    file_id: ?u64 = null, // the file ID of a new database. if null, a random one is used.
 };
 
 pub const InitOptsBufferedFile = struct {
     fsync: bool = true,
-    io: std.Io,
     file: std.Io.File,
     buffer: *std.Io.Writer.Allocating,
     max_size: u64 = 2 * 1024 * 1024, // flushes before the memory would grow beyond this size
     hash_id: ?HashId = null,
+    file_id: ?u64 = null, // the file ID of a new database. if null, a random one is used.
 };
 
 pub fn InitOpts(comptime db_kind: DatabaseKind) type {
@@ -181,9 +205,12 @@ pub fn Core(comptime db_kind: DatabaseKind) type {
 
 pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
     return struct {
+        io: std.Io,
         core: Core(db_kind),
         header: DatabaseHeader,
         tx_start: ?u64,
+        // streaming mode only. see `ROOT_HEADER_START`.
+        file_id: u64 = 0,
 
         // internal constants
 
@@ -206,6 +233,53 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         const TopLevelArrayListHeader = packed struct {
             file_size: u64,
             parent: ArrayListHeader,
+        };
+
+        // streaming mode only. the database header is followed by a random file
+        // ID, which never changes, and then the root header. the file ID is part
+        // of every trailer's checksum, so a replica can't be extended with bytes
+        // from a different file.
+        const ROOT_HEADER_START = DATABASE_START + byteSizeOf(u64);
+        const ROOT_HEADER_END = ROOT_HEADER_START + byteSizeOf(RootHeader);
+
+        // streaming mode only. rewritten at every commit, as a cache of the latest
+        // trailer. it is written big endian, so the root slot comes first on disk.
+        const RootHeaderInt = u136;
+        const RootHeader = packed struct {
+            file_size: u64,
+            root: Slot,
+        };
+
+        // streaming mode only. appended at the end of every transaction, so the
+        // committed bytes (up to the root header's `file_size`) always end with one.
+        // it is written big endian, so `root` comes first on disk.
+        const RootTrailerInt = u200;
+        const RootTrailer = packed struct {
+            checksum: u64,
+            // random for every transaction except the first, so separately written
+            // copies of a file can't end up with the same trailers, even when they
+            // write data of the same size. that is how a replica notices it is being
+            // sent bytes from a different history.
+            commit_id: u64,
+            root: Slot,
+
+            fn init(file_id: u64, position: u64, root: Slot, commit_id: u64) RootTrailer {
+                return .{ .checksum = computeChecksum(file_id, position, root, commit_id), .commit_id = commit_id, .root = root };
+            }
+
+            // CRC-64/XZ of the file ID, the trailer's position, `root`, and `commit_id`,
+            // all big endian. including the file ID and position means the trailer can't
+            // be mistaken for one written elsewhere. 64 bits makes it safe to find the
+            // last trailer by scanning a file whose root header can't be trusted.
+            fn computeChecksum(file_id: u64, position: u64, root: Slot, commit_id: u64) u64 {
+                const root_end = comptime 16 + byteSizeOf(Slot);
+                var bytes: [root_end + 8]u8 = undefined;
+                std.mem.writeInt(u64, bytes[0..8], file_id, .big);
+                std.mem.writeInt(u64, bytes[8..16], position, .big);
+                std.mem.writeInt(SlotInt, bytes[16..root_end], @bitCast(root), .big);
+                std.mem.writeInt(u64, bytes[root_end..], commit_id, .big);
+                return std.hash.crc.@"CRC-64/XZ".hash(&bytes);
+            }
         };
 
         const KeyValuePairInt = @typeInfo(KeyValuePair).@"struct".backing_integer.?;
@@ -389,7 +463,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // init
 
-        pub fn init(opts: InitOpts(db_kind)) !Database(db_kind, HashInt) {
+        pub fn init(io: std.Io, opts: InitOpts(db_kind)) !Database(db_kind, HashInt) {
             // the buffer only holds writes that haven't been flushed yet, so it
             // must start empty. anything left in it from an earlier use would be
             // treated as unflushed data at the start of the file.
@@ -399,6 +473,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             var self: Database(db_kind, HashInt) = switch (db_kind) {
                 .memory => .{
+                    .io = io,
                     .core = .{
                         .buffer = opts.buffer,
                         .max_size = opts.max_size,
@@ -407,8 +482,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .tx_start = null,
                 },
                 .file => .{
+                    .io = io,
                     .core = .{
-                        .io = opts.io,
+                        .io = io,
                         .file = opts.file,
                         .fsync = opts.fsync,
                     },
@@ -416,6 +492,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .tx_start = null,
                 },
                 .buffered_file => .{
+                    .io = io,
                     .core = .{
                         .memory = .{
                             .buffer = opts.buffer,
@@ -423,7 +500,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .memory_max_size = opts.max_size,
                         .file = .{
-                            .io = opts.io,
+                            .io = io,
                             .file = opts.file,
                             .fsync = opts.fsync,
                         },
@@ -434,23 +511,43 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
 
             if (try self.core.length() == 0) {
+                // new databases are always written with the newest version
                 self.header = .{
                     .hash_id = opts.hash_id orelse .{ .id = 0 },
                     .hash_size = byteSizeOf(HashInt),
+                    .version = VERSION,
+                    .tag = .none,
                 };
+                self.file_id = opts.file_id orelse self.randomU64();
                 var writer = self.core.writer();
                 try writer.seekTo(0);
                 try self.header.write(&writer.interface);
-                try self.core.flush();
+                try writer.interface.writeInt(u64, self.file_id, .big);
+                // write the root header and commit an empty root, so the
+                // file ends with a trailer like after any transaction
+                try writer.interface.writeInt(RootHeaderInt, @bitCast(RootHeader{ .file_size = 0, .root = .{} }), .big);
+                // the first commit's ID is 0, so a new database's bytes only
+                // depend on its file ID
+                try self.commitRoot(.{}, 0);
+                try self.core.sync();
             } else {
                 self.header = try self.readAndValidateHeader();
-                _ = try self.validateCommittedSize();
+                if (self.header.streaming()) self.file_id = try self.readFileId();
+                _ = try self.committedSize();
             }
 
             return self;
         }
 
         pub fn rootCursor(self: *Database(db_kind, HashInt)) Cursor(.read_write) {
+            // in streaming mode, the cursor only holds a snapshot of the root
+            // slot, and every operation that starts at it reads the root again.
+            // if this read fails, the cursor looks empty and the next operation
+            // returns the error.
+            if (self.header.streaming()) {
+                const root = self.readRootSlot() catch Slot{};
+                return .{ .slot_ptr = .{ .position = ROOT_HEADER_START, .slot = root }, .db = self };
+            }
             // another instance may have initialized the top-level data since we
             // read the header. if this fails, the cursor sees an empty database,
             // and the error will be returned when it is written to.
@@ -463,6 +560,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
+        /// runs `ctx.run(cursor)` with a write cursor to the root in a single
+        /// transaction, discarding everything it wrote if it returns an error.
+        /// use it to group writes to a root that isn't an array list, such as a
+        /// hash map. for an array list root, `appendContext` does the same.
+        pub fn runContext(self: *Database(db_kind, HashInt), ctx: anytype) !void {
+            _ = try self.rootCursor().writePath(@TypeOf(ctx), &.{.{ .ctx = ctx }});
+        }
+
         /// finish byte writers before freezing; reinitialize writable collections and
         /// reacquire nested write cursors from the moment root before further writes
         pub fn freeze(self: *Database(db_kind, HashInt)) !void {
@@ -470,6 +575,84 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 self.tx_start = try self.core.length();
             } else {
                 return error.ExpectedTxStart;
+            }
+        }
+
+        /// streaming mode only. this database's `ReplicaState`.
+        pub fn replicaState(self: *Database(db_kind, HashInt)) !ReplicaState {
+            if (!self.header.streaming()) return error.StreamingModeRequired;
+            const committed_size = try self.committedSize();
+            return .{ .committed_size = committed_size, .checksum = (try self.readRootTrailer(committed_size)).checksum };
+        }
+
+        /// streaming mode only. where to start sending committed bytes to a replica
+        /// in `state`. that's its committed size if its bytes are a prefix of this
+        /// database, or 0 if it must be replaced, because it's a replica of another
+        /// file or it has diverged from this one.
+        pub fn replicationStart(self: *Database(db_kind, HashInt), state: ReplicaState) !u64 {
+            if (!self.header.streaming()) return error.StreamingModeRequired;
+            if (state.committed_size > try self.committedSize()) return 0;
+            const trailer = self.readRootTrailer(state.committed_size) catch |err| switch (err) {
+                error.InvalidDatabase, error.InvalidEnumTag => return 0,
+                else => |e| return e,
+            };
+            return if (trailer.checksum == state.checksum) state.committed_size else 0;
+        }
+
+        /// streaming mode only. writes the committed bytes from `start` up to
+        /// `end` to `writer`. `start` is usually from `replicationStart`, and `end`
+        /// can't be past `committedSize`. committed bytes never change except for
+        /// the root header, so when `start` is 0, a root header matching `end` is
+        /// written, making the bytes a complete database by themselves.
+        pub fn readCommitted(self: *Database(db_kind, HashInt), start: u64, end: u64, writer: *std.Io.Writer) !void {
+            if (!self.header.streaming()) return error.StreamingModeRequired;
+            if (start > end or end > try self.committedSize()) return error.InvalidRange;
+            if (start > 0 and start < ROOT_HEADER_END) return error.InvalidRange;
+            var reader = self.core.reader();
+            if (start == 0) {
+                const trailer = try self.readRootTrailer(end);
+                try reader.seekTo(0);
+                try reader.interface.streamExact64(writer, ROOT_HEADER_START);
+                try writer.writeInt(RootHeaderInt, @bitCast(RootHeader{ .file_size = end, .root = trailer.root }), .big);
+                try reader.seekTo(ROOT_HEADER_END);
+                try reader.interface.streamExact64(writer, end - ROOT_HEADER_END);
+            } else {
+                try reader.seekTo(start);
+                try reader.interface.streamExact64(writer, end - start);
+            }
+        }
+
+        /// streaming mode only. writes `len` bytes from `reader` at `start` and
+        /// commits them. they must be the bytes from `readCommitted`, so they end
+        /// with a trailer. when `start` is 0, this database is replaced by them;
+        /// otherwise `start` must be this database's `committedSize`.
+        pub fn applyReplicated(self: *Database(db_kind, HashInt), start: u64, reader: *std.Io.Reader, len: u64) !void {
+            if (!self.header.streaming()) return error.StreamingModeRequired;
+            if (start == 0) {
+                try self.core.setLength(0);
+            } else if (start == try self.committedSize()) {
+                // discard anything past the committed bytes, such as the remains of an interrupted sync
+                try self.truncate();
+            } else return error.InvalidRange;
+
+            var writer = self.core.writer();
+            try writer.seekTo(start);
+            try reader.streamExact64(&writer.interface, len);
+
+            if (start == 0) {
+                // the bytes are a different database, with its own header and file ID
+                try self.core.sync();
+                const header = try self.readAndValidateHeader();
+                if (!header.streaming()) return error.InvalidDatabase;
+                self.header = header;
+                self.file_id = try self.readFileId();
+                _ = try self.committedSize();
+            } else if (len > 0) {
+                // the bytes must end with a trailer. update the root header to match it.
+                const trailer = try self.readRootTrailer(start + len);
+                try self.core.sync();
+                try self.writeRootHeader(trailer.root);
+                try self.core.sync();
             }
         }
 
@@ -481,6 +664,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         ///
         /// all mappings must remain available until compaction finishes to preserve
         /// sharing and cycles.
+        ///
+        /// the target must be a new or empty database, or this returns
+        /// `error.TargetNotEmpty`. it is always written with the newest version,
+        /// so this is also how a version 0 database is migrated.
         pub fn compact(self: *Database(db_kind, HashInt), comptime target_db_kind: DatabaseKind, target_opts: InitOpts(target_db_kind), offset_map: anytype) !Database(target_db_kind, HashInt) {
             // cached offsets only apply to this compaction's target.
             if (@TypeOf(offset_map) == *std.AutoHashMap(u64, u64)) {
@@ -491,64 +678,58 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
             var opts = target_opts;
             opts.hash_id = target_opts.hash_id orelse self.header.hash_id;
-            var target = try Database(target_db_kind, HashInt).init(opts);
+            var target = try Database(target_db_kind, HashInt).init(self.io, opts);
 
-            if (self.header.tag == .none) {
-                try target.core.sync();
-                return target;
-            }
-            if (self.header.tag != .array_list) return error.UnexpectedTag;
+            // the target must be a new or empty database, because compaction
+            // writes to it with ordinary transactions. this also rejects
+            // compacting a database into its own file.
+            if (!target.header.streaming() or !(try target.readRootSlot()).empty()) return error.TargetNotEmpty;
 
-            // read source's top-level ArrayListHeader
-            var source_reader = self.core.reader();
-            try source_reader.seekTo(DATABASE_START);
-            const source_header: ArrayListHeader = @bitCast(try takeInt(&source_reader.interface, ArrayListHeaderInt, .big));
+            // in streaming mode, the root slot carries the type of the top-level data
+            const source_root: Slot = if (self.header.streaming())
+                try self.readRootSlot()
+            else
+                .{ .value = DATABASE_START, .tag = self.header.tag };
 
-            if (source_header.size == 0) {
-                try target.core.sync();
-                return target;
-            }
+            // an empty root compacts to a new database. a root explicitly
+            // set to null isn't empty, so it is remapped below.
+            if (source_root.empty()) return target;
 
-            // read the last moment's slot
-            const last_key = source_header.size - 1;
-            const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
-            const last_slot_ptr = try self.readArrayListSlot(source_header.ptr, last_key, shift, .read_only, true);
-            const moment_slot = last_slot_ptr.slot;
-
-            // write TopLevelArrayListHeader + root index block to target
-            var target_writer = target.core.writer();
-            try target_writer.seekTo(DATABASE_START);
-            const target_array_list_ptr = DATABASE_START + byteSizeOf(TopLevelArrayListHeader);
-            try target_writer.interface.writeInt(TopLevelArrayListHeaderInt, @bitCast(TopLevelArrayListHeader{
-                .file_size = 0,
-                .parent = .{
-                    .ptr = target_array_list_ptr,
-                    .size = 1,
-                },
-            }), .big);
-            const index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-            try target_writer.interface.writeAll(&index_block);
-
-            // recursively remap the moment slot
+            // the target is written as one ordinary transaction, so it is committed
+            // and fsynced like any other (callers typically rename it over an
+            // existing database file). the remap must run inside the transaction,
+            // because starting one truncates the target.
+            const TargetDB = Database(target_db_kind, HashInt);
             var compactor = Compactor(target_db_kind, @TypeOf(offset_map)){
                 .source_core = &self.core,
                 .target_core = &target.core,
                 .offset_map = offset_map,
             };
-            const remapped_moment = try compactor.remapSlot(moment_slot);
+            const Ctx = struct {
+                compactor: *@TypeOf(compactor),
+                slot: Slot,
 
-            // write remapped moment slot into position 0 of target's root index block
-            try target_writer.seekTo(target_array_list_ptr);
-            try target_writer.interface.writeInt(SlotInt, @bitCast(remapped_moment), .big);
+                pub fn run(ctx: @This(), cursor: *TargetDB.Cursor(.read_write)) !void {
+                    try cursor.write(.{ .slot = try ctx.compactor.remapSlot(ctx.slot) });
+                }
+            };
 
-            // update target's DatabaseHeader tag
-            target.header.tag = .array_list;
-            try target_writer.seekTo(0);
-            try target.header.write(&target_writer.interface);
-
-            // fsync so the compacted database is durable, since callers
-            // typically rename it over an existing database file
-            try target.updateCommittedSize();
+            switch (source_root.tag) {
+                // an array list root is a history, and its latest moment
+                // becomes the only moment of a new one
+                .array_list => {
+                    if (try self.rootCursor().readPathSlot(void, &.{.{ .array_list_get = -1 }})) |last_moment| {
+                        _ = try target.rootCursor().writePath(Ctx, &.{
+                            .array_list_init,
+                            .array_list_append,
+                            .{ .ctx = .{ .compactor = &compactor, .slot = last_moment } },
+                        });
+                    }
+                },
+                // any other root is remapped whole. this is also how a version 0
+                // database with a top-level hash map is migrated.
+                else => try target.runContext(Ctx{ .compactor = &compactor, .slot = source_root }),
+            }
 
             return target;
         }
@@ -568,13 +749,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // TODO: retain frozen data on rollback to keep its read cursors valid
         fn truncate(self: *Database(db_kind, HashInt)) !void {
-            const committed_size = try self.validateCommittedSize();
+            const committed_size = try self.committedSize();
             if (try self.core.length() > committed_size) {
                 try self.core.setLength(committed_size);
             }
         }
 
-        fn validateCommittedSize(self: *Database(db_kind, HashInt)) !u64 {
+        /// the number of bytes that belong to committed transactions. in streaming
+        /// mode, they never change except for the root header (see `readCommitted`).
+        pub fn committedSize(self: *Database(db_kind, HashInt)) !u64 {
+            if (self.header.streaming()) {
+                const header = try self.readRootHeader();
+                const minimum_size = ROOT_HEADER_END + byteSizeOf(RootTrailer);
+                if (header.file_size < minimum_size) return error.InvalidDatabase;
+                if (try self.core.length() < header.file_size) return error.TruncatedDatabase;
+                // the committed bytes must end with a trailer matching the header
+                if (!std.meta.eql((try self.readRootTrailer(header.file_size)).root, header.root)) {
+                    return error.InvalidDatabase;
+                }
+                return header.file_size;
+            }
+
             if (self.header.tag != .array_list) return self.core.length();
 
             var core_reader = self.core.reader();
@@ -592,6 +787,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const file_size = try self.core.length();
 
             if (file_size < committed_size) return error.TruncatedDatabase;
+
             return committed_size;
         }
 
@@ -610,6 +806,142 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
+        // streaming mode only
+        fn readFileId(self: *Database(db_kind, HashInt)) !u64 {
+            var reader = self.core.reader();
+            try reader.seekTo(DATABASE_START);
+            return try takeInt(&reader.interface, u64, .big);
+        }
+
+        // streaming mode only
+        fn readRootHeader(self: *Database(db_kind, HashInt)) !RootHeader {
+            var reader = self.core.reader();
+            try reader.seekTo(ROOT_HEADER_START);
+            const header: RootHeader = @bitCast(try takeInt(&reader.interface, RootHeaderInt, .big));
+            try header.root.tag.validate();
+            return header;
+        }
+
+        // streaming mode only. the most recently committed root slot.
+        fn readRootSlot(self: *Database(db_kind, HashInt)) !Slot {
+            return (try self.readRootHeader()).root;
+        }
+
+        // streaming mode only. the trailer that ends at `end`.
+        fn readRootTrailer(self: *Database(db_kind, HashInt), end: u64) !RootTrailer {
+            if (end < byteSizeOf(RootTrailer)) return error.InvalidDatabase;
+            const trailer_pos = end - byteSizeOf(RootTrailer);
+            var reader = self.core.reader();
+            try reader.seekTo(trailer_pos);
+            const trailer: RootTrailer = @bitCast(try takeInt(&reader.interface, RootTrailerInt, .big));
+            if (trailer.checksum != RootTrailer.computeChecksum(self.file_id, trailer_pos, trailer.root, trailer.commit_id)) return error.InvalidDatabase;
+            try trailer.root.tag.validate();
+            return trailer;
+        }
+
+        fn randomU64(self: *Database(db_kind, HashInt)) u64 {
+            var bytes: [8]u8 = undefined;
+            self.io.random(&bytes);
+            return std.mem.readInt(u64, &bytes, .big);
+        }
+
+        // streaming mode only. completes a transaction by appending a trailer
+        // for `root` and updating the root header. callers must sync afterwards
+        // to make the header itself durable.
+        fn commitRoot(self: *Database(db_kind, HashInt), root: Slot, commit_id: u64) !void {
+            const trailer_pos = try self.core.length();
+            var writer = self.core.writer();
+            try writer.seekTo(trailer_pos);
+            try writer.interface.writeInt(RootTrailerInt, @bitCast(RootTrailer.init(self.file_id, trailer_pos, root, commit_id)), .big);
+
+            // flush and fsync before updating the header, because updating
+            // the header is what completes the transaction. without the
+            // fsync, the OS could persist the header before the data it
+            // points to, so a crash could commit a transaction whose data
+            // never reached disk.
+            try self.core.sync();
+
+            try self.writeRootHeader(root);
+        }
+
+        // streaming mode only. points the root header at `root`, which must be
+        // in the trailer that ends the file.
+        fn writeRootHeader(self: *Database(db_kind, HashInt), root: Slot) !void {
+            var writer = self.core.writer();
+            try writer.seekTo(ROOT_HEADER_START);
+            try writer.interface.writeInt(RootHeaderInt, @bitCast(RootHeader{
+                .file_size = try self.core.length(),
+                .root = root,
+            }), .big);
+        }
+
+        // whether this slot pointer is the root of the database
+        fn isRoot(self: *const Database(db_kind, HashInt), slot_ptr: SlotPointer) bool {
+            if (self.header.streaming()) return slot_ptr.position == ROOT_HEADER_START;
+            return slot_ptr.position == null and slot_ptr.slot.value == DATABASE_START;
+        }
+
+        // whether writes must happen inside a transaction. in version 0 databases,
+        // only an array list root needs them; otherwise no moment can reference
+        // the data, so it is all mutable in place.
+        fn transactional(self: *const Database(db_kind, HashInt)) bool {
+            return self.header.streaming() or self.header.tag == .array_list;
+        }
+
+        // the collection tag that an init path part creates, if any
+        fn initTag(comptime Ctx: type, part: PathPart(Ctx)) ?Tag {
+            return switch (part) {
+                .array_list_init => .array_list,
+                .linked_array_list_init => .linked_array_list,
+                .hash_map_init => |opts| if (opts.counted)
+                    (if (opts.set) .counted_hash_set else .counted_hash_map)
+                else
+                    (if (opts.set) .hash_set else .hash_map),
+                .sorted_map_init => |opts| if (opts.set) .sorted_set else .sorted_map,
+                else => null,
+            };
+        }
+
+        // the init path part for a collection tag, if any
+        fn initPartFor(comptime Ctx: type, tag: Tag) ?PathPart(Ctx) {
+            return switch (tag) {
+                .array_list => .array_list_init,
+                .linked_array_list => .linked_array_list_init,
+                .hash_map => .{ .hash_map_init = .{ .counted = false, .set = false } },
+                .hash_set => .{ .hash_map_init = .{ .counted = false, .set = true } },
+                .counted_hash_map => .{ .hash_map_init = .{ .counted = true, .set = false } },
+                .counted_hash_set => .{ .hash_map_init = .{ .counted = true, .set = true } },
+                .sorted_map => .{ .sorted_map_init = .{ .set = false } },
+                .sorted_set => .{ .sorted_map_init = .{ .set = true } },
+                else => null,
+            };
+        }
+
+        // whether the data at `ptr` predates this transaction, so it must be
+        // copied before it is modified. outside a transaction nothing is old,
+        // but a transactional database can't be written outside one.
+        fn isOld(self: *const Database(db_kind, HashInt), ptr: u64) !bool {
+            const tx_start = self.tx_start orelse {
+                if (self.transactional()) return error.ExpectedTxStart;
+                return false;
+            };
+            return ptr < tx_start;
+        }
+
+        // copies an index block to the end unless it was made in this transaction
+        fn copyIndexBlockIfOld(self: *Database(db_kind, HashInt), ptr: u64) !u64 {
+            if (!try self.isOld(ptr)) return ptr;
+            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+            var reader = self.core.reader();
+            try reader.seekTo(ptr);
+            try reader.interface.readSliceAll(&index_block);
+            const next_ptr = try self.core.length();
+            var writer = self.core.writer();
+            try writer.seekTo(next_ptr);
+            try writer.interface.writeAll(&index_block);
+            return next_ptr;
+        }
+
         fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer) !SlotPointer {
             const part = if (path.len > 0) path[0] else {
                 if (write_mode == .read_only and slot_ptr.slot.empty()) {
@@ -618,7 +950,68 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 return slot_ptr;
             };
 
-            const is_top_level = slot_ptr.position == null and slot_ptr.slot.value == DATABASE_START;
+            // in streaming mode, every write that starts at the root is a transaction
+            if (self.header.streaming() and self.isRoot(slot_ptr)) {
+                const root = try self.readRootSlot();
+
+                // the position of a read path doesn't matter, but it must not be
+                // ROOT_HEADER_START or this would recurse forever
+                if (write_mode == .read_only) {
+                    return self.readSlotPointer(write_mode, Ctx, path, .{ .position = null, .slot = root });
+                }
+
+                // initializing an initialized root is free, so a wrapper like
+                // `ArrayList` can hold a root cursor without a transaction. like
+                // starting one, it discards data left by an unfinished transaction.
+                // (`writePath` rejects root writes inside a transaction, so none
+                // is open here.)
+                if (path.len == 1 and root.tag != .none) {
+                    if (initTag(Ctx, path[0])) |tag| {
+                        if (tag == root.tag) {
+                            try self.truncate();
+                            return .{ .position = ROOT_HEADER_START, .slot = root };
+                        }
+                    }
+                }
+
+                // discard data left by an unfinished transaction after a crash
+                try self.truncate();
+                const scratch_pos = try self.core.length();
+                self.tx_start = scratch_pos;
+                defer self.tx_start = null;
+
+                // the transaction works on a copy of the root slot
+                var writer = self.core.writer();
+                try writer.seekTo(scratch_pos);
+                try writer.interface.writeInt(SlotInt, @bitCast(root), .big);
+                var root_ptr = SlotPointer{ .position = scratch_pos, .slot = root };
+
+                // every collection expects its init part to copy its header or root
+                // block into the transaction before anything writes to it. the root
+                // has no enclosing init part, so run one here.
+                if (initPartFor(Ctx, root.tag)) |init_part| {
+                    root_ptr = try self.readSlotPointer(write_mode, Ctx, &.{init_part}, root_ptr);
+                }
+
+                var result = try self.readSlotPointer(write_mode, Ctx, path, root_ptr);
+
+                // the copy now holds the new root, so commit it
+                var reader = self.core.reader();
+                try reader.seekTo(scratch_pos);
+                const next_root: Slot = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                try self.commitRoot(next_root, self.randomU64());
+
+                // a path that ends at the root (such as an init or a write) returns
+                // a root cursor, so it can be used for later transactions
+                if (result.position == scratch_pos) {
+                    result = .{ .position = ROOT_HEADER_START, .slot = next_root };
+                }
+                return result;
+            }
+
+            // in streaming mode the root is handled above, so the
+            // top-level special cases below only apply to version 0
+            const is_top_level = !self.header.streaming() and self.isRoot(slot_ptr);
 
             // the root tag only changes once, when the top-level data is initialized.
             // if we haven't seen that happen, another instance may have done it since
@@ -705,24 +1098,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             var array_list_start = slot_ptr.slot.value;
 
                             // copy it to the end unless it was made in this transaction
-                            if (self.tx_start) |tx_start| {
-                                if (array_list_start < tx_start) {
-                                    // read existing block
-                                    try reader.seekTo(array_list_start);
-                                    var header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
-                                    try reader.seekTo(header.ptr);
-                                    var array_list_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                                    try reader.interface.readSliceAll(&array_list_index_block);
-                                    // copy to the end
-                                    array_list_start = try self.core.length();
-                                    const next_array_list_ptr = array_list_start + byteSizeOf(ArrayListHeader);
-                                    header.ptr = next_array_list_ptr;
-                                    try writer.seekTo(array_list_start);
-                                    try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(header), .big);
-                                    try writer.interface.writeAll(&array_list_index_block);
-                                }
-                            } else if (self.header.tag == .array_list) {
-                                return error.ExpectedTxStart;
+                            if (try self.isOld(array_list_start)) {
+                                // read existing block
+                                try reader.seekTo(array_list_start);
+                                var header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
+                                try reader.seekTo(header.ptr);
+                                var array_list_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                                try reader.interface.readSliceAll(&array_list_index_block);
+                                // copy to the end
+                                array_list_start = try self.core.length();
+                                const next_array_list_ptr = array_list_start + byteSizeOf(ArrayListHeader);
+                                header.ptr = next_array_list_ptr;
+                                try writer.seekTo(array_list_start);
+                                try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(header), .big);
+                                try writer.interface.writeAll(&array_list_index_block);
                             }
 
                             // make slot point to list
@@ -867,17 +1256,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             // so past moments still pointing at the old header are unaffected.
                             // b-tree nodes are always appended, so only the header (updated in
                             // place by later operations in this tx) needs copying.
-                            if (self.tx_start) |tx_start| {
-                                if (header_ptr < tx_start) {
-                                    var reader = self.core.reader();
-                                    try reader.seekTo(header_ptr);
-                                    const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
-                                    header_ptr = try self.core.length();
-                                    try writer.seekTo(header_ptr);
-                                    try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
-                                }
-                            } else if (self.header.tag == .array_list) {
-                                return error.ExpectedTxStart;
+                            if (try self.isOld(header_ptr)) {
+                                var reader = self.core.reader();
+                                try reader.seekTo(header_ptr);
+                                const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
+                                header_ptr = try self.core.length();
+                                try writer.seekTo(header_ptr);
+                                try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
                             }
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = .linked_array_list } };
                             try writer.seekTo(position);
@@ -1138,21 +1523,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             var map_start = slot_ptr.slot.value;
 
                             // copy it to the end unless it was made in this transaction
-                            if (self.tx_start) |tx_start| {
-                                if (map_start < tx_start) {
-                                    // read existing block
-                                    try reader.seekTo(map_start);
-                                    const map_count_maybe = if (hash_map_init.counted) try takeInt(&reader.interface, u64, .big) else null;
-                                    var map_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                                    try reader.interface.readSliceAll(&map_index_block);
-                                    // copy to the end
-                                    map_start = try self.core.length();
-                                    try writer.seekTo(map_start);
-                                    if (map_count_maybe) |map_count| try writer.interface.writeInt(u64, map_count, .big);
-                                    try writer.interface.writeAll(&map_index_block);
-                                }
-                            } else if (self.header.tag == .array_list) {
-                                return error.ExpectedTxStart;
+                            if (try self.isOld(map_start)) {
+                                // read existing block
+                                try reader.seekTo(map_start);
+                                const map_count_maybe = if (hash_map_init.counted) try takeInt(&reader.interface, u64, .big) else null;
+                                var map_index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                                try reader.interface.readSliceAll(&map_index_block);
+                                // copy to the end
+                                map_start = try self.core.length();
+                                try writer.seekTo(map_start);
+                                if (map_count_maybe) |map_count| try writer.interface.writeInt(u64, map_count, .big);
+                                try writer.interface.writeAll(&map_index_block);
                             }
 
                             // make slot point to map
@@ -1245,17 +1626,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             if (slot_ptr.slot.tag != tag) return error.UnexpectedTag;
                             var header_ptr = slot_ptr.slot.value;
                             // copy the header into this transaction unless it was made in it
-                            if (self.tx_start) |tx_start| {
-                                if (header_ptr < tx_start) {
-                                    var reader = self.core.reader();
-                                    try reader.seekTo(header_ptr);
-                                    const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
-                                    header_ptr = try self.core.length();
-                                    try writer.seekTo(header_ptr);
-                                    try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
-                                }
-                            } else if (self.header.tag == .array_list) {
-                                return error.ExpectedTxStart;
+                            if (try self.isOld(header_ptr)) {
+                                var reader = self.core.reader();
+                                try reader.seekTo(header_ptr);
+                                const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
+                                header_ptr = try self.core.length();
+                                try writer.seekTo(header_ptr);
+                                try writer.interface.writeInt(BTreeHeaderInt, header_int, .big);
                             }
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = tag } };
                             try writer.seekTo(position);
@@ -1482,22 +1859,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .index => {
                     var next_ptr = ptr;
                     if (write_mode == .read_write and !is_top_level) {
-                        if (self.tx_start) |tx_start| {
-                            if (next_ptr < tx_start) {
-                                // read existing block
-                                try reader.seekTo(ptr);
-                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                                try reader.interface.readSliceAll(&index_block);
-                                // copy it to the end
-                                next_ptr = try self.core.length();
-                                try writer.seekTo(next_ptr);
-                                try writer.interface.writeAll(&index_block);
-                                // make slot point to block
-                                try writer.seekTo(slot_pos);
-                                try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
-                            }
-                        } else if (self.header.tag == .array_list) {
-                            return error.ExpectedTxStart;
+                        next_ptr = try self.copyIndexBlockIfOld(ptr);
+                        if (next_ptr != ptr) {
+                            // make slot point to the copied block
+                            try writer.seekTo(slot_pos);
+                            try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
                         }
                     }
                     return self.readMapSlot(next_ptr, key_hash, key_offset + 1, write_mode, is_top_level, target);
@@ -1508,31 +1874,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (kv_pair.hash == key_hash) {
                         if (write_mode == .read_write and !is_top_level) {
-                            if (self.tx_start) |tx_start| {
-                                if (ptr < tx_start) {
-                                    // write hash and key/val slots
-                                    const hash_pos = try self.core.length();
-                                    const key_slot_pos = hash_pos + byteSizeOf(HashInt);
-                                    const value_slot_pos = key_slot_pos + byteSizeOf(Slot);
-                                    try writer.seekTo(hash_pos);
-                                    try writer.interface.writeInt(KeyValuePairInt, @bitCast(kv_pair), .big);
+                            if (try self.isOld(ptr)) {
+                                // write hash and key/val slots
+                                const hash_pos = try self.core.length();
+                                const key_slot_pos = hash_pos + byteSizeOf(HashInt);
+                                const value_slot_pos = key_slot_pos + byteSizeOf(Slot);
+                                try writer.seekTo(hash_pos);
+                                try writer.interface.writeInt(KeyValuePairInt, @bitCast(kv_pair), .big);
 
-                                    // point slot to hash pos
-                                    const next_slot = Slot{ .value = hash_pos, .tag = .kv_pair };
-                                    try writer.seekTo(slot_pos);
-                                    try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
+                                // point slot to hash pos
+                                const next_slot = Slot{ .value = hash_pos, .tag = .kv_pair };
+                                try writer.seekTo(slot_pos);
+                                try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
 
-                                    return .{
-                                        .slot_ptr = switch (target) {
-                                            .kv_pair => SlotPointer{ .position = slot_pos, .slot = next_slot },
-                                            .key => SlotPointer{ .position = key_slot_pos, .slot = kv_pair.key_slot },
-                                            .value => SlotPointer{ .position = value_slot_pos, .slot = kv_pair.value_slot },
-                                        },
-                                        .is_empty = false,
-                                    };
-                                }
-                            } else if (self.header.tag == .array_list) {
-                                return error.ExpectedTxStart;
+                                return .{
+                                    .slot_ptr = switch (target) {
+                                        .kv_pair => SlotPointer{ .position = slot_pos, .slot = next_slot },
+                                        .key => SlotPointer{ .position = key_slot_pos, .slot = kv_pair.key_slot },
+                                        .value => SlotPointer{ .position = value_slot_pos, .slot = kv_pair.value_slot },
+                                    },
+                                    .is_empty = false,
+                                };
                             }
                         }
 
@@ -1650,29 +2012,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
 
             // there was more than one used slot, or a single .index slot,
-            // so we must keep this index block
-
-            if (!is_top_level) {
-                if (self.tx_start) |tx_start| {
-                    if (index_pos < tx_start) {
-                        // copy index block to the end
-                        const next_index_pos = try self.core.length();
-                        try writer.seekTo(next_index_pos);
-                        try writer.interface.writeAll(&index_block);
-                        // update the slot
-                        const next_slot_pos = next_index_pos + (byteSizeOf(Slot) * i);
-                        try writer.seekTo(next_slot_pos);
-                        try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
-                        return .{ .value = next_index_pos, .tag = .index };
-                    }
-                } else if (self.header.tag == .array_list) {
-                    return error.ExpectedTxStart;
-                }
-            }
-
-            try writer.seekTo(slot_pos);
+            // so we must keep this index block. update the slot in it,
+            // copying the block first unless it belongs to this transaction.
+            const next_index_pos = if (is_top_level) index_pos else try self.copyIndexBlockIfOld(index_pos);
+            try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * i));
             try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
-            return .{ .value = index_pos, .tag = .index };
+            return .{ .value = next_index_pos, .tag = .index };
         }
 
         // array_list
@@ -1759,23 +2104,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .index => {
                     var next_ptr = ptr;
                     if (write_mode == .read_write and !is_top_level) {
-                        if (self.tx_start) |tx_start| {
-                            if (next_ptr < tx_start) {
-                                // read existing block
-                                try reader.seekTo(ptr);
-                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                                try reader.interface.readSliceAll(&index_block);
-                                // copy it to the end
-                                var writer = self.core.writer();
-                                next_ptr = try self.core.length();
-                                try writer.seekTo(next_ptr);
-                                try writer.interface.writeAll(&index_block);
-                                // make slot point to block
-                                try writer.seekTo(slot_pos);
-                                try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
-                            }
-                        } else if (self.header.tag == .array_list) {
-                            return error.ExpectedTxStart;
+                        next_ptr = try self.copyIndexBlockIfOld(ptr);
+                        if (next_ptr != ptr) {
+                            // make slot point to the copied block
+                            var writer = self.core.writer();
+                            try writer.seekTo(slot_pos);
+                            try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
                         }
                     }
                     return self.readArrayListSlot(next_ptr, key, shift - 1, write_mode, is_top_level);
@@ -1815,17 +2149,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 // the new root may still belong to a past moment. unlike child
                 // nodes, root nodes are written directly, so copy it now.
                 if (!is_top_level) {
-                    if (self.tx_start) |tx_start| {
-                        if (index_pos < tx_start) {
-                            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                            try core_reader.seekTo(index_pos);
-                            try core_reader.interface.readSliceAll(&index_block);
-                            index_pos = try self.core.length();
-                            var writer = self.core.writer();
-                            try writer.seekTo(index_pos);
-                            try writer.interface.writeAll(&index_block);
-                        }
-                    }
+                    index_pos = try self.copyIndexBlockIfOld(index_pos);
                 }
                 return .{
                     .ptr = index_pos,
@@ -1894,11 +2218,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // transaction (offset >= tx_start), since no committed moment and no
         // pre-`concat` sharing can reference it. `concat` advances tx_start (an
         // implicit freeze) precisely so its shared subtrees fall below it here.
-        // for an ephemeral (non-array-list) top level there is no transaction, so
+        // for an ephemeral (non-transactional) database there is no transaction, so
         // everything is mutable in place until a `concat` first sets tx_start.
         fn btreeReusable(self: *Database(db_kind, HashInt), ptr: u64) bool {
-            if (self.tx_start) |tx_start| return ptr >= tx_start;
-            return self.header.tag != .array_list;
+            // a transactional database outside a transaction can't reuse anything
+            const old = self.isOld(ptr) catch return false;
+            return !old;
         }
 
         // write a new version of a node, reusing `old_ptr`'s position in place if
@@ -2810,7 +3135,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     format_tag: ?[2]u8,
 
                     pub fn finish(self: *Writer) !void {
-                        if (self.parent.db.header.tag == .array_list and self.parent.db.tx_start == null) return error.ExpectedTxStart;
+                        if (self.parent.db.transactional() and self.parent.db.tx_start == null) return error.ExpectedTxStart;
                         try self.interface.flush();
 
                         var core_writer = self.parent.db.core.writer();
@@ -2869,7 +3194,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!usize {
-                        if (self.parent.db.header.tag == .array_list and self.parent.db.tx_start == null) return error.WriteFailed;
+                        if (self.parent.db.transactional() and self.parent.db.tx_start == null) return error.WriteFailed;
                         const n = bytes.len;
                         const new_position = self.pos + @as(u64, @intCast(n));
 
@@ -2893,6 +3218,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
                 };
 
+                // a streaming root cursor only has a snapshot of the root slot,
+                // which goes stale after the next transaction, so read it again.
+                // the result points at the copy of the root slot in the newest
+                // trailer, not the root header, so it is a fixed snapshot: the
+                // trailer never changes, so everything read through it comes from
+                // one commit, even if more are made.
+                // every method that reads `slot_ptr` must go through this.
+                fn resolved(self: Cursor(write_mode)) !SlotPointer {
+                    if (self.db.header.streaming() and self.db.isRoot(self.slot_ptr)) {
+                        const header = try self.db.readRootHeader();
+                        if (header.file_size < byteSizeOf(RootTrailer)) return error.InvalidDatabase;
+                        // the root slot is the first thing in the trailer
+                        return .{ .position = header.file_size - byteSizeOf(RootTrailer), .slot = header.root };
+                    }
+                    return self.slot_ptr;
+                }
+
+                fn resolvedCursor(self: Cursor(write_mode)) !Cursor(write_mode) {
+                    return .{ .slot_ptr = try self.resolved(), .db = self.db };
+                }
+
                 pub fn readOnly(self: Cursor(.read_write)) Cursor(.read_only) {
                     return .{
                         .slot_ptr = self.slot_ptr,
@@ -2901,7 +3247,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readPath(self: Cursor(write_mode), comptime Ctx: type, path: []const PathPart(Ctx)) !?Cursor(.read_only) {
-                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, self.slot_ptr) catch |err| {
+                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved()) catch |err| {
                         switch (err) {
                             error.KeyNotFound => return null,
                             else => |e| return e,
@@ -2914,7 +3260,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readPathSlot(self: Cursor(write_mode), comptime Ctx: type, path: []const PathPart(Ctx)) !?Slot {
-                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, self.slot_ptr) catch |err| {
+                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved()) catch |err| {
                         switch (err) {
                             error.KeyNotFound => return null,
                             else => |e| return e,
@@ -2929,14 +3275,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn writePath(self: Cursor(.read_write), comptime Ctx: type, path: []const PathPart(Ctx)) !Cursor(.read_write) {
                     // writes to moments must run inside a transaction.
-                    if (self.db.header.tag == .array_list and self.db.tx_start == null and
-                        self.slot_ptr.position != null and path.len > 0)
+                    if (self.db.transactional() and self.db.tx_start == null and
+                        !self.db.isRoot(self.slot_ptr) and path.len > 0)
                     {
                         return error.ExpectedTxStart;
                     }
                     // nested top-level writes could commit before the outer transaction ends
-                    if (self.db.tx_start != null and self.db.header.tag == .array_list and
-                        self.slot_ptr.position == null and self.slot_ptr.slot.value == DATABASE_START and path.len > 0)
+                    if (self.db.tx_start != null and self.db.transactional() and
+                        self.db.isRoot(self.slot_ptr) and path.len > 0)
                     {
                         return error.NestedTopLevelWrite;
                     }
@@ -2958,24 +3304,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readUint(self: Cursor(write_mode)) !u64 {
-                    if (self.slot_ptr.slot.tag != .uint) {
+                    const slot_ptr = try self.resolved();
+                    if (slot_ptr.slot.tag != .uint) {
                         return error.UnexpectedTag;
                     }
-                    return self.slot_ptr.slot.value;
+                    return slot_ptr.slot.value;
                 }
 
                 pub fn readInt(self: Cursor(write_mode)) !i64 {
-                    if (self.slot_ptr.slot.tag != .int) {
+                    const slot_ptr = try self.resolved();
+                    if (slot_ptr.slot.tag != .int) {
                         return error.UnexpectedTag;
                     }
-                    return @bitCast(self.slot_ptr.slot.value);
+                    return @bitCast(slot_ptr.slot.value);
                 }
 
                 pub fn readFloat(self: Cursor(write_mode)) !f64 {
-                    if (self.slot_ptr.slot.tag != .float) {
+                    const slot_ptr = try self.resolved();
+                    if (slot_ptr.slot.tag != .float) {
                         return error.UnexpectedTag;
                     }
-                    return @bitCast(self.slot_ptr.slot.value);
+                    return @bitCast(slot_ptr.slot.value);
                 }
 
                 pub fn readBytesAlloc(self: Cursor(write_mode), allocator: std.mem.Allocator, max_size_maybe: ?usize) ![]const u8 {
@@ -2987,12 +3336,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readBytesObjectAlloc(self: Cursor(write_mode), allocator: std.mem.Allocator, max_size_maybe: ?usize) !Bytes {
+                    const slot_ptr = try self.resolved();
                     var core_reader = self.db.core.reader();
 
-                    switch (self.slot_ptr.slot.tag) {
+                    switch (slot_ptr.slot.tag) {
                         .none => return .{ .value = try allocator.alloc(u8, 0) },
                         .bytes => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             const value_size = try takeInt(&core_reader.interface, u64, .big);
 
                             if (max_size_maybe) |max_size| {
@@ -3008,7 +3358,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                             try core_reader.interface.readSliceAll(value);
 
-                            const format_tag = if (self.slot_ptr.slot.full) blk: {
+                            const format_tag = if (slot_ptr.slot.full) blk: {
                                 try core_reader.seekTo(start_position + value_size);
                                 var buf: [2]u8 = @splat(0);
                                 try core_reader.interface.readSliceAll(&buf);
@@ -3019,8 +3369,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .short_bytes => {
                             var bytes: [byteSizeOf(u64)]u8 = @splat(0);
-                            std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
-                            const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
+                            std.mem.writeInt(u64, &bytes, slot_ptr.slot.value, .big);
+                            const total_size = if (slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
                             const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
 
                             if (max_size_maybe) |max_size| {
@@ -3033,7 +3383,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             errdefer allocator.free(value);
                             @memcpy(value, bytes[0..value_size]);
 
-                            const format_tag = if (self.slot_ptr.slot.full) blk: {
+                            const format_tag = if (slot_ptr.slot.full) blk: {
                                 var buf: [2]u8 = @splat(0);
                                 @memcpy(&buf, bytes[total_size..]);
                                 break :blk buf;
@@ -3046,12 +3396,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readBytesObject(self: Cursor(write_mode), buffer: []u8) !Bytes {
+                    const slot_ptr = try self.resolved();
                     var core_reader = self.db.core.reader();
 
-                    switch (self.slot_ptr.slot.tag) {
+                    switch (slot_ptr.slot.tag) {
                         .none => return if (buffer.len == 0) .{ .value = buffer } else error.EndOfStream,
                         .bytes => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             const value_size = try takeInt(&core_reader.interface, u64, .big);
 
                             if (value_size > buffer.len) {
@@ -3063,7 +3414,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             try core_reader.interface.readSliceAll(buffer[0..value_size]);
                             const value = buffer[0..value_size];
 
-                            const format_tag = if (self.slot_ptr.slot.full) blk: {
+                            const format_tag = if (slot_ptr.slot.full) blk: {
                                 try core_reader.seekTo(start_position + value_size);
                                 var buf: [2]u8 = @splat(0);
                                 try core_reader.interface.readSliceAll(&buf);
@@ -3074,8 +3425,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .short_bytes => {
                             var bytes: [byteSizeOf(u64)]u8 = @splat(0);
-                            std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
-                            const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
+                            std.mem.writeInt(u64, &bytes, slot_ptr.slot.value, .big);
+                            const total_size = if (slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
                             const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
 
                             if (value_size > buffer.len) {
@@ -3085,7 +3436,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             @memcpy(buffer[0..value_size], bytes[0..value_size]);
                             const value = buffer[0..value_size];
 
-                            const format_tag = if (self.slot_ptr.slot.full) blk: {
+                            const format_tag = if (slot_ptr.slot.full) blk: {
                                 var buf: [2]u8 = @splat(0);
                                 @memcpy(&buf, bytes[total_size..]);
                                 break :blk buf;
@@ -3098,19 +3449,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readKeyValuePair(self: Cursor(write_mode)) !KeyValuePairCursor(write_mode) {
+                    const slot_ptr = try self.resolved();
                     var core_reader = self.db.core.reader();
 
-                    if (self.slot_ptr.slot.tag != .kv_pair) {
+                    if (slot_ptr.slot.tag != .kv_pair) {
                         return error.UnexpectedTag;
                     }
 
-                    try core_reader.seekTo(self.slot_ptr.slot.value);
+                    try core_reader.seekTo(slot_ptr.slot.value);
                     const kv_pair: KeyValuePair = @bitCast(try takeInt(&core_reader.interface, KeyValuePairInt, .big));
 
                     try kv_pair.key_slot.tag.validate();
                     try kv_pair.value_slot.tag.validate();
 
-                    const hash_pos = self.slot_ptr.slot.value;
+                    const hash_pos = slot_ptr.slot.value;
                     const key_slot_pos = hash_pos + byteSizeOf(HashInt);
                     const value_slot_pos = key_slot_pos + byteSizeOf(Slot);
 
@@ -3126,17 +3478,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writeIfEmpty(self: *Cursor(.read_write), data: WriteableData) !void {
-                    if (self.slot_ptr.slot.empty()) {
+                    const slot_ptr = try self.resolved();
+                    if (slot_ptr.slot.empty()) {
                         try self.write(data);
                     }
                 }
 
                 pub fn reader(self: *Cursor(write_mode), buffer: []u8) !Reader {
+                    const slot_ptr = try self.resolved();
                     var core_reader = self.db.core.reader();
 
-                    switch (self.slot_ptr.slot.tag) {
+                    switch (slot_ptr.slot.tag) {
                         .bytes => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             const size: u64 = @intCast(try takeInt(&core_reader.interface, u64, .big));
                             const start_position = core_reader.pos;
                             return .{
@@ -3154,8 +3508,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         },
                         .short_bytes => {
                             var bytes: [byteSizeOf(u64)]u8 = @splat(0);
-                            std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
-                            const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
+                            std.mem.writeInt(u64, &bytes, slot_ptr.slot.value, .big);
+                            const total_size = if (slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
                             const value_size = std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
                             return .{
                                 .parent = self,
@@ -3167,7 +3521,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 },
                                 .size = value_size,
                                 // add one to get past the tag byte
-                                .start_position = (self.slot_ptr.position orelse return error.ExpectedSlotPosition) + 1,
+                                .start_position = (slot_ptr.position orelse return error.ExpectedSlotPosition) + 1,
                                 .pos = 0,
                             };
                         },
@@ -3176,7 +3530,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writer(self: *Cursor(.read_write), buffer: []u8) !Writer {
-                    if (self.db.header.tag == .array_list and self.db.tx_start == null) return error.ExpectedTxStart;
+                    // in streaming mode, bytes are written to the root with
+                    // `write`, which runs inside a transaction
+                    if (self.db.header.streaming() and self.db.isRoot(self.slot_ptr)) return error.CursorNotWriteable;
+                    if (self.db.transactional() and self.db.tx_start == null) return error.ExpectedTxStart;
                     var core_writer = self.db.core.writer();
                     const ptr_pos = try self.db.core.length();
                     try core_writer.seekTo(ptr_pos);
@@ -3197,36 +3554,37 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     };
                 }
 
-                pub fn slot(self: Cursor(write_mode)) Slot {
-                    return self.slot_ptr.slot;
+                pub fn slot(self: Cursor(write_mode)) !Slot {
+                    return (try self.resolved()).slot;
                 }
 
                 pub fn count(self: Cursor(write_mode)) !u64 {
+                    const slot_ptr = try self.resolved();
                     var core_reader = self.db.core.reader();
-                    switch (self.slot_ptr.slot.tag) {
+                    switch (slot_ptr.slot.tag) {
                         .none => return 0,
                         .array_list => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
                             return header.size;
                         },
                         .linked_array_list, .sorted_map, .sorted_set => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                             return header.size;
                         },
                         .bytes => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             return try takeInt(&core_reader.interface, u64, .big);
                         },
                         .short_bytes => {
                             var bytes: [byteSizeOf(u64)]u8 = @splat(0);
-                            std.mem.writeInt(u64, &bytes, self.slot_ptr.slot.value, .big);
-                            const total_size = if (self.slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
+                            std.mem.writeInt(u64, &bytes, slot_ptr.slot.value, .big);
+                            const total_size = if (slot_ptr.slot.full) byteSizeOf(u64) - 2 else byteSizeOf(u64);
                             return std.mem.findScalar(u8, bytes[0..total_size], 0) orelse total_size;
                         },
                         .counted_hash_map, .counted_hash_set => {
-                            try core_reader.seekTo(self.slot_ptr.slot.value);
+                            try core_reader.seekTo(slot_ptr.slot.value);
                             return try takeInt(&core_reader.interface, u64, .big);
                         },
                         else => return error.UnexpectedTag,
@@ -3247,7 +3605,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         index: u8,
                     };
 
-                    pub fn init(cursor: Cursor(write_mode)) !Iter {
+                    pub fn init(unresolved_cursor: Cursor(write_mode)) !Iter {
+                        const cursor = try unresolved_cursor.resolvedCursor();
                         return .{
                             .cursor = cursor,
                             .core = switch (cursor.slot_ptr.slot.tag) {
@@ -3295,16 +3654,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     fn resolveStartIndex(index: i65, size: u64) ?u64 {
                         const ssize: i65 = @intCast(size);
-                        const resolved: i65 = if (index < 0) index + ssize else index;
-                        if (resolved < 0 or resolved >= ssize) return null;
-                        return @intCast(resolved);
+                        const resolved_index: i65 = if (index < 0) index + ssize else index;
+                        if (resolved_index < 0 or resolved_index >= ssize) return null;
+                        return @intCast(resolved_index);
                     }
 
                     fn emptyIter(cursor: Cursor(write_mode)) !Iter {
                         return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
                     }
 
-                    pub fn initSortedFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
+                    pub fn initSortedFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             // an unwritten map is .none (like iterator()): yield nothing
                             .none => return emptyIter(cursor),
@@ -3320,7 +3680,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         };
                     }
 
-                    pub fn initSortedFromKey(cursor: Cursor(write_mode), start_key: []const u8) !Iter {
+                    pub fn initSortedFromKey(unresolved_cursor: Cursor(write_mode), start_key: []const u8) !Iter {
+                        const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             .none => return emptyIter(cursor),
                             .sorted_map, .sorted_set => {},
@@ -3335,7 +3696,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         };
                     }
 
-                    pub fn initArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
+                    pub fn initArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             .none => return emptyIter(cursor),
                             .array_list => {},
@@ -3353,7 +3715,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         };
                     }
 
-                    pub fn initLinkedArrayListFromIndex(cursor: Cursor(write_mode), start_index: i65) !Iter {
+                    pub fn initLinkedArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             .none => return emptyIter(cursor),
                             .linked_array_list => {},
@@ -3585,7 +3948,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !HashMap(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .hash_map, .hash_set => .{ .cursor = cursor },
                             else => error.UnexpectedTag,
                         },
@@ -3599,8 +3962,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .cursor = self.cursor.readOnly() };
                 }
 
-                pub fn slot(self: HashMap(write_mode)) Slot {
-                    return self.cursor.slot();
+                pub fn slot(self: HashMap(write_mode)) !Slot {
+                    return try self.cursor.slot();
                 }
 
                 pub fn iterator(self: HashMap(write_mode)) !Cursor(write_mode).Iter {
@@ -3684,7 +4047,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !CountedHashMap(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .counted_hash_map, .counted_hash_set => .{ .map = .{ .cursor = cursor } },
                             else => error.UnexpectedTag,
                         },
@@ -3698,8 +4061,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .map = self.map.readOnly() };
                 }
 
-                pub fn slot(self: CountedHashMap(write_mode)) Slot {
-                    return self.map.cursor.slot();
+                pub fn slot(self: CountedHashMap(write_mode)) !Slot {
+                    return try self.map.cursor.slot();
                 }
 
                 pub fn count(self: CountedHashMap(write_mode)) !u64 {
@@ -3758,7 +4121,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !HashSet(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .hash_map, .hash_set => .{ .cursor = cursor },
                             else => error.UnexpectedTag,
                         },
@@ -3772,8 +4135,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .cursor = self.cursor.readOnly() };
                 }
 
-                pub fn slot(self: HashSet(write_mode)) Slot {
-                    return self.cursor.slot();
+                pub fn slot(self: HashSet(write_mode)) !Slot {
+                    return try self.cursor.slot();
                 }
 
                 pub fn iterator(self: HashSet(write_mode)) !Cursor(write_mode).Iter {
@@ -3825,7 +4188,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !CountedHashSet(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .counted_hash_map, .counted_hash_set => .{ .set = .{ .cursor = cursor } },
                             else => error.UnexpectedTag,
                         },
@@ -3839,8 +4202,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .set = self.set.readOnly() };
                 }
 
-                pub fn slot(self: CountedHashSet(write_mode)) Slot {
-                    return self.set.cursor.slot();
+                pub fn slot(self: CountedHashSet(write_mode)) !Slot {
+                    return try self.set.cursor.slot();
                 }
 
                 pub fn count(self: CountedHashSet(write_mode)) !u64 {
@@ -3882,7 +4245,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !SortedMap(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .sorted_map, .sorted_set => .{ .cursor = cursor },
                             else => error.UnexpectedTag,
                         },
@@ -3896,8 +4259,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .cursor = self.cursor.readOnly() };
                 }
 
-                pub fn slot(self: SortedMap(write_mode)) Slot {
-                    return self.cursor.slot();
+                pub fn slot(self: SortedMap(write_mode)) !Slot {
+                    return try self.cursor.slot();
                 }
 
                 pub fn count(self: SortedMap(write_mode)) !u64 {
@@ -3968,9 +4331,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 // number of keys strictly less than `key` (the inverse of getByIndex)
                 pub fn rank(self: SortedMap(write_mode), key: []const u8) !u64 {
-                    if (self.cursor.slot_ptr.slot.tag == .none) return 0;
+                    const slot_ptr = try self.cursor.resolved();
+                    if (slot_ptr.slot.tag == .none) return 0;
                     var core_reader = self.cursor.db.core.reader();
-                    try core_reader.seekTo(self.cursor.slot_ptr.slot.value);
+                    try core_reader.seekTo(slot_ptr.slot.value);
                     const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                     return try self.cursor.db.sortedRank(header.root_ptr, key);
                 }
@@ -3984,7 +4348,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !SortedSet(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .sorted_map, .sorted_set => .{ .map = .{ .cursor = cursor } },
                             else => error.UnexpectedTag,
                         },
@@ -3998,8 +4362,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .map = self.map.readOnly() };
                 }
 
-                pub fn slot(self: SortedSet(write_mode)) Slot {
-                    return self.map.cursor.slot();
+                pub fn slot(self: SortedSet(write_mode)) !Slot {
+                    return try self.map.cursor.slot();
                 }
 
                 pub fn count(self: SortedSet(write_mode)) !u64 {
@@ -4051,7 +4415,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !ArrayList(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .array_list => .{ .cursor = cursor },
                             else => error.UnexpectedTag,
                         },
@@ -4065,8 +4429,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .cursor = self.cursor.readOnly() };
                 }
 
-                pub fn slot(self: ArrayList(write_mode)) Slot {
-                    return self.cursor.slot();
+                pub fn slot(self: ArrayList(write_mode)) !Slot {
+                    return try self.cursor.slot();
                 }
 
                 pub fn count(self: ArrayList(write_mode)) !u64 {
@@ -4142,7 +4506,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 pub fn init(cursor: Database(db_kind, HashInt).Cursor(write_mode)) !LinkedArrayList(write_mode) {
                     return switch (write_mode) {
-                        .read_only => switch (cursor.slot_ptr.slot.tag) {
+                        .read_only => switch ((try cursor.resolved()).slot.tag) {
                             .none, .linked_array_list => .{ .cursor = cursor },
                             else => error.UnexpectedTag,
                         },
@@ -4156,8 +4520,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .cursor = self.cursor.readOnly() };
                 }
 
-                pub fn slot(self: LinkedArrayList(write_mode)) Slot {
-                    return self.cursor.slot();
+                pub fn slot(self: LinkedArrayList(write_mode)) !Slot {
+                    return try self.cursor.slot();
                 }
 
                 pub fn count(self: LinkedArrayList(write_mode)) !u64 {

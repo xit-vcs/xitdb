@@ -8,30 +8,32 @@ test "high level api" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        try testHighLevelApi(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000 });
-    }
-
-    {
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+    for ([_]bool{ true, false }) |legacy| {
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            try testHighLevelApi(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000 }, legacy);
         }
-        try testHighLevelApi(allocator, .file, .{ .io = io, .file = file });
-    }
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testHighLevelApi(allocator, .file, .{ .file = file }, legacy);
         }
-        try testHighLevelApi(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testHighLevelApi(allocator, .buffered_file, .{ .file = file, .buffer = &buffer }, legacy);
+        }
     }
 }
 
@@ -39,34 +41,42 @@ test "low level api" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        try testLowLevelApi(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 });
-    }
-
-    {
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+    for ([_]bool{ true, false }) |legacy| {
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            try testLowLevelApi(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 }, legacy);
         }
-        try testLowLevelApi(allocator, .file, .{ .io = io, .file = file });
-    }
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testLowLevelApi(allocator, .file, .{ .file = file }, legacy);
         }
-        try testLowLevelApi(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testLowLevelApi(allocator, .buffered_file, .{ .file = file, .buffer = &buffer }, legacy);
+        }
     }
 }
 
 test "not using arraylist at the top level" {
+    for ([_]bool{ true, false }) |legacy| {
+        try testNotUsingArrayListAtTopLevel(std.testing.allocator, legacy);
+    }
+}
+
+fn testNotUsingArrayListAtTopLevel(allocator: std.mem.Allocator, legacy: bool) !void {
     // normally an arraylist makes the most sense at the top level,
     // but this test just ensures we can use other data structures
     // at the top level. in theory a top-level hash map might make
@@ -74,44 +84,55 @@ test "not using arraylist at the top level" {
     // network. in that case, immutability isn't important because
     // the data is just created and immediately sent over the wire.
 
-    const allocator = std.testing.allocator;
-
     // hash map
     {
         var buffer = std.Io.Writer.Allocating.init(allocator);
         defer buffer.deinit();
 
         const DB = xitdb.Database(.memory, HashInt);
-        var db = try DB.init(.{ .buffer = &buffer, .max_size = 50000 });
+        var db = try initDb(.memory, .{ .buffer = &buffer, .max_size = 50000 }, legacy);
 
         const map = try DB.HashMap(.read_write).init(db.rootCursor());
         try map.put(hashInt("foo"), .{ .bytes = "foo" });
         try map.put(hashInt("bar"), .{ .bytes = "bar" });
 
-        // init inner map
-        {
-            const inner_map_cursor = try map.putCursor(hashInt("inner-map"));
-            _ = try DB.HashMap(.read_write).init(inner_map_cursor);
-        }
+        if (legacy) {
+            // init inner map
+            {
+                const inner_map_cursor = try map.putCursor(hashInt("inner-map"));
+                _ = try DB.HashMap(.read_write).init(inner_map_cursor);
+            }
 
-        // re-init inner map
-        // since the top-level type isn't an arraylist, there is no concept of
-        // a transaction, so this does not perform a copy of the root node
-        {
+            // re-init inner map
+            // since the top-level type isn't an arraylist, there is no concept of
+            // a transaction, so this does not perform a copy of the root node
+            {
+                const inner_map_cursor = try map.putCursor(hashInt("inner-map"));
+                _ = try DB.HashMap(.read_write).init(inner_map_cursor);
+            }
+        } else {
+            // in the newest version every write to the root is a transaction,
+            // so a nested cursor can't be written to after it was returned
             const inner_map_cursor = try map.putCursor(hashInt("inner-map"));
-            _ = try DB.HashMap(.read_write).init(inner_map_cursor);
+            try std.testing.expectError(error.ExpectedTxStart, DB.HashMap(.read_write).init(inner_map_cursor));
         }
     }
 
-    // linked array list is not currently allowed at the top level
+    // linked array list is only allowed at the top level in the newest version
     {
         var buffer = std.Io.Writer.Allocating.init(allocator);
         defer buffer.deinit();
 
         const DB = xitdb.Database(.memory, HashInt);
-        var db = try DB.init(.{ .buffer = &buffer, .max_size = 50000 });
+        var db = try initDb(.memory, .{ .buffer = &buffer, .max_size = 50000 }, legacy);
 
-        try std.testing.expectError(error.InvalidTopLevelType, DB.LinkedArrayList(.read_write).init(db.rootCursor()));
+        if (legacy) {
+            try std.testing.expectError(error.InvalidTopLevelType, DB.LinkedArrayList(.read_write).init(db.rootCursor()));
+        } else {
+            const list = try DB.LinkedArrayList(.read_write).init(db.rootCursor());
+            try list.append(.{ .uint = 1 });
+            try std.testing.expectEqual(1, try list.count());
+        }
     }
 }
 
@@ -121,7 +142,7 @@ test "low level memory operations" {
     var buffer = try std.Io.Writer.Allocating.initCapacity(allocator, 100);
     defer buffer.deinit();
     @memset(buffer.writer.buffer, 0xaa);
-    var db = try xitdb.Database(.memory, HashInt).init(.{ .buffer = &buffer, .max_size = 10000 });
+    var db = try xitdb.Database(.memory, HashInt).init(std.testing.io, .{ .buffer = &buffer, .max_size = 10000 });
 
     var writer = db.core.writer();
     try writer.seekTo(0);
@@ -211,19 +232,45 @@ fn clearStorage(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(
             init_opts.buffer.shrinkRetainingCapacity(0);
         },
         .file => {
-            try init_opts.file.setLength(init_opts.io, 0);
+            try init_opts.file.setLength(std.testing.io, 0);
         },
         .buffered_file => {
             init_opts.buffer.shrinkRetainingCapacity(0);
-            try init_opts.file.setLength(init_opts.io, 0);
+            try init_opts.file.setLength(std.testing.io, 0);
         },
     }
 }
 
-fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+// creates a database. if `legacy` is true and the storage is empty, it first
+// writes a version 0 header, which is all an empty legacy database contains.
+fn initDb(comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), legacy: bool) !xitdb.Database(db_kind, HashInt) {
+    if (legacy) {
+        const header = xitdb.DatabaseHeader{
+            .hash_id = init_opts.hash_id orelse .{ .id = 0 },
+            .hash_size = @bitSizeOf(HashInt) / 8,
+            .version = 0,
+        };
+        switch (db_kind) {
+            .memory => if (init_opts.buffer.written().len == 0) {
+                try header.write(&init_opts.buffer.writer);
+            },
+            .file, .buffered_file => if (try init_opts.file.length(std.testing.io) == 0) {
+                if (db_kind == .buffered_file) init_opts.buffer.clearRetainingCapacity();
+                var writer = init_opts.file.writer(std.testing.io, &.{});
+                try header.write(&writer.interface);
+                try writer.interface.flush();
+            },
+        }
+    }
+    const db = try xitdb.Database(db_kind, HashInt).init(std.testing.io, init_opts);
+    try std.testing.expectEqual(@as(u16, if (legacy) 0 else xitdb.VERSION), db.header.version);
+    return db;
+}
+
+fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), legacy: bool) !void {
     // init the db
     const DB = xitdb.Database(db_kind, HashInt);
-    var db = try DB.init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
 
     {
         // to get the benefits of immutability, the top-level data structure
@@ -374,7 +421,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 var key_buffer: [100]u8 = undefined;
                 _ = try kv_pair.key_cursor.readBytes(&key_buffer);
 
-                switch (kv_pair.value_cursor.slot().tag) {
+                switch ((try kv_pair.value_cursor.slot()).tag) {
                     .short_bytes, .bytes => {
                         var val_buffer: [100]u8 = undefined;
                         _ = try kv_pair.value_cursor.readBytes(&val_buffer);
@@ -486,7 +533,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
                 const todos_cursor = try moment.putCursor(hashInt("todos"));
                 const todos = try DB.LinkedArrayList(.read_write).init(todos_cursor);
-                try todos.concat(todos_cursor.slot());
+                try todos.concat(try todos_cursor.slot());
                 try todos.slice(1, 2);
                 try todos.remove(1);
 
@@ -668,23 +715,23 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         switch (db_kind) {
             .memory => {},
             .file => {
-                const file = try std.Io.Dir.cwd().openFile(init_opts.io, "main.db", .{ .mode = .read_only });
-                defer file.close(init_opts.io);
+                const file = try std.Io.Dir.cwd().openFile(std.testing.io, "main.db", .{ .mode = .read_only });
+                defer file.close(std.testing.io);
                 var new_init_opts = init_opts;
                 new_init_opts.file = file;
-                _ = try DB.init(new_init_opts);
+                _ = try DB.init(std.testing.io, new_init_opts);
             },
             .buffered_file => {
-                const file = try std.Io.Dir.cwd().openFile(init_opts.io, "main.db", .{ .mode = .read_only });
-                defer file.close(init_opts.io);
+                const file = try std.Io.Dir.cwd().openFile(std.testing.io, "main.db", .{ .mode = .read_only });
+                defer file.close(std.testing.io);
                 var new_init_opts = init_opts;
                 new_init_opts.file = file;
                 new_init_opts.buffer.shrinkRetainingCapacity(0);
-                _ = try DB.init(new_init_opts);
+                _ = try DB.init(std.testing.io, new_init_opts);
             },
         }
 
-        db = try DB.init(init_opts);
+        db = try initDb(db_kind, init_opts, legacy);
 
         const size_after = try db.core.length();
 
@@ -708,7 +755,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 // create a new key called "food" whose initial value is
                 // based on the "fruits" list
                 var food_cursor = try moment.putCursor(hashInt("food"));
-                try food_cursor.write(.{ .slot = fruits.slot() });
+                try food_cursor.write(.{ .slot = try fruits.slot() });
 
                 const food = try DB.ArrayList(.read_write).init(food_cursor);
                 try food.append(.{ .bytes = "eggs" });
@@ -750,7 +797,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 // create a new key called "cities" whose initial value is
                 // based on the "big-cities" list
                 var cities_cursor = try moment.putCursor(hashInt("cities"));
-                try cities_cursor.write(.{ .slot = big_cities.slot() });
+                try cities_cursor.write(.{ .slot = try big_cities.slot() });
 
                 const cities = try DB.ArrayList(.read_write).init(cities_cursor);
                 try cities.append(.{ .bytes = "Charleston, SC" });
@@ -796,7 +843,7 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
                 // create a new key called "cities" whose initial value is
                 // based on the "big-cities" list
                 var cities_cursor = try moment.putCursor(hashInt("cities"));
-                try cities_cursor.write(.{ .slot = big_cities.slot() });
+                try cities_cursor.write(.{ .slot = try big_cities.slot() });
 
                 const cities = try DB.ArrayList(.read_write).init(cities_cursor);
                 try cities.append(.{ .bytes = "Charleston, SC" });
@@ -961,9 +1008,9 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
     }
 }
 
-fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime slice_offset: u64, comptime slice_size: u64) !void {
+fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime slice_offset: u64, comptime slice_size: u64, legacy: bool) !void {
     try clearStorage(db_kind, init_opts);
-    var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
     var root_cursor = db.rootCursor();
 
     const Ctx = struct {
@@ -1067,9 +1114,9 @@ fn testSlice(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind,
     });
 }
 
-fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime list_a_size: usize, comptime list_b_size: usize) !void {
+fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime list_a_size: usize, comptime list_b_size: usize, legacy: bool) !void {
     try clearStorage(db_kind, init_opts);
-    var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
     var root_cursor = db.rootCursor();
 
     var values: std.ArrayList(u64) = .empty;
@@ -1184,9 +1231,9 @@ fn testConcat(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind
     }
 }
 
-fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime insert_index: u64) !void {
+fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), comptime original_size: usize, comptime insert_index: u64, legacy: bool) !void {
     try clearStorage(db_kind, init_opts);
-    var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
     var root_cursor = db.rootCursor();
 
     const insert_value: u64 = 12345;
@@ -1316,15 +1363,15 @@ fn testInsertAndRemove(allocator: std.mem.Allocator, comptime db_kind: xitdb.Dat
     });
 }
 
-fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), legacy: bool) !void {
     // open and re-open empty database
     {
         // make empty database
         try clearStorage(db_kind, init_opts);
-        _ = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        _ = try initDb(db_kind, init_opts, legacy);
 
         // re-open without error
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var writer = db.core.writer();
 
         // modify the magic number
@@ -1334,7 +1381,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // re-open with error
         {
-            const db_or_error = xitdb.Database(db_kind, HashInt).init(init_opts);
+            const db_or_error = initDb(db_kind, init_opts, legacy);
             if (db_or_error) |_| {
                 return error.ExpectedInvalidDatabaseError;
             } else |err| {
@@ -1351,7 +1398,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // re-open with error
         {
-            const db_or_error = xitdb.Database(db_kind, HashInt).init(init_opts);
+            const db_or_error = initDb(db_kind, init_opts, legacy);
             if (db_or_error) |_| {
                 return error.ExpectedInvalidVersionError;
             } else |err| {
@@ -1367,7 +1414,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
         // make empty database
         try clearStorage(db_kind, init_opts);
-        _ = try xitdb.Database(db_kind, HashInt).init(init_opts_with_hash_id);
+        _ = try initDb(db_kind, init_opts_with_hash_id, legacy);
 
         // read header without initializing database
         const header = blk: switch (db_kind) {
@@ -1376,7 +1423,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 break :blk try xitdb.DatabaseHeader.read(&reader);
             },
             .file, .buffered_file => {
-                var reader = init_opts.file.reader(init_opts.io, &.{});
+                var reader = init_opts.file.reader(std.testing.io, &.{});
                 break :blk try xitdb.DatabaseHeader.read(&reader.interface);
             },
         };
@@ -1400,7 +1447,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // array_list of hash_maps
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         // write foo -> bar with a writer
@@ -1408,7 +1455,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         {
             const Ctx = struct {
                 pub fn run(_: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-                    try std.testing.expect(cursor.slot().tag == .none);
+                    try std.testing.expect((try cursor.slot()).tag == .none);
                     var writer = try cursor.writer(&.{});
                     try writer.interface.writeAll("bar");
                     try writer.finish();
@@ -1434,7 +1481,10 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                     _ = try cursor.db.rootCursor().writePath(void, &.{.array_list_append});
                 }
             };
-            try std.testing.expectError(error.CursorNotWriteable, root_cursor.writePath(Ctx, &.{.{ .ctx = Ctx{} }}));
+            // in streaming mode, the callback runs inside a transaction on the root,
+            // so the top-level write inside it is a nested one
+            const expected_error = if (db.header.streaming()) error.NestedTopLevelWrite else error.CursorNotWriteable;
+            try std.testing.expectError(expected_error, root_cursor.writePath(Ctx, &.{.{ .ctx = Ctx{} }}));
             try std.testing.expectEqual(1, try db.rootCursor().count());
         }
 
@@ -1456,7 +1506,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 allocator: std.mem.Allocator,
 
                 pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-                    try std.testing.expect(cursor.slot().tag != .none);
+                    try std.testing.expect((try cursor.slot()).tag != .none);
 
                     const value = try cursor.readBytesAlloc(self.allocator, MAX_READ_BYTES);
                     defer self.allocator.free(value);
@@ -1516,7 +1566,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 allocator: std.mem.Allocator,
 
                 pub fn run(self: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
-                    try std.testing.expect(cursor.slot().tag != .none);
+                    try std.testing.expect((try cursor.slot()).tag != .none);
 
                     var write_buffer: [1024]u8 = undefined;
                     var writer = try cursor.writer(&write_buffer);
@@ -1588,12 +1638,12 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             // appending must clear the failed moment's slot, including its stored value
             const history = try xitdb.Database(db_kind, HashInt).ArrayList(.read_write).init(db.rootCursor());
             const count_before = try history.count();
-            try std.testing.expect((try history.appendCursor()).slot().empty());
+            try std.testing.expect((try (try history.appendCursor()).slot()).empty());
             try std.testing.expectEqual(null, try history.getSlot(-1));
             try history.slice(count_before);
             try history.append(.{ .uint = 999 });
             try history.slice(count_before);
-            try std.testing.expect((try history.appendCursor()).slot().empty());
+            try std.testing.expect((try (try history.appendCursor()).slot()).empty());
             try std.testing.expectEqual(null, try history.getSlot(-1));
             try history.slice(count_before);
         }
@@ -1611,7 +1661,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             });
 
             // the slot tag is .bytes because the byte array is > 8 bytes long
-            try std.testing.expectEqual(.bytes, bar_cursor.slot().tag);
+            try std.testing.expectEqual(.bytes, (try bar_cursor.slot()).tag);
 
             // writing again returns the same slot
             {
@@ -1663,7 +1713,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             });
 
             // the slot tag is .short_bytes because the byte array is <= 8 bytes long
-            try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
+            try std.testing.expectEqual(.short_bytes, (try bar_cursor.slot()).tag);
             try std.testing.expectEqual(8, try bar_cursor.count());
 
             // make sure .short_bytes can be read with a reader
@@ -1687,7 +1737,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 });
 
                 // the slot tag is .bytes because the byte array is > 8 bytes long including the format tag
-                try std.testing.expectEqual(.bytes, bar_cursor.slot().tag);
+                try std.testing.expectEqual(.bytes, (try bar_cursor.slot()).tag);
                 try std.testing.expectEqual(8, try bar_cursor.count());
 
                 // read bar
@@ -1719,7 +1769,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 });
 
                 // the slot tag is .short_bytes because the byte array is <= 8 bytes long including the format tag
-                try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
+                try std.testing.expectEqual(.short_bytes, (try bar_cursor.slot()).tag);
                 try std.testing.expectEqual(6, try bar_cursor.count());
 
                 // read bar
@@ -1751,7 +1801,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 });
 
                 // the slot tag is .short_bytes because the byte array is <= 8 bytes long including the format tag
-                try std.testing.expectEqual(.short_bytes, bar_cursor.slot().tag);
+                try std.testing.expectEqual(.short_bytes, (try bar_cursor.slot()).tag);
                 try std.testing.expectEqual(5, try bar_cursor.count());
 
                 // read bar
@@ -1901,8 +1951,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 const map_cursor = (try root_cursor.readPath(void, &.{
                     .{ .array_list_get = -1 },
                 })).?;
-                const index_pos = map_cursor.slot().value;
-                try std.testing.expectEqual(.hash_map, map_cursor.slot().tag);
+                const index_pos = (try map_cursor.slot()).value;
+                try std.testing.expectEqual(.hash_map, (try map_cursor.slot()).tag);
 
                 var reader = db.core.reader();
                 const slot_size: u64 = @bitSizeOf(xitdb.Slot) / 8;
@@ -1947,8 +1997,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 const map_cursor = (try root_cursor.readPath(void, &.{
                     .{ .array_list_get = -1 },
                 })).?;
-                const index_pos = map_cursor.slot().value;
-                try std.testing.expectEqual(.hash_map, map_cursor.slot().tag);
+                const index_pos = (try map_cursor.slot()).value;
+                try std.testing.expectEqual(.hash_map, (try map_cursor.slot()).tag);
 
                 var reader = db.core.reader();
                 const slot_size: u64 = @bitSizeOf(xitdb.Slot) / 8;
@@ -1985,8 +2035,8 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 const map_cursor = (try root_cursor.readPath(void, &.{
                     .{ .array_list_get = -1 },
                 })).?;
-                const index_pos = map_cursor.slot().value;
-                try std.testing.expectEqual(.hash_map, map_cursor.slot().tag);
+                const index_pos = (try map_cursor.slot()).value;
+                try std.testing.expectEqual(.hash_map, (try map_cursor.slot()).tag);
 
                 var reader = db.core.reader();
                 const slot_size: u64 = @bitSizeOf(xitdb.Slot) / 8;
@@ -2183,7 +2233,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // append to top-level array_list many times, filling up the array_list until a root overflow occurs
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         const wat_key = hashInt("wat");
@@ -2289,7 +2339,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // append to inner array_list many times, filling up the array_list until a root overflow occurs
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         for (0..xitdb.SLOT_COUNT + 1) |i| {
@@ -2403,7 +2453,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // iterate over inner array_list
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         // add wats
@@ -2479,7 +2529,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // iterate over inner hash_map
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         // add wats
@@ -2579,33 +2629,33 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
 
     {
         // slice linked_array_list
-        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, 10, 5);
-        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, 0, xitdb.SLOT_COUNT * 2);
-        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 3, xitdb.SLOT_COUNT);
-        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 3, xitdb.SLOT_COUNT * 2);
-        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 2, 10, xitdb.SLOT_COUNT);
-        try testSlice(allocator, db_kind, init_opts, 2, 0, 2);
-        try testSlice(allocator, db_kind, init_opts, 2, 1, 1);
-        try testSlice(allocator, db_kind, init_opts, 1, 0, 0);
+        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, 10, 5, legacy);
+        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, 0, xitdb.SLOT_COUNT * 2, legacy);
+        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 3, xitdb.SLOT_COUNT, legacy);
+        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 3, xitdb.SLOT_COUNT * 2, legacy);
+        try testSlice(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 2, 10, xitdb.SLOT_COUNT, legacy);
+        try testSlice(allocator, db_kind, init_opts, 2, 0, 2, legacy);
+        try testSlice(allocator, db_kind, init_opts, 2, 1, 1, legacy);
+        try testSlice(allocator, db_kind, init_opts, 1, 0, 0, legacy);
 
         // concat linked_array_list
-        try testConcat(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, xitdb.SLOT_COUNT + 1);
-        try testConcat(allocator, db_kind, init_opts, xitdb.SLOT_COUNT, xitdb.SLOT_COUNT);
-        try testConcat(allocator, db_kind, init_opts, 1, 1);
-        try testConcat(allocator, db_kind, init_opts, 0, 0);
+        try testConcat(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5 + 1, xitdb.SLOT_COUNT + 1, legacy);
+        try testConcat(allocator, db_kind, init_opts, xitdb.SLOT_COUNT, xitdb.SLOT_COUNT, legacy);
+        try testConcat(allocator, db_kind, init_opts, 1, 1, legacy);
+        try testConcat(allocator, db_kind, init_opts, 0, 0, legacy);
 
         // insert linked_array_list
-        try testInsertAndRemove(allocator, db_kind, init_opts, 1, 0);
-        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 0);
-        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 5);
-        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 9);
-        try testInsertAndRemove(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 2);
+        try testInsertAndRemove(allocator, db_kind, init_opts, 1, 0, legacy);
+        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 0, legacy);
+        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 5, legacy);
+        try testInsertAndRemove(allocator, db_kind, init_opts, 10, 9, legacy);
+        try testInsertAndRemove(allocator, db_kind, init_opts, xitdb.SLOT_COUNT * 5, xitdb.SLOT_COUNT * 2, legacy);
     }
 
     // concat linked_array_list multiple times
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         const Ctx = struct {
@@ -2694,7 +2744,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // append items to linked_array_list without setting their value
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         // appending without setting any value should work
@@ -2724,7 +2774,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // insert at beginning of linked_array_list many times
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         _ = try root_cursor.writePath(void, &.{
@@ -2751,7 +2801,7 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     // insert at end of linked_array_list many times
     {
         try clearStorage(db_kind, init_opts);
-        var db = try xitdb.Database(db_kind, HashInt).init(init_opts);
+        var db = try initDb(db_kind, init_opts, legacy);
         var root_cursor = db.rootCursor();
 
         _ = try root_cursor.writePath(void, &.{
@@ -2782,118 +2832,149 @@ test "compaction" {
     var offset_map = std.AutoHashMap(u64, u64).init(allocator);
     defer offset_map.deinit();
 
-    // memory
+    for ([_]bool{ true, false }) |legacy| {
+        // memory
+        {
+            var source_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer source_buffer.deinit();
+            var target_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer target_buffer.deinit();
+            try testCompaction(
+                allocator,
+                .memory,
+                .{ .buffer = &source_buffer, .max_size = 5_000_000 },
+                .memory,
+                .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+                &offset_map,
+                legacy,
+            );
+        }
+
+        // file
+        {
+            const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+            defer {
+                source_file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+            }
+            const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
+            defer {
+                target_file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
+            }
+            try testCompaction(
+                allocator,
+                .file,
+                .{ .file = source_file },
+                .file,
+                .{ .file = target_file },
+                &offset_map,
+                legacy,
+            );
+        }
+
+        // buffered_file
+        {
+            var source_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer source_buffer.deinit();
+            var target_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer target_buffer.deinit();
+            const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+            defer {
+                source_file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+            }
+            const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
+            defer {
+                target_file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
+            }
+            try testCompaction(
+                allocator,
+                .buffered_file,
+                .{ .file = source_file, .buffer = &source_buffer },
+                .buffered_file,
+                .{ .file = target_file, .buffer = &target_buffer },
+                &offset_map,
+                legacy,
+            );
+        }
+
+        // buffered_file to memory
+        {
+            var source_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer source_buffer.deinit();
+            var target_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer target_buffer.deinit();
+            const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
+            defer {
+                source_file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
+            }
+            try testCompaction(
+                allocator,
+                .buffered_file,
+                .{ .file = source_file, .buffer = &source_buffer },
+                .memory,
+                .{ .buffer = &target_buffer, .max_size = 5_000_000 },
+                &offset_map,
+                legacy,
+            );
+        }
+    }
+
+    // compacting migrates a legacy database to the newest version
     {
+        const DB = xitdb.Database(.memory, HashInt);
         var source_buffer = std.Io.Writer.Allocating.init(allocator);
         defer source_buffer.deinit();
         var target_buffer = std.Io.Writer.Allocating.init(allocator);
         defer target_buffer.deinit();
-        try testCompaction(
-            allocator,
-            .memory,
-            .{ .buffer = &source_buffer, .max_size = 5_000_000 },
-            .memory,
-            .{ .buffer = &target_buffer, .max_size = 5_000_000 },
-            &offset_map,
-        );
-    }
 
-    // file
-    {
-        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
-        defer {
-            source_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
-        }
-        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
-        defer {
-            target_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
-        }
-        try testCompaction(
-            allocator,
-            .file,
-            .{ .io = io, .file = source_file },
-            .file,
-            .{ .io = io, .file = target_file },
-            &offset_map,
-        );
-    }
+        var source = try initDb(.memory, .{ .buffer = &source_buffer }, true);
+        try std.testing.expectEqual(0, source.header.version);
+        const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+        try history.append(.{ .uint = 1 });
+        try history.append(.{ .uint = 2 });
 
-    // buffered_file
-    {
-        var source_buffer = std.Io.Writer.Allocating.init(allocator);
-        defer source_buffer.deinit();
-        var target_buffer = std.Io.Writer.Allocating.init(allocator);
-        defer target_buffer.deinit();
-        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
-        defer {
-            source_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
-        }
-        const target_file = try std.Io.Dir.cwd().createFile(io, "compact_target.db", .{ .read = true, .truncate = true });
-        defer {
-            target_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
-        }
-        try testCompaction(
-            allocator,
-            .buffered_file,
-            .{ .io = io, .file = source_file, .buffer = &source_buffer },
-            .buffered_file,
-            .{ .io = io, .file = target_file, .buffer = &target_buffer },
-            &offset_map,
-        );
-    }
+        var target = try source.compact(.memory, .{ .buffer = &target_buffer }, &offset_map);
+        try std.testing.expect(target.header.streaming());
+        try std.testing.expectEqual(xitdb.VERSION, target.header.version);
+        const target_history = try DB.ArrayList(.read_only).init(target.rootCursor().readOnly());
+        try std.testing.expectEqual(1, try target_history.count());
+        try std.testing.expectEqual(2, try (try target_history.getCursor(-1)).?.readUint());
 
-    // buffered_file to memory
-    {
-        var source_buffer = std.Io.Writer.Allocating.init(allocator);
-        defer source_buffer.deinit();
-        var target_buffer = std.Io.Writer.Allocating.init(allocator);
-        defer target_buffer.deinit();
-        const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
-        defer {
-            source_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "compact_source.db") catch {};
-        }
-        try testCompaction(
-            allocator,
-            .buffered_file,
-            .{ .io = io, .file = source_file, .buffer = &source_buffer },
-            .memory,
-            .{ .buffer = &target_buffer, .max_size = 5_000_000 },
-            &offset_map,
-        );
+        // and compacting a database in the newest version keeps it there
+        var compacted_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer compacted_buffer.deinit();
+        const compacted = try target.compact(.memory, .{ .buffer = &compacted_buffer }, &offset_map);
+        try std.testing.expectEqual(xitdb.VERSION, compacted.header.version);
     }
 }
 
 test "compaction with disk-backed offsets map" {
     const io = std.testing.io;
 
-    // a custom offsets map only needs reset, get, and put. store offsets
-    // directly as u64 hashes in a separate, mutable top-level xitdb hash map.
+    // a custom offsets map only needs reset, get, and put. this one stores offsets
+    // directly as u64 hashes in a separate xitdb hash map, inside one transaction
+    // that lasts for the whole compaction, so each put isn't committed separately.
+    const OffsetDB = xitdb.Database(.file, u64);
     const DiskOffsets = struct {
-        const DB = xitdb.Database(.file, u64);
-
-        io: std.Io,
-        file: std.Io.File,
-        db: DB = undefined, // initialized by compact's call to reset
+        map: OffsetDB.HashMap(.read_write),
 
         pub fn reset(self: *@This()) !void {
-            try self.file.setLength(self.io, 0);
-            self.db = try DB.init(.{ .io = self.io, .file = self.file, .fsync = false });
+            var cursor = self.map.cursor;
+            try cursor.write(.{ .slot = null });
+            self.map = try OffsetDB.HashMap(.read_write).init(cursor);
         }
 
         pub fn get(self: *@This(), source_offset: u64) !?u64 {
-            const map = try DB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
-            const cursor = (try map.getCursor(source_offset)) orelse return null;
+            const cursor = (try self.map.getCursor(source_offset)) orelse return null;
             return try cursor.readUint();
         }
 
         pub fn put(self: *@This(), source_offset: u64, target_offset: u64) !void {
-            const map = try DB.HashMap(.read_write).init(self.db.rootCursor());
-            try map.put(source_offset, .{ .uint = target_offset });
+            try self.map.put(source_offset, .{ .uint = target_offset });
         }
     };
 
@@ -2902,11 +2983,7 @@ test "compaction with disk-backed offsets map" {
         offsets_file.close(io);
         std.Io.Dir.cwd().deleteFile(io, "compact_offsets.db") catch {};
     }
-    var offset_map = DiskOffsets{ .io = io, .file = offsets_file };
-
-    // reusing a scratch map must discard offsets from previous compactions.
-    try offset_map.reset();
-    try offset_map.put(0, 123);
+    var offsets_db = try OffsetDB.init(io, .{ .file = offsets_file, .fsync = false });
 
     const source_file = try std.Io.Dir.cwd().createFile(io, "compact_source.db", .{ .read = true, .truncate = true });
     defer {
@@ -2919,24 +2996,39 @@ test "compaction with disk-backed offsets map" {
         std.Io.Dir.cwd().deleteFile(io, "compact_target.db") catch {};
     }
 
-    // exercise the same data types, cycles, sharing, and reopening checks
-    // as the in-memory offsets map, reusing the scratch file between runs.
-    try testCompaction(
-        std.testing.allocator,
-        .file,
-        .{ .io = io, .file = source_file, .fsync = false },
-        .file,
-        .{ .io = io, .file = target_file, .fsync = false },
-        &offset_map,
-    );
-    try std.testing.expectEqual(null, try offset_map.get(0));
+    const Ctx = struct {
+        source_file: std.Io.File,
+        target_file: std.Io.File,
+
+        pub fn run(self: @This(), cursor: *OffsetDB.Cursor(.read_write)) !void {
+            var offset_map = DiskOffsets{ .map = try OffsetDB.HashMap(.read_write).init(cursor.*) };
+
+            // exercise the same data types, cycles, sharing, and reopening checks
+            // as the in-memory offsets map, reusing the scratch map between runs.
+            // reusing it must discard offsets from previous compactions.
+            for ([_]bool{ true, false }) |legacy| {
+                try offset_map.put(0, 123);
+                try testCompaction(
+                    std.testing.allocator,
+                    .file,
+                    .{ .file = self.source_file, .fsync = false },
+                    .file,
+                    .{ .file = self.target_file, .fsync = false },
+                    &offset_map,
+                    legacy,
+                );
+                try std.testing.expectEqual(null, try offset_map.get(0));
+            }
+        }
+    };
+    try offsets_db.runContext(Ctx{ .source_file = source_file, .target_file = target_file });
 }
 
 test "hash map with u64 hashes" {
     const DB = xitdb.Database(.memory, u64);
     var buffer = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer buffer.deinit();
-    var db = try DB.init(.{ .buffer = &buffer });
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer });
     const map = try DB.HashMap(.read_write).init(db.rootCursor());
 
     // the first two keys share all but their highest nibble, exercising
@@ -2959,6 +3051,7 @@ fn testCompaction(
     comptime target_db_kind: xitdb.DatabaseKind,
     target_opts: xitdb.InitOpts(target_db_kind),
     offset_map: anytype,
+    legacy: bool,
 ) !void {
     const DB = xitdb.Database(db_kind, HashInt);
     const TargetDB = xitdb.Database(target_db_kind, HashInt);
@@ -2967,7 +3060,7 @@ fn testCompaction(
     {
         try clearStorage(db_kind, source_opts);
         try clearStorage(target_db_kind, target_opts);
-        var source = try DB.init(source_opts);
+        var source = try initDb(db_kind, source_opts, legacy);
         const compacted = try source.compact(target_db_kind, target_opts, offset_map);
         try std.testing.expectEqual(.none, compacted.header.tag);
     }
@@ -2976,7 +3069,7 @@ fn testCompaction(
     {
         try clearStorage(db_kind, source_opts);
         try clearStorage(target_db_kind, target_opts);
-        var source = try DB.init(source_opts);
+        var source = try initDb(db_kind, source_opts, legacy);
 
         // moment 1
         {
@@ -3067,15 +3160,15 @@ fn testCompaction(
 
                     // cycles must survive compaction rather than causing the
                     // remapper to recurse indefinitely.
-                    try moment.put(hashInt("self"), .{ .slot = moment.slot() });
+                    try moment.put(hashInt("self"), .{ .slot = try moment.slot() });
 
                     const cyclic_list = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("cyclic-list")));
-                    try cyclic_list.append(.{ .slot = cyclic_list.slot() });
+                    try cyclic_list.append(.{ .slot = try cyclic_list.slot() });
 
                     const map_a = try DB.HashMap(.read_write).init(try moment.putCursor(hashInt("map-a")));
                     const map_b = try DB.HashMap(.read_write).init(try moment.putCursor(hashInt("map-b")));
-                    try map_a.put(hashInt("map-b"), .{ .slot = map_b.slot() });
-                    try map_b.put(hashInt("map-a"), .{ .slot = map_a.slot() });
+                    try map_a.put(hashInt("map-b"), .{ .slot = try map_b.slot() });
+                    try map_b.put(hashInt("map-a"), .{ .slot = try map_a.slot() });
                 }
             };
             try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx3{});
@@ -3102,17 +3195,17 @@ fn testCompaction(
         // self-references and mutual references point back to the same compacted
         // objects rather than duplicate objects or dangling source offsets.
         const self_cursor = (try moment.getCursor(hashInt("self"))).?;
-        try std.testing.expect(self_cursor.slot().eql(moment_cursor.slot()));
+        try std.testing.expect((try self_cursor.slot()).eql(try moment_cursor.slot()));
 
         const cyclic_list_cursor = (try moment.getCursor(hashInt("cyclic-list"))).?;
         const cyclic_list = try TargetDB.ArrayList(.read_only).init(cyclic_list_cursor);
-        try std.testing.expect((try cyclic_list.getSlot(0)).?.eql(cyclic_list_cursor.slot()));
+        try std.testing.expect((try cyclic_list.getSlot(0)).?.eql(try cyclic_list_cursor.slot()));
 
         const map_a_cursor = (try moment.getCursor(hashInt("map-a"))).?;
         const map_a = try TargetDB.HashMap(.read_only).init(map_a_cursor);
         const map_b_cursor = (try map_a.getCursor(hashInt("map-b"))).?;
         const map_b = try TargetDB.HashMap(.read_only).init(map_b_cursor);
-        try std.testing.expect((try map_b.getSlot(hashInt("map-a"))).?.eql(map_a_cursor.slot()));
+        try std.testing.expect((try map_b.getSlot(hashInt("map-a"))).?.eql(try map_a_cursor.slot()));
 
         // key1 should have the final value
         const key1_val = try (try moment.getCursor(hashInt("key1"))).?.readBytesAlloc(allocator, 1024);
@@ -3209,7 +3302,7 @@ fn testCompaction(
     {
         try clearStorage(db_kind, source_opts);
         try clearStorage(target_db_kind, target_opts);
-        var source = try DB.init(source_opts);
+        var source = try initDb(db_kind, source_opts, legacy);
 
         // moment 1: create many keys
         {
@@ -3266,7 +3359,7 @@ fn testCompaction(
         {
             try clearStorage(db_kind, source_opts);
             try clearStorage(target_db_kind, target_opts);
-            var source = try DB.init(source_opts);
+            var source = try initDb(db_kind, source_opts, legacy);
 
             // write some data
             {
@@ -3286,7 +3379,7 @@ fn testCompaction(
             _ = &compacted;
 
             // re-open the target
-            var reopened = try TargetDB.init(target_opts);
+            var reopened = try TargetDB.init(std.testing.io, target_opts);
 
             const history = try TargetDB.ArrayList(.read_only).init(reopened.rootCursor().readOnly());
             try std.testing.expectEqual(1, try history.count());
@@ -3303,7 +3396,7 @@ fn testCompaction(
         {
             try clearStorage(db_kind, source_opts);
             try clearStorage(target_db_kind, target_opts);
-            var source = try DB.init(source_opts);
+            var source = try initDb(db_kind, source_opts, legacy);
 
             // write initial data
             {
@@ -3362,38 +3455,40 @@ test "sorted map and set" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        try testSortedMap(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 });
-    }
-
-    {
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+    for ([_]bool{ true, false }) |legacy| {
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            try testSortedMap(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 }, legacy);
         }
-        try testSortedMap(allocator, .file, .{ .io = io, .file = file });
-    }
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testSortedMap(allocator, .file, .{ .file = file }, legacy);
         }
-        try testSortedMap(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testSortedMap(allocator, .buffered_file, .{ .file = file, .buffer = &buffer }, legacy);
+        }
     }
 }
 
-fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), legacy: bool) !void {
     _ = allocator;
     try clearStorage(db_kind, init_opts);
     const DB = xitdb.Database(db_kind, HashInt);
-    var db = try DB.init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
     var root_cursor = db.rootCursor();
 
     // keys "k0000".."k0059" sort lexicographically in numeric order
@@ -3637,38 +3732,40 @@ test "iterator from index" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        try testIteratorFrom(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 });
-    }
-
-    {
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+    for ([_]bool{ true, false }) |legacy| {
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            try testIteratorFrom(allocator, .memory, .{ .buffer = &buffer, .max_size = 50_000_000 }, legacy);
         }
-        try testIteratorFrom(allocator, .file, .{ .io = io, .file = file });
-    }
 
-    {
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
-        defer {
-            file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        {
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testIteratorFrom(allocator, .file, .{ .file = file }, legacy);
         }
-        try testIteratorFrom(allocator, .buffered_file, .{ .io = io, .file = file, .buffer = &buffer });
+
+        {
+            var buffer = std.Io.Writer.Allocating.init(allocator);
+            defer buffer.deinit();
+            const file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+            defer {
+                file.close(io);
+                std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+            }
+            try testIteratorFrom(allocator, .buffered_file, .{ .file = file, .buffer = &buffer }, legacy);
+        }
     }
 }
 
-fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind)) !void {
+fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseKind, init_opts: xitdb.InitOpts(db_kind), legacy: bool) !void {
     _ = allocator;
     try clearStorage(db_kind, init_opts);
     const DB = xitdb.Database(db_kind, HashInt);
-    var db = try DB.init(init_opts);
+    var db = try initDb(db_kind, init_opts, legacy);
     var root_cursor = db.rootCursor();
 
     // enough items to force several tiers in both the array-list radix trie
@@ -3746,5 +3843,620 @@ fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         try std.testing.expect((try li.next()) == null);
         var ki = try linked.iteratorFrom(start);
         try std.testing.expect((try ki.next()) == null);
+    }
+}
+
+test "streaming" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    {
+        var source_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer source_buffer.deinit();
+        var replica_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer replica_buffer.deinit();
+        try testStreaming(
+            allocator,
+            .memory,
+            .{ .buffer = &source_buffer, .max_size = 50_000_000 },
+            .{ .buffer = &replica_buffer, .max_size = 50_000_000 },
+        );
+        try testStreamingRoots(
+            allocator,
+            .memory,
+            .{ .buffer = &source_buffer, .max_size = 50_000_000 },
+            .{ .buffer = &replica_buffer, .max_size = 50_000_000 },
+        );
+    }
+
+    {
+        const source_file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        const replica_file = try std.Io.Dir.cwd().createFile(io, "replica.db", .{ .read = true, .truncate = true });
+        defer {
+            replica_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "replica.db") catch {};
+        }
+        try testStreaming(
+            allocator,
+            .file,
+            .{ .file = source_file, .fsync = false },
+            .{ .file = replica_file, .fsync = false },
+        );
+        try testStreamingRoots(
+            allocator,
+            .file,
+            .{ .file = source_file, .fsync = false },
+            .{ .file = replica_file, .fsync = false },
+        );
+    }
+
+    {
+        var source_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer source_buffer.deinit();
+        var replica_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer replica_buffer.deinit();
+        const source_file = try std.Io.Dir.cwd().createFile(io, "main.db", .{ .read = true, .truncate = true });
+        defer {
+            source_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "main.db") catch {};
+        }
+        const replica_file = try std.Io.Dir.cwd().createFile(io, "replica.db", .{ .read = true, .truncate = true });
+        defer {
+            replica_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "replica.db") catch {};
+        }
+        try testStreaming(
+            allocator,
+            .buffered_file,
+            .{ .file = source_file, .buffer = &source_buffer, .fsync = false },
+            .{ .file = replica_file, .buffer = &replica_buffer, .fsync = false },
+        );
+        try testStreamingRoots(
+            allocator,
+            .buffered_file,
+            .{ .file = source_file, .buffer = &source_buffer, .fsync = false },
+            .{ .file = replica_file, .buffer = &replica_buffer, .fsync = false },
+        );
+    }
+
+    try testReplicaOfOtherFile(allocator);
+}
+
+// a replica is never extended with bytes from a file it isn't a replica of
+fn testReplicaOfOtherFile(allocator: std.mem.Allocator) !void {
+    const DB = xitdb.Database(.memory, HashInt);
+    var source_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer source_buffer.deinit();
+    var other_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer other_buffer.deinit();
+    var restored_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer restored_buffer.deinit();
+    var replica_buffer = std.Io.Writer.Allocating.init(allocator);
+    defer replica_buffer.deinit();
+
+    var source = try DB.init(std.testing.io, .{ .buffer = &source_buffer, .file_id = 1 });
+    var other = try DB.init(std.testing.io, .{ .buffer = &other_buffer, .file_id = 2 });
+    var replica = try DB.init(std.testing.io, .{ .buffer = &replica_buffer });
+
+    // the same writes give both files the same layout
+    var source_root = source.rootCursor();
+    try source_root.write(.{ .uint = 1 });
+    var other_root = other.rootCursor();
+    try other_root.write(.{ .uint = 1 });
+    try replicate(allocator, &source, &replica);
+
+    // the other file has a trailer where the replica's committed bytes end,
+    // but its checksum covers a different file ID, so the replica is replaced
+    try other_root.write(.{ .uint = 2 });
+    try std.testing.expectEqual(0, try other.replicationStart(try replica.replicaState()));
+
+    // and if its bytes are appended anyway, they are rejected
+    {
+        const start = try replica.committedSize();
+        const end = try other.committedSize();
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        try other.readCommitted(start, end, &buffer.writer);
+        var reader = std.Io.Reader.fixed(buffer.written());
+        try std.testing.expectError(error.InvalidDatabase, replica.applyReplicated(start, &reader, end - start));
+        try std.testing.expectEqual(start, try replica.committedSize());
+    }
+
+    // a source restored from an older copy keeps its file ID, but
+    // its history diverges, so the replica is replaced too
+    var restored = try DB.init(std.testing.io, .{ .buffer = &restored_buffer, .file_id = 1 });
+    var restored_root = restored.rootCursor();
+    try restored_root.write(.{ .uint = 3 });
+    try std.testing.expectEqual(0, try restored.replicationStart(try replica.replicaState()));
+
+    // copies of one file that write different data of the same size have the
+    // same layout, but every commit has a random ID, so their histories differ
+    {
+        var copy_a_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer copy_a_buffer.deinit();
+        var copy_b_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer copy_b_buffer.deinit();
+        var copy_replica_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer copy_replica_buffer.deinit();
+
+        var copy_a = try DB.init(std.testing.io, .{ .buffer = &copy_a_buffer, .file_id = 3 });
+        var copy_b = try DB.init(std.testing.io, .{ .buffer = &copy_b_buffer, .file_id = 3 });
+        var copy_replica = try DB.init(std.testing.io, .{ .buffer = &copy_replica_buffer });
+        var copy_a_root = copy_a.rootCursor();
+        try copy_a_root.write(.{ .bytes = "aaaaaaaaaaaa" });
+        var copy_b_root = copy_b.rootCursor();
+        try copy_b_root.write(.{ .bytes = "bbbbbbbbbbbb" });
+
+        try replicate(allocator, &copy_a, &copy_replica);
+        try std.testing.expectEqual(try copy_a.committedSize(), try copy_b.committedSize());
+        try std.testing.expectEqual(0, try copy_b.replicationStart(try copy_replica.replicaState()));
+        try replicate(allocator, &copy_b, &copy_replica);
+        var buffer: [16]u8 = undefined;
+        try std.testing.expectEqualStrings("bbbbbbbbbbbb", try copy_replica.rootCursor().readBytes(&buffer));
+    }
+
+    // while the real source only sends the new bytes
+    try source_root.write(.{ .uint = 2 });
+    try std.testing.expectEqual(try replica.committedSize(), try source.replicationStart(try replica.replicaState()));
+    try replicate(allocator, &source, &replica);
+    try expectSameCommittedBytes(allocator, &source, &replica);
+}
+
+fn readCommittedBytes(allocator: std.mem.Allocator, db: anytype, start: u64) ![]u8 {
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    errdefer buffer.deinit();
+    try db.readCommitted(start, try db.committedSize(), &buffer.writer);
+    return try buffer.toOwnedSlice();
+}
+
+// the replica sends its state, and the source sends back the bytes it doesn't
+// have yet (or all of them, if it isn't a replica of this source)
+fn replicate(allocator: std.mem.Allocator, source: anytype, replica: anytype) !void {
+    const start = try source.replicationStart(try replica.replicaState());
+    const end = try source.committedSize();
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+    try source.readCommitted(start, end, &buffer.writer);
+    var reader = std.Io.Reader.fixed(buffer.written());
+    try replica.applyReplicated(start, &reader, end - start);
+}
+
+// checks that no committed byte has changed since `committed` was read,
+// except the root header (the root slot and file size after the database
+// header and file ID). then replicates and checks that the replica is identical.
+fn expectAppendOnlyAndReplicate(allocator: std.mem.Allocator, source: anytype, replica: anytype, committed: *[]u8) !void {
+    const root_header_start = @bitSizeOf(xitdb.DatabaseHeader) / 8 + 8;
+    const root_header_end = root_header_start + 17;
+    {
+        const current = try readCommittedBytes(allocator, source, 0);
+        errdefer allocator.free(current);
+        try std.testing.expect(current.len >= committed.len);
+        try std.testing.expectEqualSlices(u8, committed.*[0..root_header_start], current[0..root_header_start]);
+        try std.testing.expectEqualSlices(u8, committed.*[root_header_end..], current[root_header_end..committed.len]);
+        allocator.free(committed.*);
+        committed.* = current;
+    }
+
+    try replicate(allocator, source, replica);
+    const replica_bytes = try readCommittedBytes(allocator, replica, 0);
+    defer allocator.free(replica_bytes);
+    try std.testing.expectEqualSlices(u8, committed.*, replica_bytes);
+}
+
+fn expectSameCommittedBytes(allocator: std.mem.Allocator, source: anytype, replica: anytype) !void {
+    const source_bytes = try readCommittedBytes(allocator, source, 0);
+    defer allocator.free(source_bytes);
+    const replica_bytes = try readCommittedBytes(allocator, replica, 0);
+    defer allocator.free(replica_bytes);
+    try std.testing.expectEqualSlices(u8, source_bytes, replica_bytes);
+}
+
+fn testStreaming(
+    allocator: std.mem.Allocator,
+    comptime db_kind: xitdb.DatabaseKind,
+    source_opts: xitdb.InitOpts(db_kind),
+    replica_opts: xitdb.InitOpts(db_kind),
+) !void {
+    const DB = xitdb.Database(db_kind, HashInt);
+    const Ctx = struct {
+        i: u64,
+        fail: bool = false,
+
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+            var key_buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "key-{}", .{self.i});
+            try moment.put(hashInt(key), .{ .uint = self.i });
+            const list = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+            try list.append(.{ .uint = self.i });
+            if (self.fail) return error.Fail;
+        }
+    };
+
+    try clearStorage(db_kind, source_opts);
+    try clearStorage(db_kind, replica_opts);
+
+    // a fixed file ID, so the bytes of the new database are known
+    var fixed_source_opts = source_opts;
+    fixed_source_opts.file_id = 0x0102030405060708;
+    var source = try DB.init(std.testing.io, fixed_source_opts);
+    var replica = try DB.init(std.testing.io, replica_opts);
+
+    // a new streaming database is its header, its file ID, its root header, and
+    // the trailer for its empty root: the slot (9 zero bytes), the commit ID (0 for
+    // the first commit), then the CRC-64/XZ of the file ID, the trailer's position
+    // (37), the slot, and the commit ID
+    {
+        const bytes = try readCommittedBytes(allocator, &source, 0);
+        defer allocator.free(bytes);
+        try std.testing.expectEqual(62, bytes.len);
+        try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 }, bytes[12..20]);
+        try std.testing.expectEqualSlices(u8, &.{
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd6, 0x18, 0x4e, 0x46, 0xb4, 0x7d, 0x29,
+            0x26,
+        }, bytes[37..]);
+    }
+
+    // new databases have their own random file IDs, so the
+    // first sync replaces the replica with a copy of the source
+    try std.testing.expectEqual(0, try source.replicationStart(try replica.replicaState()));
+    try replicate(allocator, &source, &replica);
+    try expectSameCommittedBytes(allocator, &source, &replica);
+
+    // older builds can't open streaming databases
+    try std.testing.expectEqual(1, source.header.version);
+
+    // the root slot carries the type of the top-level data
+    try std.testing.expectEqual(.none, source.header.tag);
+
+    const history = try DB.ArrayList(.read_write).init(source.rootCursor());
+
+    var committed = try readCommittedBytes(allocator, &source, 0);
+    defer allocator.free(committed);
+
+    // enough moments for the top-level array list to grow to three levels
+    for (0..300) |i| {
+        if (i == 200) {
+            // roll back the history
+            try history.slice(150);
+        } else if (i % 50 == 25) {
+            // a failed transaction
+            try std.testing.expectError(error.Fail, history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .i = i, .fail = true }));
+        } else {
+            try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .i = i });
+        }
+
+        try expectAppendOnlyAndReplicate(allocator, &source, &replica, &committed);
+    }
+
+    // `applyReplicated` must be given exactly the bytes up to a trailer.
+    // a short append fails and is overwritten by the next one.
+    {
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{ .i = 300 });
+        const start = try replica.committedSize();
+        const end = try source.committedSize();
+        const bytes = try readCommittedBytes(allocator, &source, start);
+        defer allocator.free(bytes);
+        var short_reader = std.Io.Reader.fixed(bytes[0 .. bytes.len - 1]);
+        try std.testing.expectError(error.InvalidDatabase, replica.applyReplicated(start, &short_reader, bytes.len - 1));
+        try std.testing.expectEqual(start, try replica.committedSize());
+        // and only committed bytes can be read, starting at 0 or after the root header
+        var discarding = std.Io.Writer.Discarding.init(&.{});
+        try std.testing.expectError(error.InvalidRange, source.readCommitted(start, end + 1, &discarding.writer));
+        try std.testing.expectError(error.InvalidRange, source.readCommitted(20, end, &discarding.writer));
+        try replicate(allocator, &source, &replica);
+        try expectSameCommittedBytes(allocator, &source, &replica);
+    }
+
+    // the replica can be reopened and read
+    replica = try DB.init(std.testing.io, replica_opts);
+    const source_history = try DB.ArrayList(.read_only).init(source.rootCursor().readOnly());
+    const replica_history = try DB.ArrayList(.read_only).init(replica.rootCursor().readOnly());
+    try std.testing.expectEqual(try source_history.count(), try replica_history.count());
+    const moment = try DB.HashMap(.read_only).init((try replica_history.getCursor(-1)).?);
+    try std.testing.expectEqual(299, try (try moment.getCursor(hashInt("key-299"))).?.readUint());
+    // removed by the slice
+    try std.testing.expectEqual(null, try moment.getCursor(hashInt("key-180")));
+    try std.testing.expectEqual(149, try (try moment.getCursor(hashInt("key-149"))).?.readUint());
+
+    // a compacted database is a new file, so a replica of it is seeded from byte 0
+    {
+        const MemoryDB = xitdb.Database(.memory, HashInt);
+        var target_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer target_buffer.deinit();
+        var compacted_replica_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer compacted_replica_buffer.deinit();
+        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+        defer offset_map.deinit();
+
+        var target = try source.compact(.memory, .{ .buffer = &target_buffer }, &offset_map);
+        var compacted_replica = try MemoryDB.init(std.testing.io, .{ .buffer = &compacted_replica_buffer });
+        try replicate(allocator, &target, &compacted_replica);
+        try expectSameCommittedBytes(allocator, &target, &compacted_replica);
+
+        // and it can keep receiving transactions
+        const target_history = try MemoryDB.ArrayList(.read_write).init(target.rootCursor());
+        try target_history.append(.{ .slot = try target_history.getSlot(-1) });
+        try replicate(allocator, &target, &compacted_replica);
+        try expectSameCommittedBytes(allocator, &target, &compacted_replica);
+
+        const compacted_history = try MemoryDB.ArrayList(.read_only).init(compacted_replica.rootCursor().readOnly());
+        try std.testing.expectEqual(2, try compacted_history.count());
+        const compacted_moment = try MemoryDB.HashMap(.read_only).init((try compacted_history.getCursor(-1)).?);
+        try std.testing.expectEqual(299, try (try compacted_moment.getCursor(hashInt("key-299"))).?.readUint());
+    }
+
+    // a database whose trailer doesn't match its header is invalid
+    {
+        const pos = try replica.committedSize() - 1;
+        var reader = replica.core.reader();
+        try reader.seekTo(pos);
+        const byte = try takeInt(&reader.interface, u8, .big);
+        var writer = replica.core.writer();
+        try writer.seekTo(pos);
+        try writer.interface.writeByte(~byte);
+        try replica.core.flush();
+        try std.testing.expectError(error.InvalidDatabase, DB.init(std.testing.io, replica_opts));
+    }
+}
+
+// in streaming mode, the root can be any type, not just an array list
+fn testStreamingRoots(
+    allocator: std.mem.Allocator,
+    comptime db_kind: xitdb.DatabaseKind,
+    source_opts: xitdb.InitOpts(db_kind),
+    replica_opts: xitdb.InitOpts(db_kind),
+) !void {
+    const DB = xitdb.Database(db_kind, HashInt);
+
+    // a hash map root
+    {
+        try clearStorage(db_kind, source_opts);
+        try clearStorage(db_kind, replica_opts);
+
+        var source = try DB.init(std.testing.io, source_opts);
+        var replica = try DB.init(std.testing.io, replica_opts);
+
+        const map = try DB.HashMap(.read_write).init(source.rootCursor());
+
+        // initializing an initialized root doesn't start a transaction
+        const size_after_init = try source.committedSize();
+        _ = try DB.HashMap(.read_write).init(source.rootCursor());
+        try std.testing.expectEqual(size_after_init, try source.committedSize());
+
+        // nor can the root be initialized as another type
+        try std.testing.expectError(error.UnexpectedTag, DB.ArrayList(.read_write).init(source.rootCursor()));
+        try std.testing.expectEqual(size_after_init, try source.committedSize());
+
+        var committed = try readCommittedBytes(allocator, &source, 0);
+        defer allocator.free(committed);
+
+        for (0..100) |i| {
+            var key_buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "key-{}", .{i});
+            try map.put(hashInt(key), .{ .uint = i });
+            if (i == 50) {
+                const removed_key = try std.fmt.bufPrint(&key_buffer, "key-{}", .{25});
+                try std.testing.expect(try map.remove(hashInt(removed_key)));
+            }
+
+            try expectAppendOnlyAndReplicate(allocator, &source, &replica, &committed);
+        }
+
+        // nested collections are written inside one transaction
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const inner = try DB.HashMap(.read_write).init(cursor.*);
+                try inner.put(hashInt("foo"), .{ .bytes = "foo" });
+                const list = try DB.ArrayList(.read_write).init(try inner.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                try list.append(.{ .uint = 2 });
+            }
+        };
+        _ = try map.cursor.writePath(Ctx, &.{
+            .{ .hash_map_get = .{ .value = hashInt("inner") } },
+            .{ .ctx = Ctx{} },
+        });
+        try replicate(allocator, &source, &replica);
+        try expectSameCommittedBytes(allocator, &source, &replica);
+
+        // `runContext` groups many writes into one transaction
+        {
+            const size_before = try source.committedSize();
+            const Batch = struct {
+                fail: bool,
+
+                pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                    const root = try DB.HashMap(.read_write).init(cursor.*);
+                    for (0..100) |i| {
+                        var key_buffer: [32]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buffer, "batch-{}", .{i});
+                        try root.put(hashInt(key), .{ .uint = i });
+                    }
+                    if (self.fail) return error.Fail;
+                }
+            };
+
+            // a failed transaction leaves nothing behind
+            try std.testing.expectError(error.Fail, source.runContext(Batch{ .fail = true }));
+            try std.testing.expectEqual(size_before, try source.committedSize());
+            try std.testing.expectEqual(null, try map.getCursor(hashInt("batch-0")));
+
+            // a successful one commits everything at once
+            try source.runContext(Batch{ .fail = false });
+            try std.testing.expect(try source.committedSize() > size_before);
+            try std.testing.expectEqual(0, try (try map.getCursor(hashInt("batch-0"))).?.readUint());
+            try std.testing.expectEqual(99, try (try map.getCursor(hashInt("batch-99"))).?.readUint());
+            try replicate(allocator, &source, &replica);
+            try expectSameCommittedBytes(allocator, &source, &replica);
+        }
+
+        // a nested write cursor can't be written to after its transaction
+        var late_cursor = try map.putCursor(hashInt("late"));
+        try std.testing.expectError(error.ExpectedTxStart, late_cursor.write(.{ .uint = 1 }));
+        try std.testing.expectError(error.ExpectedTxStart, DB.HashMap(.read_write).init(late_cursor));
+        try replicate(allocator, &source, &replica);
+        try expectSameCommittedBytes(allocator, &source, &replica);
+
+        // the replica can be reopened and read
+        replica = try DB.init(std.testing.io, replica_opts);
+        {
+            const replica_map = try DB.HashMap(.read_only).init(replica.rootCursor().readOnly());
+            try std.testing.expectEqual(99, try (try replica_map.getCursor(hashInt("key-99"))).?.readUint());
+            try std.testing.expectEqual(null, try replica_map.getCursor(hashInt("key-25")));
+            const inner = try DB.HashMap(.read_only).init((try replica_map.getCursor(hashInt("inner"))).?);
+            const list = try DB.ArrayList(.read_only).init((try inner.getCursor(hashInt("list"))).?);
+            try std.testing.expectEqual(2, try list.count());
+            try std.testing.expectEqual(2, try (try list.getCursor(-1)).?.readUint());
+        }
+
+        // it can be compacted
+        {
+            const MemoryDB = xitdb.Database(.memory, HashInt);
+            var target_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer target_buffer.deinit();
+            var compacted_replica_buffer = std.Io.Writer.Allocating.init(allocator);
+            defer compacted_replica_buffer.deinit();
+            var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+            defer offset_map.deinit();
+
+            var target = try replica.compact(.memory, .{ .buffer = &target_buffer }, &offset_map);
+            try std.testing.expect(target.header.streaming());
+            try std.testing.expect(try target.committedSize() < try replica.committedSize());
+
+            const target_map = try MemoryDB.HashMap(.read_only).init(target.rootCursor().readOnly());
+            try std.testing.expectEqual(99, try (try target_map.getCursor(hashInt("key-99"))).?.readUint());
+            try std.testing.expectEqual(null, try target_map.getCursor(hashInt("key-25")));
+            const inner = try MemoryDB.HashMap(.read_only).init((try target_map.getCursor(hashInt("inner"))).?);
+            const list = try MemoryDB.ArrayList(.read_only).init((try inner.getCursor(hashInt("list"))).?);
+            try std.testing.expectEqual(2, try list.count());
+
+            // a compacted database is a new file, so a replica of it is seeded from byte 0
+            var compacted_replica = try MemoryDB.init(std.testing.io, .{ .buffer = &compacted_replica_buffer });
+            try replicate(allocator, &target, &compacted_replica);
+            try expectSameCommittedBytes(allocator, &target, &compacted_replica);
+        }
+    }
+
+    // an array list root held by a wrapper stays current
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try DB.init(std.testing.io, source_opts);
+
+        const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+        try history.append(.{ .uint = 1 });
+        try history.append(.{ .uint = 2 });
+        try std.testing.expectEqual(2, try history.count());
+        var iter = try history.iterator();
+        var iter_count: usize = 0;
+        while (try iter.next()) |_| iter_count += 1;
+        try std.testing.expectEqual(2, iter_count);
+
+        // initializing an initialized root doesn't start a transaction
+        const size = try db.committedSize();
+        _ = try DB.ArrayList(.read_write).init(db.rootCursor());
+        try std.testing.expectEqual(size, try db.committedSize());
+    }
+
+    // a scalar root
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try DB.init(std.testing.io, source_opts);
+
+        const retained = db.rootCursor();
+        var root = db.rootCursor();
+        try root.write(.{ .uint = 42 });
+        try std.testing.expectEqual(42, try root.readUint());
+        try std.testing.expectEqual(42, try db.rootCursor().readUint());
+
+        // a root cursor kept from before the write sees the new root
+        // everywhere it reads its slot, not just in typed reads
+        try std.testing.expectEqual(42, try retained.readUint());
+        try std.testing.expectEqual(42, (try retained.slot()).value);
+        try std.testing.expectEqual(42, (try retained.readPathSlot(void, &.{})).?.value);
+        try std.testing.expectEqual(42, try (try retained.readPath(void, &.{})).?.readUint());
+
+        // the cursor stays a root cursor, so it can keep writing
+        try root.write(.{ .bytes = "this is too long to fit in a slot" });
+        var buffer: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("this is too long to fit in a slot", try db.rootCursor().readBytes(&buffer));
+
+        // bytes can't be streamed into the root
+        try std.testing.expectError(error.CursorNotWriteable, root.writer(&.{}));
+
+        // a scalar root can't be initialized as a collection
+        try std.testing.expectError(error.UnexpectedTag, DB.HashMap(.read_write).init(db.rootCursor()));
+
+        // but once it is cleared, it can
+        try root.write(.{ .slot = null });
+        const map = try DB.HashMap(.read_write).init(db.rootCursor());
+        try map.put(hashInt("foo"), .{ .uint = 1 });
+        try std.testing.expectEqual(1, try (try map.getCursor(hashInt("foo"))).?.readUint());
+    }
+
+    // a sorted map root
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try DB.init(std.testing.io, source_opts);
+
+        const map = try DB.SortedMap(.read_write).init(db.rootCursor());
+        try map.put("b", .{ .uint = 2 });
+        try map.put("a", .{ .uint = 1 });
+        try map.put("c", .{ .uint = 3 });
+        try std.testing.expect(try map.remove("c"));
+        try std.testing.expectEqual(2, try map.count());
+        try std.testing.expectEqual(1, try map.rank("b"));
+        try std.testing.expectEqual(1, try (try map.getCursor("a")).?.readUint());
+
+        const size = try db.committedSize();
+        _ = try DB.SortedMap(.read_write).init(db.rootCursor());
+        try std.testing.expectEqual(size, try db.committedSize());
+    }
+
+    // a linked array list root
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try DB.init(std.testing.io, source_opts);
+
+        const list = try DB.LinkedArrayList(.read_write).init(db.rootCursor());
+        try list.append(.{ .uint = 1 });
+        try list.append(.{ .uint = 3 });
+        try list.insert(1, .{ .uint = 2 });
+        try std.testing.expectEqual(3, try list.count());
+        try std.testing.expectEqual(2, try (try list.getCursor(1)).?.readUint());
+        try list.remove(0);
+        try std.testing.expectEqual(2, try (try list.getCursor(0)).?.readUint());
+
+        const size = try db.committedSize();
+        _ = try DB.LinkedArrayList(.read_write).init(db.rootCursor());
+        try std.testing.expectEqual(size, try db.committedSize());
+    }
+
+    // a legacy database whose root is a hash map can be compacted into a streaming one
+    {
+        try clearStorage(db_kind, source_opts);
+        var db = try initDb(db_kind, source_opts, true);
+        try std.testing.expect(!db.header.streaming());
+
+        const map = try DB.CountedHashMap(.read_write).init(db.rootCursor());
+        try map.put(hashInt("foo"), .{ .uint = 1 });
+        try map.put(hashInt("bar"), .{ .uint = 2 });
+
+        const MemoryDB = xitdb.Database(.memory, HashInt);
+        var target_buffer = std.Io.Writer.Allocating.init(allocator);
+        defer target_buffer.deinit();
+        var offset_map = std.AutoHashMap(u64, u64).init(allocator);
+        defer offset_map.deinit();
+        var target = try db.compact(.memory, .{ .buffer = &target_buffer }, &offset_map);
+        try std.testing.expect(target.header.streaming());
+        const target_map = try MemoryDB.CountedHashMap(.read_only).init(target.rootCursor().readOnly());
+        try std.testing.expectEqual(2, try target_map.count());
+        try std.testing.expectEqual(2, try (try target_map.getCursor(hashInt("bar"))).?.readUint());
     }
 }
