@@ -775,21 +775,22 @@ fn testHighLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
 
         const Ctx = struct {
             pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
-                var moment = try DB.HashMap(.read_write).init(cursor.*);
+                const moment = try DB.HashMap(.read_write).init(cursor.*);
 
                 const big_cities_cursor = try moment.putCursor(hashInt("big-cities"));
                 const big_cities = try DB.ArrayList(.read_write).init(big_cities_cursor);
                 try big_cities.append(.{ .bytes = "New York, NY" });
                 try big_cities.append(.{ .bytes = "Los Angeles, CA" });
 
-                // freeze here, so big-cities won't be mutated
-                try cursor.db.freeze();
-                moment = try DB.HashMap(.read_write).init(moment.cursor);
-
                 // create a new key called "cities" whose initial value is
                 // based on the "big-cities" list
                 var cities_cursor = try moment.putCursor(hashInt("cities"));
                 try cities_cursor.write(.{ .slot = try big_cities.slot() });
+
+                // freeze here, so writes to cities won't mutate big-cities
+                // note: you can also freeze globally with `cursor.db.freeze()`,
+                // but call it before `putCursor` creates the cities cursor
+                try cities_cursor.freeze();
 
                 const cities = try DB.ArrayList(.read_write).init(cities_cursor);
                 try cities.append(.{ .bytes = "Charleston, SC" });

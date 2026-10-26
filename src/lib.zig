@@ -823,16 +823,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
-        // whether the data at `ptr` predates this transaction, so it must be
-        // copied before it is modified. writes only happen inside a transaction.
-        fn isOld(self: *const Database(db_kind, HashInt), ptr: u64) !bool {
+        // whether the data at `ptr` predates this transaction, or the writing
+        // cursor's freeze point, so it must be copied before it is modified.
+        // writes only happen inside a transaction.
+        fn isOld(self: *const Database(db_kind, HashInt), ptr: u64, frozen_at: u64) !bool {
             const tx_start = self.tx_start orelse return error.ExpectedTxStart;
-            return ptr < tx_start;
+            return ptr < @max(tx_start, frozen_at);
         }
 
         // copies an index block to the end unless it was made in this transaction
-        fn copyIndexBlockIfOld(self: *Database(db_kind, HashInt), ptr: u64) !u64 {
-            if (!try self.isOld(ptr)) return ptr;
+        fn copyIndexBlockIfOld(self: *Database(db_kind, HashInt), ptr: u64, frozen_at: u64) !u64 {
+            if (!try self.isOld(ptr, frozen_at)) return ptr;
             var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
             var reader = self.core.reader();
             try reader.seekTo(ptr);
@@ -844,7 +845,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return next_ptr;
         }
 
-        fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer) !SlotPointer {
+        fn readSlotPointer(self: *Database(db_kind, HashInt), comptime write_mode: WriteMode, comptime Ctx: type, path: []const PathPart(Ctx), slot_ptr: SlotPointer, frozen_at: u64) !SlotPointer {
             const part = if (path.len > 0) path[0] else {
                 if (write_mode == .read_only and slot_ptr.slot.empty()) {
                     return error.KeyNotFound;
@@ -859,7 +860,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 // the position of a read path doesn't matter, but it must not be
                 // ROOT_HEADER_START or this would recurse forever
                 if (write_mode == .read_only) {
-                    return self.readSlotPointer(write_mode, Ctx, path, .{ .position = null, .slot = root });
+                    return self.readSlotPointer(write_mode, Ctx, path, .{ .position = null, .slot = root }, frozen_at);
                 }
 
                 // initializing an initialized root is free, so a wrapper like
@@ -892,10 +893,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 // block into the transaction before anything writes to it. the root
                 // has no enclosing init part, so run one here.
                 if (initPartFor(Ctx, root.tag)) |init_part| {
-                    root_ptr = try self.readSlotPointer(write_mode, Ctx, &.{init_part}, root_ptr);
+                    root_ptr = try self.readSlotPointer(write_mode, Ctx, &.{init_part}, root_ptr, frozen_at);
                 }
 
-                var result = try self.readSlotPointer(write_mode, Ctx, path, root_ptr);
+                var result = try self.readSlotPointer(write_mode, Ctx, path, root_ptr, frozen_at);
 
                 // the copy now holds the new root, so commit it
                 var reader = self.core.reader();
@@ -934,7 +935,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = array_list_start, .tag = .array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         .array_list => {
                             var reader = self.core.reader();
@@ -943,7 +944,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             var array_list_start = slot_ptr.slot.value;
 
                             // copy it to the end unless it was made in this transaction
-                            if (try self.isOld(array_list_start)) {
+                            if (try self.isOld(array_list_start, frozen_at)) {
                                 // read existing block
                                 try reader.seekTo(array_list_start);
                                 var header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
@@ -963,7 +964,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = array_list_start, .tag = .array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -990,9 +991,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
                     const last_key = header.size - 1;
                     const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
-                    const final_slot_ptr = try self.readArrayListSlot(header.ptr, key, shift, write_mode);
+                    const final_slot_ptr = try self.readArrayListSlot(header.ptr, key, shift, write_mode, frozen_at);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr, frozen_at);
                 },
                 .array_list_append => {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1007,12 +1008,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const orig_header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
 
                     // append
-                    const append_result = try self.readArrayListSlotAppend(orig_header, write_mode);
+                    const append_result = try self.readArrayListSlotAppend(orig_header, write_mode, frozen_at);
                     // update the header before callbacks can freeze it
                     var writer = self.core.writer();
                     try writer.seekTo(next_array_list_start);
                     try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(append_result.header), .big);
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], append_result.slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], append_result.slot_ptr, frozen_at);
                 },
                 .array_list_slice => |array_list_slice| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1027,12 +1028,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const orig_header: ArrayListHeader = @bitCast(try takeInt(&reader.interface, ArrayListHeaderInt, .big));
 
                     // slice
-                    const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size);
+                    const slice_header = try self.readArrayListSlice(orig_header, array_list_slice.size, frozen_at);
                     // update the header before callbacks can freeze it
                     var writer = self.core.writer();
                     try writer.seekTo(next_array_list_start);
                     try writer.interface.writeInt(ArrayListHeaderInt, @bitCast(slice_header), .big);
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr, frozen_at);
                 },
                 .linked_array_list_init => {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1051,7 +1052,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = .linked_array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         .linked_array_list => {
                             var header_ptr = slot_ptr.slot.value;
@@ -1059,7 +1060,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             // so past moments still pointing at the old header are unaffected.
                             // b-tree nodes are always appended, so only the header (updated in
                             // place by later operations in this tx) needs copying.
-                            if (try self.isOld(header_ptr)) {
+                            if (try self.isOld(header_ptr, frozen_at)) {
                                 var reader = self.core.reader();
                                 try reader.seekTo(header_ptr);
                                 const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
@@ -1070,7 +1071,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = .linked_array_list } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -1096,17 +1097,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (write_mode == .read_only) {
                         const final_slot_ptr = try self.readBTreeSlot(header.root_ptr, rank);
-                        return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr);
+                        return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr, frozen_at);
                     } else {
                         // path-copy down to the value slot so the write is persistent
-                        const write_slot = try self.btreeGetForWrite(header.root_ptr, rank);
+                        const write_slot = try self.btreeGetForWrite(header.root_ptr, rank, frozen_at);
                         // update the header before callbacks can freeze it
                         if (write_slot.node_ptr != header.root_ptr) {
                             var writer = self.core.writer();
                             try writer.seekTo(header_ptr);
                             try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = write_slot.node_ptr, .size = header.size }), .big);
                         }
-                        return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = write_slot.value_position, .slot = write_slot.slot });
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = write_slot.value_position, .slot = write_slot.slot }, frozen_at);
                     }
                 },
                 .linked_array_list_append => {
@@ -1119,7 +1120,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(header_ptr);
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    const result = try self.btreeInsert(header.root_ptr, header.size);
+                    const result = try self.btreeInsert(header.root_ptr, header.size, frozen_at);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
                     // update the header before filling in the value, so that a failure
@@ -1129,7 +1130,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
                     // fill in the value via the rest of the path
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} }, frozen_at);
                 },
                 .linked_array_list_slice => |linked_array_list_slice| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1159,7 +1160,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = linked_array_list_slice.size }), .big);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr, frozen_at);
                 },
                 .linked_array_list_concat => |linked_array_list_concat| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1188,7 +1189,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header_a.size + header_b.size }), .big);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr, frozen_at);
                 },
                 .linked_array_list_insert => |index| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1208,7 +1209,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     else
                         @intCast(index);
 
-                    const result = try self.btreeInsert(header.root_ptr, rank);
+                    const result = try self.btreeInsert(header.root_ptr, rank, frozen_at);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
                     // update the header before filling in the value, so that a failure
@@ -1217,7 +1218,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + 1 }), .big);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} });
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], .{ .position = result.value_position, .slot = .{} }, frozen_at);
                 },
                 .linked_array_list_remove => |index| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1238,8 +1239,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
 
                     const new_root_ptr = if (header.size == 1) try self.btreeNewRoot() else blk: {
-                        var root = try self.btreeRemove(header.root_ptr, rank);
-                        var root_ptr = try self.btreeWriteNode(root, header.root_ptr);
+                        var root = try self.btreeRemove(header.root_ptr, rank, frozen_at);
+                        var root_ptr = try self.btreeWriteNode(root, header.root_ptr, frozen_at);
                         // a root left with one child is replaced by it
                         while (root.kind == .branch and root.num == 1) {
                             root_ptr = root.children[0].value;
@@ -1254,7 +1255,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size - 1 }), .big);
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr, frozen_at);
                 },
                 .hash_map_init => |hash_map_init| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1281,7 +1282,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = map_start, .tag = tag } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => {
                             if (hash_map_init.counted) {
@@ -1302,7 +1303,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             var map_start = slot_ptr.slot.value;
 
                             // copy it to the end unless it was made in this transaction
-                            if (try self.isOld(map_start)) {
+                            if (try self.isOld(map_start, frozen_at)) {
                                 // read existing block
                                 try reader.seekTo(map_start);
                                 const map_count_maybe = if (hash_map_init.counted) try takeInt(&reader.interface, u64, .big) else null;
@@ -1319,7 +1320,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = map_start, .tag = tag } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -1336,9 +1337,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const index_pos = if (counted) slot_ptr.slot.value + byteSizeOf(u64) else slot_ptr.slot.value;
 
                     const res = switch (hash_map_get) {
-                        .kv_pair => |kv_pair| try self.readMapSlot(index_pos, kv_pair, 0, write_mode, .kv_pair),
-                        .key => |key| try self.readMapSlot(index_pos, key, 0, write_mode, .key),
-                        .value => |value| try self.readMapSlot(index_pos, value, 0, write_mode, .value),
+                        .kv_pair => |kv_pair| try self.readMapSlot(index_pos, kv_pair, 0, write_mode, .kv_pair, frozen_at),
+                        .key => |key| try self.readMapSlot(index_pos, key, 0, write_mode, .key, frozen_at),
+                        .value => |value| try self.readMapSlot(index_pos, value, 0, write_mode, .value, frozen_at),
                     };
 
                     if (write_mode == .read_write and counted and res.is_empty) {
@@ -1350,7 +1351,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         try writer.interface.writeInt(u64, map_count + 1, .big);
                     }
 
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], res.slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], res.slot_ptr, frozen_at);
                 },
                 .hash_map_remove => |key_hash| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1366,7 +1367,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const index_pos = if (counted) slot_ptr.slot.value + byteSizeOf(u64) else slot_ptr.slot.value;
 
                     var key_found = true;
-                    _ = self.removeMapSlot(index_pos, key_hash, 0) catch |err| switch (err) {
+                    _ = self.removeMapSlot(index_pos, key_hash, 0, frozen_at) catch |err| switch (err) {
                         error.KeyNotFound => key_found = false,
                         else => |e| return e,
                     };
@@ -1398,13 +1399,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = tag } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         .sorted_map, .sorted_set => {
                             if (slot_ptr.slot.tag != tag) return error.UnexpectedTag;
                             var header_ptr = slot_ptr.slot.value;
                             // copy the header into this transaction unless it was made in it
-                            if (try self.isOld(header_ptr)) {
+                            if (try self.isOld(header_ptr, frozen_at)) {
                                 var reader = self.core.reader();
                                 try reader.seekTo(header_ptr);
                                 const header_int = try takeInt(&reader.interface, BTreeHeaderInt, .big);
@@ -1415,7 +1416,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const next_slot_ptr = SlotPointer{ .position = position, .slot = .{ .value = header_ptr, .tag = tag } };
                             try writer.seekTo(position);
                             try writer.interface.writeInt(SlotInt, @bitCast(next_slot_ptr.slot), .big);
-                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                            return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         else => return error.UnexpectedTag,
                     }
@@ -1442,9 +1443,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (write_mode == .read_only) {
                         const found = (try self.sortedGet(header.root_ptr, key)) orelse return error.KeyNotFound;
                         const target_slot = try self.sortedTargetSlot(found.slot, target);
-                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                     } else {
-                        const result = try self.sortedPut(header.root_ptr, key);
+                        const result = try self.sortedPut(header.root_ptr, key, frozen_at);
                         const new_root_ptr = try self.sortedGrowRoot(result);
 
                         // update the header before filling in the value, so that a
@@ -1456,7 +1457,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + @as(u64, if (result.added) 1 else 0) }), .big);
 
                         const target_slot = try self.sortedTargetSlot(result.kv_slot, target);
-                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+                        return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                     }
                 },
                 .sorted_map_get_index => |index| {
@@ -1484,7 +1485,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const found = try self.sortedGetByIndex(header.root_ptr, rank);
                     // return the entry so the caller can read key and value
                     const target_slot = SlotPointer{ .position = found.position, .slot = found.slot };
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                 },
                 .sorted_map_remove => |key| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1500,7 +1501,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(header_ptr);
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    const result = try self.sortedRemove(header.root_ptr, key);
+                    const result = try self.sortedRemove(header.root_ptr, key, frozen_at);
                     if (!result.found) return error.KeyNotFound;
 
                     var writer = self.core.writer();
@@ -1555,7 +1556,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try core_writer.interface.writeInt(SlotInt, @bitCast(slot), .big);
 
                     const next_slot_ptr = SlotPointer{ .position = slot_ptr.position, .slot = slot };
-                    return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr);
+                    return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                 },
                 .ctx => |ctx| {
                     if (write_mode == .read_only) return error.WriteNotAllowed;
@@ -1568,6 +1569,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         var next_cursor = Cursor(.read_write){
                             .slot_ptr = slot_ptr,
                             .db = self,
+                            .frozen_at = frozen_at,
                         };
                         try ctx.run(&next_cursor);
                         return next_cursor.slot_ptr;
@@ -1583,7 +1585,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             is_empty: bool,
         };
 
-        fn readMapSlot(self: *Database(db_kind, HashInt), index_pos: u64, key_hash: HashInt, key_offset: u8, comptime write_mode: WriteMode, target: HashMapSlotKind) !HashMapGetResult {
+        fn readMapSlot(self: *Database(db_kind, HashInt), index_pos: u64, key_hash: HashInt, key_offset: u8, comptime write_mode: WriteMode, target: HashMapSlotKind, frozen_at: u64) !HashMapGetResult {
             if (key_offset >= (HASH_SIZE * 8) / BIT_COUNT) {
                 return error.KeyOffsetExceeded;
             }
@@ -1635,14 +1637,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .index => {
                     var next_ptr = ptr;
                     if (write_mode == .read_write) {
-                        next_ptr = try self.copyIndexBlockIfOld(ptr);
+                        next_ptr = try self.copyIndexBlockIfOld(ptr, frozen_at);
                         if (next_ptr != ptr) {
                             // make slot point to the copied block
                             try writer.seekTo(slot_pos);
                             try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
                         }
                     }
-                    return self.readMapSlot(next_ptr, key_hash, key_offset + 1, write_mode, target);
+                    return self.readMapSlot(next_ptr, key_hash, key_offset + 1, write_mode, target, frozen_at);
                 },
                 .kv_pair => {
                     try reader.seekTo(ptr);
@@ -1650,7 +1652,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     if (kv_pair.hash == key_hash) {
                         if (write_mode == .read_write) {
-                            if (try self.isOld(ptr)) {
+                            if (try self.isOld(ptr, frozen_at)) {
                                 // write hash and key/val slots
                                 const hash_pos = try self.core.length();
                                 const key_slot_pos = hash_pos + byteSizeOf(HashInt);
@@ -1699,7 +1701,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 try writer.interface.writeAll(&index_block);
                                 try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * next_i));
                                 try writer.interface.writeInt(SlotInt, @bitCast(slot), .big);
-                                const res = try self.readMapSlot(next_index_pos, key_hash, key_offset + 1, write_mode, target);
+                                const res = try self.readMapSlot(next_index_pos, key_hash, key_offset + 1, write_mode, target, frozen_at);
                                 try writer.seekTo(slot_pos);
                                 try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_index_pos, .tag = .index }), .big);
                                 return res;
@@ -1711,7 +1713,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        fn removeMapSlot(self: *Database(db_kind, HashInt), index_pos: u64, key_hash: HashInt, key_offset: u8) !Slot {
+        fn removeMapSlot(self: *Database(db_kind, HashInt), index_pos: u64, key_hash: HashInt, key_offset: u8, frozen_at: u64) !Slot {
             if (key_offset >= (HASH_SIZE * 8) / BIT_COUNT) {
                 return error.KeyOffsetExceeded;
             }
@@ -1738,7 +1740,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             // get the slot that will replace the current slot
             const next_slot: Slot = switch (slot.tag) {
                 .none => return error.KeyNotFound,
-                .index => try self.removeMapSlot(slot.value, key_hash, key_offset + 1),
+                .index => try self.removeMapSlot(slot.value, key_hash, key_offset + 1, frozen_at),
                 .kv_pair => blk: {
                     try reader.seekTo(slot.value);
                     const kv_pair: KeyValuePair = @bitCast(try takeInt(&reader.interface, KeyValuePairInt, .big));
@@ -1790,7 +1792,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             // there was more than one used slot, or a single .index slot,
             // so we must keep this index block. update the slot in it,
             // copying the block first unless it belongs to this transaction.
-            const next_index_pos = try self.copyIndexBlockIfOld(index_pos);
+            const next_index_pos = try self.copyIndexBlockIfOld(index_pos, frozen_at);
             try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * i));
             try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
             return .{ .value = next_index_pos, .tag = .index };
@@ -1803,7 +1805,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             slot_ptr: SlotPointer,
         };
 
-        fn readArrayListSlotAppend(self: *Database(db_kind, HashInt), header: ArrayListHeader, comptime write_mode: WriteMode) !ArrayListAppendResult {
+        fn readArrayListSlotAppend(self: *Database(db_kind, HashInt), header: ArrayListHeader, comptime write_mode: WriteMode, frozen_at: u64) !ArrayListAppendResult {
             var writer = self.core.writer();
 
             var index_pos = header.ptr;
@@ -1824,7 +1826,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 index_pos = next_index_pos;
             }
 
-            var slot_ptr = try self.readArrayListSlot(index_pos, key, next_shift, write_mode);
+            var slot_ptr = try self.readArrayListSlot(index_pos, key, next_shift, write_mode, frozen_at);
             // clear values left by a rollback or slice
             slot_ptr.slot = .{};
             try writer.seekTo(slot_ptr.position orelse unreachable);
@@ -1839,7 +1841,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
-        fn readArrayListSlot(self: *Database(db_kind, HashInt), index_pos: u64, key: u64, shift: u6, comptime write_mode: WriteMode) !SlotPointer {
+        fn readArrayListSlot(self: *Database(db_kind, HashInt), index_pos: u64, key: u64, shift: u6, comptime write_mode: WriteMode, frozen_at: u64) !SlotPointer {
             if (shift >= MAX_BRANCH_LENGTH) return error.MaxShiftExceeded;
 
             var reader = self.core.reader();
@@ -1868,14 +1870,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             try writer.interface.writeAll(&index_block);
                             try writer.seekTo(slot_pos);
                             try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_index_pos, .tag = .index }), .big);
-                            return try self.readArrayListSlot(next_index_pos, key, shift - 1, write_mode);
+                            return try self.readArrayListSlot(next_index_pos, key, shift - 1, write_mode, frozen_at);
                         },
                     }
                 },
                 .index => {
                     var next_ptr = ptr;
                     if (write_mode == .read_write) {
-                        next_ptr = try self.copyIndexBlockIfOld(ptr);
+                        next_ptr = try self.copyIndexBlockIfOld(ptr, frozen_at);
                         if (next_ptr != ptr) {
                             // make slot point to the copied block
                             var writer = self.core.writer();
@@ -1883,13 +1885,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_ptr, .tag = .index }), .big);
                         }
                     }
-                    return self.readArrayListSlot(next_ptr, key, shift - 1, write_mode);
+                    return self.readArrayListSlot(next_ptr, key, shift - 1, write_mode, frozen_at);
                 },
                 else => return error.UnexpectedTag,
             }
         }
 
-        fn readArrayListSlice(self: *Database(db_kind, HashInt), header: ArrayListHeader, size: u64) !ArrayListHeader {
+        fn readArrayListSlice(self: *Database(db_kind, HashInt), header: ArrayListHeader, size: u64, frozen_at: u64) !ArrayListHeader {
             var core_reader = self.core.reader();
 
             if (size > header.size) {
@@ -1919,7 +1921,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 // the new root may still belong to a past moment. unlike child
                 // nodes, root nodes are written directly, so copy it now.
-                index_pos = try self.copyIndexBlockIfOld(index_pos);
+                index_pos = try self.copyIndexBlockIfOld(index_pos, frozen_at);
                 return .{
                     .ptr = index_pos,
                     .size = size,
@@ -1984,19 +1986,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         // a node is safe to mutate in place when it was created in the current
-        // transaction (offset >= tx_start), since no committed moment and no
-        // pre-`concat` sharing can reference it. `concat` advances tx_start (an
-        // implicit freeze) precisely so its shared subtrees fall below it here.
-        fn btreeReusable(self: *Database(db_kind, HashInt), ptr: u64) bool {
+        // transaction after the writing cursor's freeze point (see `isOld`), since
+        // no committed moment and no pre-`concat` sharing can reference it. `concat`
+        // advances tx_start (an implicit freeze) precisely so its shared subtrees
+        // fall below it here.
+        fn btreeReusable(self: *Database(db_kind, HashInt), ptr: u64, frozen_at: u64) bool {
             // nothing can be reused outside a transaction
-            const old = self.isOld(ptr) catch return false;
+            const old = self.isOld(ptr, frozen_at) catch return false;
             return !old;
         }
 
         // write a new version of a node, reusing `old_ptr`'s position in place if
         // that node belongs to this transaction, otherwise appending a copy
-        fn btreeWriteNode(self: *Database(db_kind, HashInt), node: BTreeNode, old_ptr: u64) !u64 {
-            if (self.btreeReusable(old_ptr)) {
+        fn btreeWriteNode(self: *Database(db_kind, HashInt), node: BTreeNode, old_ptr: u64, frozen_at: u64) !u64 {
+            if (self.btreeReusable(old_ptr, frozen_at)) {
                 try self.writeBTreeNodeAt(node, old_ptr);
                 return old_ptr;
             }
@@ -2029,7 +2032,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // insert a placeholder slot at `rank` within the subtree at node_ptr,
         // writing new nodes along the path. the caller fills in the value at the
         // returned `value_position`.
-        fn btreeInsert(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeInsertResult {
+        fn btreeInsert(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeInsertResult {
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2047,7 +2050,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (total <= BTREE_SLOT_COUNT) {
                         var leaf = BTreeNode{ .kind = .leaf, .num = @intCast(total) };
                         @memcpy(leaf.values[0..total], vals[0..total]);
-                        const ptr = try self.btreeWriteNode(leaf, node_ptr);
+                        const ptr = try self.btreeWriteNode(leaf, node_ptr, frozen_at);
                         return .{
                             .node_ptr = ptr,
                             .count = total,
@@ -2063,7 +2066,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     @memcpy(left.values[0..left_n], vals[0..left_n]);
                     var right = BTreeNode{ .kind = .leaf, .num = @intCast(right_n) };
                     @memcpy(right.values[0..right_n], vals[left_n..total]);
-                    const left_ptr = try self.btreeWriteNode(left, node_ptr);
+                    const left_ptr = try self.btreeWriteNode(left, node_ptr, frozen_at);
                     const right_ptr = try self.writeBTreeNode(right);
                     const value_position = if (r < left_n)
                         left_ptr + BTREE_NODE_HEADER_SIZE + r * byteSizeOf(Slot)
@@ -2083,7 +2086,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
                         rem -= node.counts[i];
                     }
-                    const child = try self.btreeInsert(node.children[i].value, rem);
+                    const child = try self.btreeInsert(node.children[i].value, rem, frozen_at);
 
                     // rebuild this branch with the (possibly split) child
                     var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
@@ -2108,7 +2111,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         var branch = BTreeNode{ .kind = .branch, .num = @intCast(total) };
                         @memcpy(branch.children[0..total], children[0..total]);
                         @memcpy(branch.counts[0..total], counts[0..total]);
-                        const ptr = try self.btreeWriteNode(branch, node_ptr);
+                        const ptr = try self.btreeWriteNode(branch, node_ptr, frozen_at);
                         return .{
                             .node_ptr = ptr,
                             .count = branch.subtreeCount(),
@@ -2126,7 +2129,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var right = BTreeNode{ .kind = .branch, .num = @intCast(right_n) };
                     @memcpy(right.children[0..right_n], children[left_n..total]);
                     @memcpy(right.counts[0..right_n], counts[left_n..total]);
-                    const left_ptr = try self.btreeWriteNode(left, node_ptr);
+                    const left_ptr = try self.btreeWriteNode(left, node_ptr, frozen_at);
                     const right_ptr = try self.writeBTreeNode(right);
                     return .{
                         .node_ptr = left_ptr,
@@ -2163,11 +2166,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // nodes that belong to a past transaction. the element count is unchanged,
         // so when the whole path is already this-transaction nothing is rewritten
         // and the caller writes straight into the existing leaf.
-        fn btreeGetForWrite(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeWriteSlot {
+        fn btreeGetForWrite(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeWriteSlot {
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
-                    const new_ptr = if (self.btreeReusable(node_ptr)) node_ptr else try self.writeBTreeNode(node);
+                    const new_ptr = if (self.btreeReusable(node_ptr, frozen_at)) node_ptr else try self.writeBTreeNode(node);
                     return .{
                         .node_ptr = new_ptr,
                         .value_position = new_ptr + BTREE_NODE_HEADER_SIZE + rank * byteSizeOf(Slot),
@@ -2180,14 +2183,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
                         rem -= node.counts[i];
                     }
-                    const child = try self.btreeGetForWrite(node.children[i].value, rem);
+                    const child = try self.btreeGetForWrite(node.children[i].value, rem, frozen_at);
                     // if the child stayed put, this branch is unchanged too
                     if (child.node_ptr == node.children[i].value) {
                         return .{ .node_ptr = node_ptr, .value_position = child.value_position, .slot = child.slot };
                     }
                     var new_node = node;
                     new_node.children[i] = .{ .value = child.node_ptr, .tag = .index };
-                    const new_ptr = try self.btreeWriteNode(new_node, node_ptr);
+                    const new_ptr = try self.btreeWriteNode(new_node, node_ptr, frozen_at);
                     return .{ .node_ptr = new_ptr, .value_position = child.value_position, .slot = child.slot };
                 },
             }
@@ -2197,7 +2200,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // the node left behind for the caller to write. an emptied child is
         // dropped and a child left under half full is merged with a neighbor it
         // fits with, so every leaf stays at the same depth.
-        fn btreeRemove(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeNode {
+        fn btreeRemove(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeNode {
             var node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2213,7 +2216,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         rem -= node.counts[i];
                     }
                     const child_ptr = node.children[i].value;
-                    var child = try self.btreeRemove(child_ptr, rem);
+                    var child = try self.btreeRemove(child_ptr, rem, frozen_at);
                     if (child.num == 0) {
                         btreeDropChild(&node, i);
                         return node;
@@ -2228,7 +2231,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             i = first;
                         }
                     }
-                    node.children[i] = .{ .value = try self.btreeWriteNode(child, child_ptr), .tag = .index };
+                    node.children[i] = .{ .value = try self.btreeWriteNode(child, child_ptr, frozen_at), .tag = .index };
                     node.counts[i] = child.subtreeCount();
                 },
             }
@@ -2520,8 +2523,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // reuse old_ptr's position in place when it belongs to this transaction
         // (mirrors btreeWriteNode / the tx_start path-copying model)
-        fn sortedWriteNode(self: *Database(db_kind, HashInt), node: SortedNode, old_ptr: u64) !u64 {
-            if (self.btreeReusable(old_ptr)) {
+        fn sortedWriteNode(self: *Database(db_kind, HashInt), node: SortedNode, old_ptr: u64, frozen_at: u64) !u64 {
+            if (self.btreeReusable(old_ptr, frozen_at)) {
                 try self.writeSortedNodeAt(node, old_ptr);
                 return old_ptr;
             }
@@ -2713,7 +2716,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // insert `key` (or locate it for replacement) within the subtree at node_ptr,
         // path-copying nodes and maintaining separators + counts. the caller writes the
         // value of the returned entry.
-        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8) anyerror!SortedInsertResult {
+        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, frozen_at: u64) anyerror!SortedInsertResult {
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2741,11 +2744,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         // kv_pair if it belongs to a past moment
                         var leaf = node;
                         var kv_slot = node.entries[idx];
-                        if (!self.btreeReusable(kv_slot.value)) {
+                        if (!self.btreeReusable(kv_slot.value, frozen_at)) {
                             kv_slot = try self.writeKvPair(kv_slot.tag, try self.readKvPair(kv_slot));
                             leaf.entries[idx] = kv_slot;
                         }
-                        const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                        const ptr = try self.sortedWriteNode(leaf, node_ptr, frozen_at);
                         return .{ .node_ptr = ptr, .count = node.num, .kv_slot = kv_slot, .added = false, .split = null };
                     }
 
@@ -2760,7 +2763,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (total <= BTREE_SLOT_COUNT) {
                         var leaf = SortedNode{ .kind = .leaf, .num = @intCast(total) };
                         @memcpy(leaf.entries[0..total], entries[0..total]);
-                        const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                        const ptr = try self.sortedWriteNode(leaf, node_ptr, frozen_at);
                         return .{ .node_ptr = ptr, .count = total, .kv_slot = entry.kv_slot, .added = true, .split = null };
                     }
 
@@ -2773,7 +2776,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var right = SortedNode{ .kind = .leaf, .num = @intCast(right_n) };
                     @memcpy(right.entries[0..right_n], entries[left_n..total]);
                     const separator = (try self.readKvPair(entries[left_n])).key_slot;
-                    const left_ptr = try self.sortedWriteNode(left, node_ptr);
+                    const left_ptr = try self.sortedWriteNode(left, node_ptr, frozen_at);
                     const right_ptr = try self.writeSortedNode(right);
                     return .{
                         .node_ptr = left_ptr,
@@ -2786,7 +2789,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .branch => {
                     var i: u8 = 0;
                     while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
-                    const child = try self.sortedPut(node.children[i].value, key);
+                    const child = try self.sortedPut(node.children[i].value, key, frozen_at);
 
                     var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
                     var separators: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
@@ -2815,7 +2818,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @memcpy(branch.children[0..total], children[0..total]);
                         @memcpy(branch.separators[0..total], separators[0..total]);
                         @memcpy(branch.counts[0..total], counts[0..total]);
-                        const ptr = try self.sortedWriteNode(branch, node_ptr);
+                        const ptr = try self.sortedWriteNode(branch, node_ptr, frozen_at);
                         return .{ .node_ptr = ptr, .count = branch.subtreeCount(), .kv_slot = child.kv_slot, .added = child.added, .split = null };
                     }
 
@@ -2832,7 +2835,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     @memcpy(right.separators[0..right_n], separators[left_n..total]);
                     @memcpy(right.counts[0..right_n], counts[left_n..total]);
                     const separator = separators[left_n];
-                    const left_ptr = try self.sortedWriteNode(left, node_ptr);
+                    const left_ptr = try self.sortedWriteNode(left, node_ptr, frozen_at);
                     const right_ptr = try self.writeSortedNode(right);
                     return .{
                         .node_ptr = left_ptr,
@@ -2847,7 +2850,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // remove `key` from the subtree at node_ptr, path-copying nodes and
         // decrementing counts. an emptied leaf is left in place (see SortedRemoveResult).
-        fn sortedRemove(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8) anyerror!SortedRemoveResult {
+        fn sortedRemove(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, frozen_at: u64) anyerror!SortedRemoveResult {
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2870,19 +2873,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var leaf = SortedNode{ .kind = .leaf, .num = node.num - 1 };
                     @memcpy(leaf.entries[0..idx], node.entries[0..idx]);
                     @memcpy(leaf.entries[idx .. node.num - 1], node.entries[idx + 1 .. node.num]);
-                    const ptr = try self.sortedWriteNode(leaf, node_ptr);
+                    const ptr = try self.sortedWriteNode(leaf, node_ptr, frozen_at);
                     return .{ .node_ptr = ptr, .found = true };
                 },
                 .branch => {
                     var i: u8 = 0;
                     while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
-                    const child = try self.sortedRemove(node.children[i].value, key);
+                    const child = try self.sortedRemove(node.children[i].value, key, frozen_at);
                     if (!child.found) return .{ .node_ptr = node_ptr, .found = false };
 
                     var branch = node;
                     branch.children[i] = .{ .value = child.node_ptr, .tag = .index };
                     branch.counts[i] -= 1;
-                    const ptr = try self.sortedWriteNode(branch, node_ptr);
+                    const ptr = try self.sortedWriteNode(branch, node_ptr, frozen_at);
                     return .{ .node_ptr = ptr, .found = true };
                 },
             }
@@ -2929,6 +2932,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return struct {
                 slot_ptr: SlotPointer,
                 db: *Database(db_kind, HashInt),
+                // writes through this cursor copy any data written before this
+                // position, even within the transaction (see `freeze`)
+                frozen_at: u64 = 0,
 
                 pub const Reader = struct {
                     parent: *Cursor(write_mode),
@@ -3079,7 +3085,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn resolvedCursor(self: Cursor(write_mode)) !Cursor(write_mode) {
-                    return .{ .slot_ptr = try self.resolved(), .db = self.db };
+                    return .{ .slot_ptr = try self.resolved(), .db = self.db, .frozen_at = self.frozen_at };
                 }
 
                 pub fn readOnly(self: Cursor(.read_write)) Cursor(.read_only) {
@@ -3090,7 +3096,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readPath(self: Cursor(write_mode), comptime Ctx: type, path: []const PathPart(Ctx)) !?Cursor(.read_only) {
-                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved()) catch |err| {
+                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved(), self.frozen_at) catch |err| {
                         switch (err) {
                             error.KeyNotFound => return null,
                             else => |e| return e,
@@ -3103,7 +3109,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn readPathSlot(self: Cursor(write_mode), comptime Ctx: type, path: []const PathPart(Ctx)) !?Slot {
-                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved()) catch |err| {
+                    const slot_ptr = self.db.readSlotPointer(.read_only, Ctx, path, try self.resolved(), self.frozen_at) catch |err| {
                         switch (err) {
                             error.KeyNotFound => return null,
                             else => |e| return e,
@@ -3125,7 +3131,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     if (self.db.tx_start != null and isRoot(self.slot_ptr) and path.len > 0) {
                         return error.NestedTopLevelWrite;
                     }
-                    const slot_ptr = self.db.readSlotPointer(.read_write, Ctx, path, self.slot_ptr) catch |err| {
+                    // an earlier write through this cursor may have moved what its
+                    // slot points to, so start from what the slot holds now
+                    var start = self.slot_ptr;
+                    if (!isRoot(start)) {
+                        if (start.position) |position| {
+                            var core_reader = self.db.core.reader();
+                            try core_reader.seekTo(position);
+                            start.slot = @bitCast(try takeInt(&core_reader.interface, SlotInt, .big));
+                            try start.slot.tag.validate();
+                        }
+                    }
+                    const slot_ptr = self.db.readSlotPointer(.read_write, Ctx, path, start, self.frozen_at) catch |err| {
                         // only truncate when the error escapes the outer write.
                         // a nested callback's caller may still commit its work.
                         if (self.db.tx_start == null) {
@@ -3139,7 +3156,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{
                         .slot_ptr = slot_ptr,
                         .db = self.db,
+                        .frozen_at = self.frozen_at,
                     };
+                }
+
+                /// makes writes through this cursor, and cursors made from it afterward,
+                /// copy what the transaction wrote so far instead of changing it in
+                /// place. call it after pointing this slot at data still referred to
+                /// elsewhere, and before wrapping the cursor in a collection, which keeps
+                /// its own copy. unlike `Database.freeze`, other cursors keep writing in place.
+                pub fn freeze(self: *Cursor(.read_write)) !void {
+                    if (self.db.tx_start == null) return error.ExpectedTxStart;
+                    self.frozen_at = try self.db.core.length();
                 }
 
                 pub fn readUint(self: Cursor(write_mode)) !u64 {
@@ -3294,8 +3322,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const value_slot_pos = key_slot_pos + byteSizeOf(Slot);
 
                     return .{
-                        .value_cursor = .{ .slot_ptr = .{ .position = value_slot_pos, .slot = kv_pair.value_slot }, .db = self.db },
-                        .key_cursor = .{ .slot_ptr = .{ .position = key_slot_pos, .slot = kv_pair.key_slot }, .db = self.db },
+                        .value_cursor = .{ .slot_ptr = .{ .position = value_slot_pos, .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .key_cursor = .{ .slot_ptr = .{ .position = key_slot_pos, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         .hash = kv_pair.hash,
                     };
                 }
@@ -3750,6 +3778,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                         return .{
                                             .slot_ptr = .{ .position = position, .slot = next_slot },
                                             .db = self.cursor.db,
+                                            .frozen_at = self.cursor.frozen_at,
                                         };
                                     } else {
                                         continue;
