@@ -1237,10 +1237,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     else
                         @intCast(index);
 
-                    // remove = join the parts before and after the removed element
-                    const before = try self.btreeSplit(header.root_ptr, rank);
-                    const after = try self.btreeSplit(before.right, 1);
-                    const new_root_ptr = try self.btreeJoin(before.left, after.right);
+                    const new_root_ptr = if (header.size == 1) try self.btreeNewRoot() else blk: {
+                        var root = try self.btreeRemove(header.root_ptr, rank);
+                        var root_ptr = try self.btreeWriteNode(root, header.root_ptr);
+                        // a root left with one child is replaced by it
+                        while (root.kind == .branch and root.num == 1) {
+                            root_ptr = root.children[0].value;
+                            root = try self.readBTreeNode(root_ptr);
+                        }
+                        break :blk root_ptr;
+                    };
 
                     // update the header before recursing into the rest of the path, so
                     // that a failure there leaves the tree and header consistent
@@ -2187,6 +2193,70 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
+        // remove the element at `rank` within the subtree at node_ptr, returning
+        // the node left behind for the caller to write. an emptied child is
+        // dropped and a child left under half full is merged with a neighbor it
+        // fits with, so every leaf stays at the same depth.
+        fn btreeRemove(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64) anyerror!BTreeNode {
+            var node = try self.readBTreeNode(node_ptr);
+            switch (node.kind) {
+                .leaf => {
+                    const r: usize = @intCast(rank);
+                    std.mem.copyForwards(Slot, node.values[r .. node.num - 1], node.values[r + 1 .. node.num]);
+                    node.num -= 1;
+                    node.values[node.num] = .{};
+                },
+                .branch => {
+                    var i: u8 = 0;
+                    var rem = rank;
+                    while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
+                        rem -= node.counts[i];
+                    }
+                    const child_ptr = node.children[i].value;
+                    var child = try self.btreeRemove(child_ptr, rem);
+                    if (child.num == 0) {
+                        btreeDropChild(&node, i);
+                        return node;
+                    }
+                    if (child.num < BTREE_SPLIT_COUNT and node.num > 1) {
+                        // the pair is i and its right neighbor, or its left one if it is last
+                        const first = if (i + 1 < node.num) i else i - 1;
+                        const neighbor = try self.readBTreeNode(node.children[if (first == i) i + 1 else first].value);
+                        if (child.num + neighbor.num <= BTREE_SLOT_COUNT) {
+                            child = if (first == i) btreeConcatNodes(child, neighbor) else btreeConcatNodes(neighbor, child);
+                            btreeDropChild(&node, first + 1);
+                            i = first;
+                        }
+                    }
+                    node.children[i] = .{ .value = try self.btreeWriteNode(child, child_ptr), .tag = .index };
+                    node.counts[i] = child.subtreeCount();
+                },
+            }
+            return node;
+        }
+
+        fn btreeDropChild(branch: *BTreeNode, i: usize) void {
+            std.mem.copyForwards(Slot, branch.children[i .. branch.num - 1], branch.children[i + 1 .. branch.num]);
+            std.mem.copyForwards(u64, branch.counts[i .. branch.num - 1], branch.counts[i + 1 .. branch.num]);
+            branch.num -= 1;
+            branch.children[branch.num] = .{};
+            branch.counts[branch.num] = 0;
+        }
+
+        // two nodes of the same kind whose entries fit in one node, a before b
+        fn btreeConcatNodes(a: BTreeNode, b: BTreeNode) BTreeNode {
+            var node = a;
+            switch (a.kind) {
+                .leaf => @memcpy(node.values[a.num .. a.num + b.num], b.values[0..b.num]),
+                .branch => {
+                    @memcpy(node.children[a.num .. a.num + b.num], b.children[0..b.num]);
+                    @memcpy(node.counts[a.num .. a.num + b.num], b.counts[0..b.num]);
+                },
+            }
+            node.num = a.num + b.num;
+            return node;
+        }
+
         // join (concat): a true O(log n), structure-sharing concatenation of two
         // trees where every element of `a` precedes every element of `b`. unlike
         // the rebuild helpers above, untouched subtrees are shared by pointer, so
@@ -2347,7 +2417,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return try self.btreeMakeRoot(result);
         }
 
-        // split (used by slice and remove): a true O(log n), structure-sharing
+        // split (used by slice): a true O(log n), structure-sharing
         // split of a tree into [0, rank) and [rank, size). partial nodes along the
         // path are reassembled with join, so the result trees stay balanced.
 
