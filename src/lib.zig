@@ -218,9 +218,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // immutable, and a replica stays in sync by copying the bytes it doesn't have.
         const ROOT_HEADER_START = byteSizeOf(DatabaseHeader);
         const ROOT_HEADER_END = ROOT_HEADER_START + byteSizeOf(RootHeader);
+        const ROOT_HEADER_FILE_SIZE_START = ROOT_HEADER_START + byteSizeOf(Slot);
 
         // rewritten at every commit, as a cache of the latest trailer.
         // it is written big endian, so the root slot comes first on disk.
+        // we only read `file_size`, which lets us read the trailer. other xitdb
+        // implementations may read the whole header to avoid that extra read,
+        // but that increases the risk of a concurrent commit tearing it.
         const RootHeaderInt = u136;
         const RootHeader = packed struct {
             file_size: u64,
@@ -717,23 +721,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         /// the number of bytes that belong to committed transactions. they never
         /// change except for the root header (see `readCommitted`).
         pub fn committedSize(self: *Database(db_kind, HashInt)) !u64 {
-            const header = try self.readRootHeader();
-            const minimum_size = ROOT_HEADER_END + byteSizeOf(RootTrailer);
-            if (header.file_size < minimum_size) return error.InvalidDatabase;
-            if (try self.core.length() < header.file_size) return error.TruncatedDatabase;
-            // the committed bytes must end with a trailer matching the header
-            if (!std.meta.eql((try self.readRootTrailer(header.file_size)).root, header.root)) {
-                return error.InvalidDatabase;
-            }
-            return header.file_size;
+            return (try self.readRootHeader()).file_size;
         }
 
+        // the file size from the root header, and the root slot from the trailer it points to
         fn readRootHeader(self: *Database(db_kind, HashInt)) !RootHeader {
             var reader = self.core.reader();
-            try reader.seekTo(ROOT_HEADER_START);
-            const header: RootHeader = @bitCast(try takeInt(&reader.interface, RootHeaderInt, .big));
-            try header.root.tag.validate();
-            return header;
+            try reader.seekTo(ROOT_HEADER_FILE_SIZE_START);
+            const file_size = try takeInt(&reader.interface, u64, .big);
+            const minimum_size = ROOT_HEADER_END + byteSizeOf(RootTrailer);
+            if (file_size < minimum_size) return error.InvalidDatabase;
+            if (try self.core.length() < file_size) return error.TruncatedDatabase;
+            // the committed bytes must end with a trailer
+            return .{ .file_size = file_size, .root = (try self.readRootTrailer(file_size)).root };
         }
 
         // the most recently committed root slot
@@ -3077,7 +3077,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 fn resolved(self: Cursor(write_mode)) !SlotPointer {
                     if (isRoot(self.slot_ptr)) {
                         const header = try self.db.readRootHeader();
-                        if (header.file_size < byteSizeOf(RootTrailer)) return error.InvalidDatabase;
                         // the root slot is the first thing in the trailer
                         return .{ .position = header.file_size - byteSizeOf(RootTrailer), .slot = header.root };
                     }
