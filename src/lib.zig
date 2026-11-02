@@ -4437,6 +4437,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     });
                 }
 
+                pub fn appendContext(self: LinkedArrayList(.read_write), data: WriteableData, ctx: anytype) !void {
+                    const Ctx = @TypeOf(ctx);
+                    _ = try self.cursor.writePath(Ctx, &.{
+                        .linked_array_list_append,
+                        .{ .write = data },
+                        .{ .ctx = ctx },
+                    });
+                }
+
                 pub fn slice(self: LinkedArrayList(.read_write), offset: u64, size: u64) !void {
                     _ = try self.cursor.writePath(void, &.{
                         .{ .linked_array_list_slice = .{ .offset = offset, .size = size } },
