@@ -18,7 +18,7 @@
 * No query engine of any kind. You just write data structures (primarily an `ArrayList` and `HashMap`) that can be nested arbitrarily.
 * No dependencies besides the Zig standard library (requires version 0.17.0).
 
-This database was originally made for the [xit version control system](https://github.com/xit-vcs/xit), but I bet it has a lot of potential for other projects. The combination of being immutable and having an API similar to in-memory data structures is pretty powerful. Consider using it [instead of SQLite](https://gist.github.com/xeubie/03a0724484e1111ef4c05d72a935c42c) for your Zig projects: it's simpler, it's pure Zig, and it creates no impedance mismatch with your program the way SQL databases do.
+This database was originally made for the [xit version control system](https://github.com/xit-vcs/xit), but I bet it has a lot of potential for other projects. The combination of being immutable and having an API similar to in-memory data structures is pretty powerful. Consider using it instead of SQLite for your Zig projects: it's simpler, it's pure Zig, and it creates no impedance mismatch with your program the way SQL databases do. Check out [xitdb.net](https://xitdb.net/zig.html) and the video [My SQLite killer was a happy accident](https://www.youtube.com/watch?v=YRUF-EaTFFM).
 
 * [Example](#example)
 * [Initializing a Database](#initializing-a-database)
@@ -673,6 +673,40 @@ try offsets_db.runContext(Ctx{
 const history = try DB.ArrayList(.read_only).init(compact_db.rootCursor().readOnly());
 try std.testing.expectEqual(1, try history.count());
 ```
+
+You may be wondering if there is a way to evict certain pieces of data without losing all of your database's history. For example, imagine your moment contains a list of people:
+
+```json
+{
+  "people": [
+    {"name": "Alice", "age": 25},
+    {"name": "Bob", "age": 42}
+  ]
+}
+```
+
+If Alice asks you to delete her data, you can remove her from the latest moment and compact the database. Her data will be gone, but so will all of your past moments, including every past version of Bob.
+
+It's important to realize that the top-level history ArrayList isn't the only place you can keep history. It's the only one compaction discards, so you are free to track history of specific things within your moment. The `people` ArrayList can contain ArrayLists tracking the history of changes for each person individually.
+
+Additionally, you can have a "global" internal history ArrayList (`versions` below), where each item is a list of integers that are indexes into each person's history. Here is what the moment looks like after Bob turns 43:
+
+```json
+{
+  "people": [
+    [{"name": "Alice", "age": 25}],
+    [{"name": "Bob", "age": 42}, {"name": "Bob", "age": 43}]
+  ],
+  "versions": [
+    [0, 0],
+    [0, 1]
+  ]
+}
+```
+
+Each item in `versions` is a snapshot of the database, with one integer per person that is an index into their list. For example, the last version says that Alice is `people[0][0]` and Bob is `people[1][1]`.
+
+Compaction can't follow an integer, so `people` is the only way to reach Alice's data. To evict her, you just clear her slot with `people.put(alice_id, .{ .slot = null })`, compact the database, then delete the original. Every past version of Bob will still be there, but you'll need to handle the integers that no longer lead anywhere when reading a version.
 
 ## Replication
 
