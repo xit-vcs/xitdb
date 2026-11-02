@@ -277,9 +277,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             key_slot: Slot,
         };
 
-        // where the key slot is in a .kv_pair or .sorted_kv_pair entry. the value slot follows it.
-        fn kvKeyOffset(tag: Tag) u64 {
-            return if (tag == .kv_pair) byteSizeOf(HashInt) else 0;
+        fn isKeyOnlyEntry(entry: Slot) bool {
+            return entry.tag == .bytes or entry.tag == .short_bytes;
+        }
+
+        // where a key-value entry's key slot is. a key-only entry has no separate slot.
+        fn kvKeyPosition(entry: Slot) ?u64 {
+            if (isKeyOnlyEntry(entry)) return null;
+            return entry.value + @as(u64, if (entry.tag == .kv_pair) byteSizeOf(HashInt) else 0);
+        }
+
+        // where a key-value entry's value slot is. it follows the key slot.
+        fn kvValuePosition(entry: Slot) ?u64 {
+            const key_position = kvKeyPosition(entry) orelse return null;
+            return key_position + byteSizeOf(Slot);
         }
 
         const BTREE_SLOT_COUNT = SLOT_COUNT; // max entries per leaf / children per branch
@@ -337,7 +348,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         const SortedNodeKind = enum(u8) { leaf, branch };
 
         // on-disk node block: [kind: u8][num: u8] followed by, for a leaf,
-        // BTREE_SLOT_COUNT .sorted_kv_pair slots (entries in ascending key order);
+        // BTREE_SLOT_COUNT entry slots in ascending key order (see `readKvPair`);
         // for a branch, BTREE_SLOT_COUNT child slots (.index), then BTREE_SLOT_COUNT
         // separator slots (a bytes/short_bytes slot = the smallest key in that
         // child's subtree; separators[0] is an unused sentinel), then
@@ -361,12 +372,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         };
 
-        // insert/replace result: the entry whose value to write, whether a new entry
+        // insert/replace result: the entry to read or write, whether a new entry
         // was added (vs replacing), and the new right sibling if this node split
         const SortedInsertResult = struct {
             node_ptr: u64,
             count: u64,
-            kv_slot: Slot,
+            entry: Slot,
             added: bool,
             split: ?struct { node_ptr: u64, count: u64, separator: Slot },
         };
@@ -1402,7 +1413,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             return self.readSlotPointer(write_mode, Ctx, path[1..], next_slot_ptr, frozen_at);
                         },
                         .sorted_map, .sorted_set => {
-                            if (slot_ptr.slot.tag != tag) return error.UnexpectedTag;
                             var header_ptr = slot_ptr.slot.value;
                             // copy the header into this transaction unless it was made in it
                             if (try self.isOld(header_ptr, frozen_at)) {
@@ -1445,7 +1455,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         const target_slot = try self.sortedTargetSlot(found.slot, target);
                         return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                     } else {
-                        const result = try self.sortedPut(header.root_ptr, key, frozen_at);
+                        // only a set that is just touching the key can leave out the value
+                        const key_only = slot_ptr.slot.tag == .sorted_set and target == .key;
+                        const result = try self.sortedPut(header.root_ptr, key, key_only, frozen_at);
                         const new_root_ptr = try self.sortedGrowRoot(result);
 
                         // update the header before filling in the value, so that a
@@ -1456,7 +1468,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         try writer.seekTo(header_ptr);
                         try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header.size + @as(u64, if (result.added) 1 else 0) }), .big);
 
-                        const target_slot = try self.sortedTargetSlot(result.kv_slot, target);
+                        const target_slot = try self.sortedTargetSlot(result.entry, target);
                         return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                     }
                 },
@@ -2558,10 +2570,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        fn readKvPair(self: *Database(db_kind, HashInt), kv_slot: Slot) !KeyValuePair {
+        // reads a key-value entry, which is one of these:
+        // 1. a .bytes or .short_bytes slot: the key by itself, stored directly in a
+        //    sorted set's leaf. it has no value slot, so its value is empty.
+        // 2. a .kv_pair or .sorted_kv_pair slot: a pointer to the key and value.
+        // sorted maps and sets can be reinterpreted as each other, so one leaf can
+        // contain both. always look at the entry's tag, not the container's. a cursor
+        // doesn't know its container, so any bytes can be read as a key-only entry.
+        fn readKvPair(self: *Database(db_kind, HashInt), entry: Slot) !KeyValuePair {
+            if (isKeyOnlyEntry(entry)) return .{ .value_slot = .{}, .key_slot = entry, .hash = 0 };
             var reader = self.core.reader();
-            try reader.seekTo(kv_slot.value);
-            return decodeKvPair(&reader.interface, kv_slot.tag);
+            try reader.seekTo(entry.value);
+            return decodeKvPair(&reader.interface, entry.tag);
         }
 
         // writes a .kv_pair or .sorted_kv_pair entry at the end and returns its slot
@@ -2702,21 +2722,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return .{ .value = pos, .tag = .bytes };
         }
 
-        const SortedEntry = struct { kv_slot: Slot, key_slot: Slot };
-
-        // materialize a new leaf entry: write the key bytes and a key-value pair with
-        // an empty value (the caller fills it in). navigation is by key bytes, so the
-        // entry has no hash.
-        fn sortedNewEntry(self: *Database(db_kind, HashInt), key: []const u8) !SortedEntry {
-            const key_slot = try self.writeKey(key);
-            const kv_slot = try self.writeKvPair(.sorted_kv_pair, .{ .value_slot = .{}, .key_slot = key_slot, .hash = 0 });
-            return .{ .kv_slot = kv_slot, .key_slot = key_slot };
+        // wraps a key slot in a new key-value pair with an empty value (the caller
+        // fills it in). navigation is by key bytes, so the pair has no hash.
+        fn writeSortedPair(self: *Database(db_kind, HashInt), key_slot: Slot) !Slot {
+            return try self.writeKvPair(.sorted_kv_pair, .{ .value_slot = .{}, .key_slot = key_slot, .hash = 0 });
         }
 
         // insert `key` (or locate it for replacement) within the subtree at node_ptr,
         // path-copying nodes and maintaining separators + counts. the caller writes the
-        // value of the returned entry.
-        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, frozen_at: u64) anyerror!SortedInsertResult {
+        // value of the returned entry, unless `key_only` is true. in that case, a new key
+        // is stored as a key-only entry, and an existing entry is left alone. otherwise,
+        // the returned entry is a key-value pair with a writeable value.
+        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, key_only: bool, frozen_at: u64) anyerror!SortedInsertResult {
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2740,23 +2757,28 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     if (found) {
-                        // replace: return a writable value slot, copy-on-writing the
-                        // kv_pair if it belongs to a past moment
+                        if (key_only) return .{ .node_ptr = node_ptr, .count = node.num, .entry = node.entries[idx], .added = false, .split = null };
+
+                        // replace: return a writable value slot, moving a key-only entry
+                        // into a pair or copy-on-writing a pair from a past moment
                         var leaf = node;
-                        var kv_slot = node.entries[idx];
-                        if (!self.btreeReusable(kv_slot.value, frozen_at)) {
-                            kv_slot = try self.writeKvPair(kv_slot.tag, try self.readKvPair(kv_slot));
-                            leaf.entries[idx] = kv_slot;
+                        var entry = node.entries[idx];
+                        if (isKeyOnlyEntry(entry)) {
+                            entry = try self.writeSortedPair(entry);
+                        } else if (!self.btreeReusable(entry.value, frozen_at)) {
+                            entry = try self.writeKvPair(entry.tag, try self.readKvPair(entry));
                         }
+                        leaf.entries[idx] = entry;
                         const ptr = try self.sortedWriteNode(leaf, node_ptr, frozen_at);
-                        return .{ .node_ptr = ptr, .count = node.num, .kv_slot = kv_slot, .added = false, .split = null };
+                        return .{ .node_ptr = ptr, .count = node.num, .entry = entry, .added = false, .split = null };
                     }
 
                     // insert a new entry at idx
-                    const entry = try self.sortedNewEntry(key);
+                    const key_slot = try self.writeKey(key);
+                    const entry = if (key_only) key_slot else try self.writeSortedPair(key_slot);
                     var entries: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
                     @memcpy(entries[0..idx], node.entries[0..idx]);
-                    entries[idx] = entry.kv_slot;
+                    entries[idx] = entry;
                     @memcpy(entries[idx + 1 .. node.num + 1], node.entries[idx..node.num]);
                     const total: usize = node.num + 1;
 
@@ -2764,7 +2786,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         var leaf = SortedNode{ .kind = .leaf, .num = @intCast(total) };
                         @memcpy(leaf.entries[0..total], entries[0..total]);
                         const ptr = try self.sortedWriteNode(leaf, node_ptr, frozen_at);
-                        return .{ .node_ptr = ptr, .count = total, .kv_slot = entry.kv_slot, .added = true, .split = null };
+                        return .{ .node_ptr = ptr, .count = total, .entry = entry, .added = true, .split = null };
                     }
 
                     // overflow: split into two leaves; the new sibling's separator is the
@@ -2781,7 +2803,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{
                         .node_ptr = left_ptr,
                         .count = left_n,
-                        .kv_slot = entry.kv_slot,
+                        .entry = entry,
                         .added = true,
                         .split = .{ .node_ptr = right_ptr, .count = right_n, .separator = separator },
                     };
@@ -2789,7 +2811,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .branch => {
                     var i: u8 = 0;
                     while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
-                    const child = try self.sortedPut(node.children[i].value, key, frozen_at);
+                    const child = try self.sortedPut(node.children[i].value, key, key_only, frozen_at);
+                    // nothing below changed, so don't copy this node for no reason
+                    if (!child.added and child.node_ptr == node.children[i].value) {
+                        return .{ .node_ptr = node_ptr, .count = node.subtreeCount(), .entry = child.entry, .added = false, .split = null };
+                    }
 
                     var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
                     var separators: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
@@ -2819,7 +2845,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @memcpy(branch.separators[0..total], separators[0..total]);
                         @memcpy(branch.counts[0..total], counts[0..total]);
                         const ptr = try self.sortedWriteNode(branch, node_ptr, frozen_at);
-                        return .{ .node_ptr = ptr, .count = branch.subtreeCount(), .kv_slot = child.kv_slot, .added = child.added, .split = null };
+                        return .{ .node_ptr = ptr, .count = branch.subtreeCount(), .entry = child.entry, .added = child.added, .split = null };
                     }
 
                     // overflow: split into two branches; the new sibling's separator is the
@@ -2840,7 +2866,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{
                         .node_ptr = left_ptr,
                         .count = left.subtreeCount(),
-                        .kv_slot = child.kv_slot,
+                        .entry = child.entry,
                         .added = child.added,
                         .split = .{ .node_ptr = right_ptr, .count = right.subtreeCount(), .separator = separator },
                     };
@@ -2909,12 +2935,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // pointer are immutable — overwriting a key would leave the entry mis-ordered
         // (it stays in place and separators aren't updated) — so they are returned
         // with no writeable position. reads use slot.value, not position.
-        fn sortedTargetSlot(self: *Database(db_kind, HashInt), kv_slot: Slot, target: HashMapSlotKind) !SlotPointer {
-            const kv = try self.readKvPair(kv_slot);
+        fn sortedTargetSlot(self: *Database(db_kind, HashInt), entry: Slot, target: HashMapSlotKind) !SlotPointer {
             return switch (target) {
-                .kv_pair => .{ .position = null, .slot = kv_slot },
-                .key => .{ .position = null, .slot = kv.key_slot },
-                .value => .{ .position = kv_slot.value + kvKeyOffset(kv_slot.tag) + byteSizeOf(Slot), .slot = kv.value_slot },
+                .kv_pair => .{ .position = null, .slot = entry },
+                .key => .{ .position = null, .slot = (try self.readKvPair(entry)).key_slot },
+                .value => .{ .position = kvValuePosition(entry), .slot = (try self.readKvPair(entry)).value_slot },
             };
         }
 
@@ -3317,12 +3342,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 pub fn readKeyValuePair(self: Cursor(write_mode)) !KeyValuePairCursor(write_mode) {
                     const slot_ptr = try self.resolved();
                     const kv_pair = try self.db.readKvPair(slot_ptr.slot);
-                    const key_slot_pos = slot_ptr.slot.value + kvKeyOffset(slot_ptr.slot.tag);
-                    const value_slot_pos = key_slot_pos + byteSizeOf(Slot);
 
                     return .{
-                        .value_cursor = .{ .slot_ptr = .{ .position = value_slot_pos, .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
-                        .key_cursor = .{ .slot_ptr = .{ .position = key_slot_pos, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .value_cursor = .{ .slot_ptr = .{ .position = kvValuePosition(slot_ptr.slot), .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .key_cursor = .{ .slot_ptr = .{ .position = kvKeyPosition(slot_ptr.slot), .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         .hash = kv_pair.hash,
                     };
                 }
@@ -4204,7 +4227,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             };
         }
 
-        // a sorted set of byte-string keys (a SortedMap with no values).
+        // a sorted set of byte-string keys (a SortedMap with no values). keys are
+        // stored directly in the leaves, which avoids a key-value pair per entry.
         pub fn SortedSet(comptime write_mode: WriteMode) type {
             return struct {
                 map: SortedMap(write_mode),
