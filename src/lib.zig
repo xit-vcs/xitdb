@@ -2629,6 +2629,41 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         const SortedSlot = struct { slot: Slot, position: u64 };
+        const SortedLeafSearch = struct { index: u8, found: bool };
+
+        // binary search for the child whose subtree may contain `key`: the last
+        // child whose separator is <= `key`, or the first child if there is none.
+        // separators[0] is an unused sentinel, so it is never compared.
+        fn sortedBranchSearch(self: *Database(db_kind, HashInt), node: *const SortedNode, key: []const u8) !u8 {
+            var lo: u8 = 1;
+            var hi = node.num;
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                switch (try self.compareKey(node.separators[mid], key)) {
+                    .lt, .eq => lo = mid + 1,
+                    .gt => hi = mid,
+                }
+            }
+            return lo - 1;
+        }
+
+        // binary search for `key` among a leaf's entries. if it isn't found, the
+        // index is where it would be inserted. since keys are unique, the index
+        // is the number of entries less than `key` either way.
+        fn sortedLeafSearch(self: *Database(db_kind, HashInt), node: *const SortedNode, key: []const u8) !SortedLeafSearch {
+            var lo: u8 = 0;
+            var hi = node.num;
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                const kv = try self.readKvPair(node.entries[mid]);
+                switch (try self.compareKey(kv.key_slot, key)) {
+                    .eq => return .{ .index = mid, .found = true },
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                }
+            }
+            return .{ .index = lo, .found = false };
+        }
 
         // descend by key to the matching leaf entry, or null
         fn sortedGet(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !?SortedSlot {
@@ -2637,20 +2672,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 const node = try self.readSortedNode(node_ptr);
                 switch (node.kind) {
                     .leaf => {
-                        for (0..node.num) |i| {
-                            const entry = node.entries[i];
-                            const kv = try self.readKvPair(entry);
-                            switch (try self.compareKey(kv.key_slot, key)) {
-                                .eq => return .{ .slot = entry, .position = node_ptr + BTREE_NODE_HEADER_SIZE + i * byteSizeOf(Slot) },
-                                .gt => return null,
-                                .lt => {},
-                            }
-                        }
-                        return null;
+                        const search = try self.sortedLeafSearch(&node, key);
+                        if (!search.found) return null;
+                        return .{ .slot = node.entries[search.index], .position = node_ptr + BTREE_NODE_HEADER_SIZE + search.index * byteSizeOf(Slot) };
                     },
                     .branch => {
-                        var i: u8 = 0;
-                        while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                        const i = try self.sortedBranchSearch(&node, key);
                         node_ptr = node.children[i].value;
                     },
                 }
@@ -2687,19 +2714,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 const node = try self.readSortedNode(node_ptr);
                 switch (node.kind) {
                     .leaf => {
-                        for (0..node.num) |i| {
-                            const kv = try self.readKvPair(node.entries[i]);
-                            if ((try self.compareKey(kv.key_slot, key)) == .lt) {
-                                rank += 1;
-                            } else break;
-                        }
-                        return rank;
+                        const search = try self.sortedLeafSearch(&node, key);
+                        return rank + search.index;
                     },
                     .branch => {
-                        var i: u8 = 0;
-                        while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {
-                            rank += node.counts[i];
-                        }
+                        const i = try self.sortedBranchSearch(&node, key);
+                        for (node.counts[0..i]) |c| rank += c;
                         node_ptr = node.children[i].value;
                     },
                 }
@@ -2738,25 +2758,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             switch (node.kind) {
                 .leaf => {
                     // find the matching or insertion index
-                    var idx: usize = node.num;
-                    var found = false;
-                    for (0..node.num) |i| {
-                        const kv = try self.readKvPair(node.entries[i]);
-                        switch (try self.compareKey(kv.key_slot, key)) {
-                            .eq => {
-                                idx = i;
-                                found = true;
-                                break;
-                            },
-                            .gt => {
-                                idx = i;
-                                break;
-                            },
-                            .lt => {},
-                        }
-                    }
+                    const search = try self.sortedLeafSearch(&node, key);
+                    const idx = search.index;
 
-                    if (found) {
+                    if (search.found) {
                         if (key_only) return .{ .node_ptr = node_ptr, .count = node.num, .entry = node.entries[idx], .added = false, .split = null };
 
                         // replace: return a writable value slot, moving a key-only entry
@@ -2809,8 +2814,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     };
                 },
                 .branch => {
-                    var i: u8 = 0;
-                    while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                    const i = try self.sortedBranchSearch(&node, key);
                     const child = try self.sortedPut(node.children[i].value, key, key_only, frozen_at);
                     // nothing below changed, so don't copy this node for no reason
                     if (!child.added and child.node_ptr == node.children[i].value) {
@@ -2880,21 +2884,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
-                    var idx: usize = node.num;
-                    var found = false;
-                    for (0..node.num) |i| {
-                        const kv = try self.readKvPair(node.entries[i]);
-                        switch (try self.compareKey(kv.key_slot, key)) {
-                            .eq => {
-                                idx = i;
-                                found = true;
-                                break;
-                            },
-                            .gt => break,
-                            .lt => {},
-                        }
-                    }
-                    if (!found) return .{ .node_ptr = node_ptr, .found = false };
+                    const search = try self.sortedLeafSearch(&node, key);
+                    if (!search.found) return .{ .node_ptr = node_ptr, .found = false };
+                    const idx = search.index;
 
                     var leaf = SortedNode{ .kind = .leaf, .num = node.num - 1 };
                     @memcpy(leaf.entries[0..idx], node.entries[0..idx]);
@@ -2903,8 +2895,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .node_ptr = ptr, .found = true };
                 },
                 .branch => {
-                    var i: u8 = 0;
-                    while (i + 1 < node.num and (try self.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {}
+                    const i = try self.sortedBranchSearch(&node, key);
                     const child = try self.sortedRemove(node.children[i].value, key, frozen_at);
                     if (!child.found) return .{ .node_ptr = node_ptr, .found = false };
 
@@ -3653,23 +3644,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const position = node_ptr + BTREE_NODE_HEADER_SIZE;
                             switch (node.kind) {
                                 .leaf => {
-                                    var li: u8 = node.num;
-                                    for (0..node.num) |j| {
-                                        const kv = try cursor.db.readKvPair(node.entries[j]);
-                                        if ((try cursor.db.compareKey(kv.key_slot, key)) != .lt) {
-                                            li = @intCast(j);
-                                            break;
-                                        }
-                                    }
-                                    before += li;
-                                    try stack.append(.{ .position = position, .block = node.entries, .index = li });
+                                    const search = try cursor.db.sortedLeafSearch(&node, key);
+                                    before += search.index;
+                                    try stack.append(.{ .position = position, .block = node.entries, .index = search.index });
                                     return .{ .stack = stack, .before = before };
                                 },
                                 .branch => {
-                                    var i: u8 = 0;
-                                    while (i + 1 < node.num and (try cursor.db.compareKey(node.separators[i + 1], key)) != .gt) : (i += 1) {
-                                        before += node.counts[i];
-                                    }
+                                    const i = try cursor.db.sortedBranchSearch(&node, key);
+                                    for (node.counts[0..i]) |c| before += c;
                                     try stack.append(.{ .position = position, .block = node.children, .index = i });
                                     node_ptr = node.children[i].value;
                                 },
