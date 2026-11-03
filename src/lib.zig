@@ -1107,7 +1107,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
 
                     if (write_mode == .read_only) {
-                        const final_slot_ptr = try self.readBTreeSlot(header.root_ptr, rank);
+                        const final_slot_ptr = try self.descendByRank(header.root_ptr, rank, BTREE_BRANCH_BLOCK_SIZE);
                         return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr, frozen_at);
                     } else {
                         // path-copy down to the value slot so the write is persistent
@@ -1451,8 +1451,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
                     if (write_mode == .read_only) {
-                        const found = (try self.sortedGet(header.root_ptr, key)) orelse return error.KeyNotFound;
-                        const target_slot = try self.sortedTargetSlot(found.slot, target);
+                        const entry = (try self.sortedGet(header.root_ptr, key)) orelse return error.KeyNotFound;
+                        const target_slot = try self.sortedTargetSlot(entry, target);
                         return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                     } else {
                         // only a set that is just touching the key can leave out the value
@@ -1494,9 +1494,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     else
                         @intCast(index);
 
-                    const found = try self.sortedGetByIndex(header.root_ptr, rank);
                     // return the entry so the caller can read key and value
-                    const target_slot = SlotPointer{ .position = found.position, .slot = found.slot };
+                    const target_slot = try self.descendByRank(header.root_ptr, rank, SORTED_BRANCH_BLOCK_SIZE);
                     return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                 },
                 .sorted_map_remove => |key| {
@@ -2018,25 +2017,50 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return try self.writeBTreeNode(node);
         }
 
-        // descend to the value slot at the given rank (0-based), returning a
-        // pointer to it (its file position and current slot).
-        fn readBTreeSlot(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) !SlotPointer {
+        // descend to the slot at the given rank (0-based), decoding only the counts
+        // and slot needed from each node. linked array lists and sorted maps/sets
+        // share this because their leaves are identical and their branches start
+        // with the children and end with the counts, so only the size differs.
+        fn descendByRank(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64, comptime branch_block_size: usize) !SlotPointer {
+            const slot_size = comptime byteSizeOf(Slot);
+            const count_size = comptime byteSizeOf(u64);
+            const counts_pos = branch_block_size - BTREE_SLOT_COUNT * count_size;
+            var reader = self.core.reader();
             var node_ptr = root_ptr;
             var rem = rank;
             while (true) {
-                const node = try self.readBTreeNode(node_ptr);
-                switch (node.kind) {
+                // a leaf may be at the end of the db, so reading a whole
+                // branch's worth of bytes can come up short
+                var block: [branch_block_size]u8 = undefined;
+                try reader.seekTo(node_ptr);
+                const size = try reader.interface.readSliceShort(&block);
+                if (size < BTREE_LEAF_BLOCK_SIZE) return error.EndOfStream;
+                const kind = std.enums.fromInt(BTreeNodeKind, block[0]) orelse return error.InvalidBTreeNodeKind;
+                const num = block[1];
+                if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
+                if (kind == .branch and size < branch_block_size) return error.EndOfStream;
+
+                var i: usize = 0;
+                switch (kind) {
                     .leaf => {
-                        const position = node_ptr + BTREE_NODE_HEADER_SIZE + rem * byteSizeOf(Slot);
-                        return .{ .position = position, .slot = node.values[@intCast(rem)] };
+                        if (rem >= num) return error.InvalidBTreeNode;
+                        i = @intCast(rem);
                     },
                     .branch => {
-                        var i: u8 = 0;
-                        while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
-                            rem -= node.counts[i];
+                        while (i + 1 < num) : (i += 1) {
+                            const count = std.mem.readInt(u64, block[counts_pos + i * count_size ..][0..count_size], .big);
+                            if (rem < count) break;
+                            rem -= count;
                         }
-                        node_ptr = node.children[i].value;
                     },
+                }
+
+                const slot_pos = BTREE_NODE_HEADER_SIZE + i * slot_size;
+                const slot: Slot = @bitCast(std.mem.readInt(SlotInt, block[slot_pos..][0..slot_size], .big));
+                try slot.tag.validate();
+                switch (kind) {
+                    .leaf => return .{ .position = node_ptr + slot_pos, .slot = slot },
+                    .branch => node_ptr = slot.value,
                 }
             }
         }
@@ -2628,7 +2652,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
         }
 
-        const SortedSlot = struct { slot: Slot, position: u64 };
         const SortedLeafSearch = struct { index: u8, found: bool };
 
         // binary search for the child whose subtree may contain `key`: the last
@@ -2666,7 +2689,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         // descend by key to the matching leaf entry, or null
-        fn sortedGet(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !?SortedSlot {
+        fn sortedGet(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !?Slot {
             var node_ptr = root_ptr;
             while (true) {
                 const node = try self.readSortedNode(node_ptr);
@@ -2674,32 +2697,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .leaf => {
                         const search = try self.sortedLeafSearch(&node, key);
                         if (!search.found) return null;
-                        return .{ .slot = node.entries[search.index], .position = node_ptr + BTREE_NODE_HEADER_SIZE + search.index * byteSizeOf(Slot) };
+                        return node.entries[search.index];
                     },
                     .branch => {
                         const i = try self.sortedBranchSearch(&node, key);
-                        node_ptr = node.children[i].value;
-                    },
-                }
-            }
-        }
-
-        // descend by rank to the leaf entry at the given 0-based index
-        fn sortedGetByIndex(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) !SortedSlot {
-            var node_ptr = root_ptr;
-            var rem = rank;
-            while (true) {
-                const node = try self.readSortedNode(node_ptr);
-                switch (node.kind) {
-                    .leaf => {
-                        const i: usize = @intCast(rem);
-                        return .{ .slot = node.entries[i], .position = node_ptr + BTREE_NODE_HEADER_SIZE + i * byteSizeOf(Slot) };
-                    },
-                    .branch => {
-                        var i: u8 = 0;
-                        while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
-                            rem -= node.counts[i];
-                        }
                         node_ptr = node.children[i].value;
                     },
                 }
