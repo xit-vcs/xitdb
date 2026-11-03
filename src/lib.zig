@@ -2654,23 +2654,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return std.mem.order(u8, buf[0..len], target);
                 },
                 .bytes => {
+                    // read the length and the start of the key together, so a key
+                    // that fits in one chunk only needs one read
+                    var chunk: [256]u8 = undefined;
                     var reader = self.core.reader();
                     try reader.seekTo(key_slot.value);
-                    const len = try takeInt(&reader.interface, u64, .big);
-                    var i: u64 = 0;
-                    var chunk: [256]u8 = undefined;
-                    while (i < len) {
-                        const n: usize = @intCast(@min(chunk.len, len - i));
-                        try reader.interface.readSliceAll(chunk[0..n]);
-                        for (chunk[0..n], 0..) |b, j| {
-                            const ti = i + j;
-                            if (ti >= target.len) return .gt; // stored has more, equal so far
-                            if (b < target[ti]) return .lt;
-                            if (b > target[ti]) return .gt;
-                        }
-                        i += n;
+                    const size = try reader.interface.readSliceShort(&chunk);
+                    const len_size = comptime byteSizeOf(u64);
+                    if (size < len_size) return error.EndOfStream;
+                    var remaining = std.mem.readInt(u64, chunk[0..len_size], .big);
+                    var stored: []const u8 = chunk[len_size..size];
+                    var rest = target;
+                    while (true) {
+                        const n: usize = @intCast(@min(stored.len, remaining));
+                        const order = std.mem.order(u8, stored[0..n], rest[0..@min(n, rest.len)]);
+                        if (order != .eq) return order;
+                        rest = rest[n..];
+                        remaining -= n;
+                        if (remaining == 0) return if (rest.len > 0) .lt else .eq;
+                        stored = chunk[0..try reader.interface.readSliceShort(&chunk)];
+                        if (stored.len == 0) return error.EndOfStream;
                     }
-                    return if (target.len > len) .lt else .eq;
                 },
                 else => return error.UnexpectedTag,
             }
