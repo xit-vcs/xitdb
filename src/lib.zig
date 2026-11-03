@@ -1943,27 +1943,33 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // b-tree
 
         fn readBTreeNode(self: *Database(db_kind, HashInt), ptr: u64) !BTreeNode {
+            // read the whole block at once, so a file-based db doesn't need a system
+            // call per field. a leaf may be at the end of the db, so reading a
+            // branch's worth of bytes can come up short.
+            var block: [BTREE_BRANCH_BLOCK_SIZE]u8 = undefined;
             var reader = self.core.reader();
             try reader.seekTo(ptr);
-            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const size = try reader.interface.readSliceShort(&block);
+            var block_reader = std.Io.Reader.fixed(block[0..size]);
+            const kind_int = try takeInt(&block_reader, u8, .big);
             const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
-            const num = try takeInt(&reader.interface, u8, .big);
+            const num = try takeInt(&block_reader, u8, .big);
             if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
             var node = BTreeNode{ .kind = kind, .num = num };
             switch (kind) {
                 .leaf => {
                     for (&node.values) |*s| {
-                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
                     }
                 },
                 .branch => {
                     for (&node.children) |*s| {
-                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
                     }
                     for (&node.counts) |*c| {
-                        c.* = try takeInt(&reader.interface, u64, .big);
+                        c.* = try takeInt(&block_reader, u64, .big);
                     }
                 },
             }
@@ -1974,19 +1980,25 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // b-tree mutations are persistent: every node on the path from the root
         // is rewritten, while untouched subtrees are shared by pointer.
         fn writeBTreeNodeAt(self: *Database(db_kind, HashInt), node: BTreeNode, ptr: u64) !void {
-            var writer = self.core.writer();
-            try writer.seekTo(ptr);
-            try writer.interface.writeInt(u8, @backingInt(node.kind), .big);
-            try writer.interface.writeInt(u8, node.num, .big);
+            // write the whole block at once, so a file-based db doesn't need a system
+            // call per field
+            var block: [BTREE_BRANCH_BLOCK_SIZE]u8 = undefined;
+            var block_writer = std.Io.Writer.fixed(&block);
+            try block_writer.writeInt(u8, @backingInt(node.kind), .big);
+            try block_writer.writeInt(u8, node.num, .big);
             switch (node.kind) {
                 .leaf => {
-                    for (node.values) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.values) |s| try block_writer.writeInt(SlotInt, @bitCast(s), .big);
                 },
                 .branch => {
-                    for (node.children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (node.counts) |c| try writer.interface.writeInt(u64, c, .big);
+                    for (node.children) |s| try block_writer.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.counts) |c| try block_writer.writeInt(u64, c, .big);
                 },
             }
+
+            var writer = self.core.writer();
+            try writer.seekTo(ptr);
+            try writer.interface.writeAll(block_writer.buffered());
         }
 
         // appends `node` as a fresh block and returns its position.
@@ -2503,31 +2515,37 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // sorted_map / sorted_set
 
         fn readSortedNode(self: *Database(db_kind, HashInt), ptr: u64) !SortedNode {
+            // read the whole block at once, so a file-based db doesn't need a system
+            // call per field. a leaf may be at the end of the db, so reading a
+            // branch's worth of bytes can come up short.
+            var block: [SORTED_BRANCH_BLOCK_SIZE]u8 = undefined;
             var reader = self.core.reader();
             try reader.seekTo(ptr);
-            const kind_int = try takeInt(&reader.interface, u8, .big);
+            const size = try reader.interface.readSliceShort(&block);
+            var block_reader = std.Io.Reader.fixed(block[0..size]);
+            const kind_int = try takeInt(&block_reader, u8, .big);
             const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
-            const num = try takeInt(&reader.interface, u8, .big);
+            const num = try takeInt(&block_reader, u8, .big);
             if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
             var node = SortedNode{ .kind = kind, .num = num };
             switch (kind) {
                 .leaf => {
                     for (&node.entries) |*s| {
-                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
                     }
                 },
                 .branch => {
                     for (&node.children) |*s| {
-                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
                     }
                     for (&node.separators) |*s| {
-                        s.* = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
                     }
                     for (&node.counts) |*c| {
-                        c.* = try takeInt(&reader.interface, u64, .big);
+                        c.* = try takeInt(&block_reader, u64, .big);
                     }
                 },
             }
@@ -2535,20 +2553,26 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         }
 
         fn writeSortedNodeAt(self: *Database(db_kind, HashInt), node: SortedNode, ptr: u64) !void {
-            var writer = self.core.writer();
-            try writer.seekTo(ptr);
-            try writer.interface.writeInt(u8, @backingInt(node.kind), .big);
-            try writer.interface.writeInt(u8, node.num, .big);
+            // write the whole block at once, so a file-based db doesn't need a system
+            // call per field
+            var block: [SORTED_BRANCH_BLOCK_SIZE]u8 = undefined;
+            var block_writer = std.Io.Writer.fixed(&block);
+            try block_writer.writeInt(u8, @backingInt(node.kind), .big);
+            try block_writer.writeInt(u8, node.num, .big);
             switch (node.kind) {
                 .leaf => {
-                    for (node.entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.entries) |s| try block_writer.writeInt(SlotInt, @bitCast(s), .big);
                 },
                 .branch => {
-                    for (node.children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (node.separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (node.counts) |c| try writer.interface.writeInt(u64, c, .big);
+                    for (node.children) |s| try block_writer.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.separators) |s| try block_writer.writeInt(SlotInt, @bitCast(s), .big);
+                    for (node.counts) |c| try block_writer.writeInt(u64, c, .big);
                 },
             }
+
+            var writer = self.core.writer();
+            try writer.seekTo(ptr);
+            try writer.interface.writeAll(block_writer.buffered());
         }
 
         fn writeSortedNode(self: *Database(db_kind, HashInt), node: SortedNode) !u64 {
