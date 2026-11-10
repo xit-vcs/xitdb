@@ -1915,10 +1915,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             }
 
             var slot_ptr = try self.readArrayListSlot(index_pos, key, next_shift, write_mode, frozen_at);
-            // clear values left by a rollback or slice
+            // clear values left by a rollback or slice. the slot is written as a `.none`
+            // slot marked `full`, so it counts as an element even if nothing is written to it.
             slot_ptr.slot = .{};
             try writer.seekTo(slot_ptr.position orelse unreachable);
-            try writer.interface.writeInt(SlotInt, @bitCast(slot_ptr.slot), .big);
+            try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .full = true }), .big);
 
             return .{
                 .header = .{
