@@ -743,3 +743,5 @@ Only change a replica with `applyReplicated`. If you write to it directly, it no
 ## Thread Safety
 
 It is possible to read a database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. Also, keep in mind that writes still need to come from one thread at a time; see the example at the top of this file, where it acquires an exclusive file lock.
+
+When a thread or process only reads, open its file in read-only mode. Otherwise, initializing its `Database` could write to the file: an empty file becomes a new database, and so does one whose creation was interrupted. That must not happen while another process is creating the database, or replacing it with `applyReplicated`.
