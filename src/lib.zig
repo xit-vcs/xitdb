@@ -590,6 +590,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         /// this database's `ReplicaState`.
         pub fn replicaState(self: *Database(db_kind, HashInt)) !ReplicaState {
+            // a full copy that didn't finish leaves nothing behind (see `applyReplicated`)
+            if (try self.core.length() == 0) return .{ .committed_size = 0, .checksum = 0 };
             const committed_size = try self.committedSize();
             return .{ .committed_size = committed_size, .checksum = (try self.readRootTrailer(committed_size)).checksum };
         }
@@ -643,10 +645,22 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 // discard anything past the committed bytes, such as the remains of an interrupted sync
                 try self.truncate();
             } else return error.InvalidRange;
+            // the old database is gone once a new one starts replacing it. if the new one
+            // doesn't fully arrive, leave nothing behind, so the next sync can replace it again.
+            errdefer if (start == 0) self.core.setLength(0) catch {};
 
+            // copy through a buffer, because the core's writer doesn't have
+            // one for the reader to stream into
             var writer = self.core.writer();
             try writer.seekTo(start);
-            try reader.streamExact64(&writer.interface, len);
+            var buffer: [4096]u8 = undefined;
+            var remaining = len;
+            while (remaining > 0) {
+                const chunk = buffer[0..@min(buffer.len, remaining)];
+                try reader.readSliceAll(chunk);
+                try writer.interface.writeAll(chunk);
+                remaining -= chunk.len;
+            }
 
             if (start == 0) {
                 // the bytes are a different database, with its own header
