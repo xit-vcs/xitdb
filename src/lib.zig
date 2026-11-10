@@ -536,6 +536,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 },
             };
 
+            // a database whose first commit never finished holds nothing. if it is no
+            // bigger than a new database, it was interrupted while being created, so
+            // it is created again. otherwise it is a full copy that was interrupted
+            // (see `applyReplicated`), which is left for the next sync to replace.
+            var has_commit = false;
+            if (try self.core.length() > 0) {
+                var reader = self.core.reader();
+                self.header = try readAndValidateHeader(&reader.interface);
+                has_commit = try self.readFileSize() > 0;
+                const new_size = fileSizeStart(self.header.version) + byteSizeOf(u64) + byteSizeOf(RootTrailer);
+                if (!has_commit and try self.core.length() <= new_size) try self.core.setLength(0);
+            }
+
             if (try self.core.length() == 0) {
                 self.header = .{
                     .file_id = opts.file_id orelse self.randomU64(),
@@ -543,19 +556,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .hash_size = byteSizeOf(HashInt),
                     .version = VERSION,
                 };
-                var writer = self.core.writer();
-                try writer.seekTo(0);
-                try self.header.write(&writer.interface);
-                // write the root header and commit an empty root, so the
-                // file ends with a trailer like after any transaction
-                const root_header: [FILE_SIZE_START + byteSizeOf(u64) - ROOT_HEADER_START]u8 = @splat(0);
-                try writer.interface.writeAll(&root_header);
-                // the first commit's ID is 0, so a new database's bytes only
-                // depend on its file ID
+                try self.writeHeaders();
+                // commit an empty root, so the file ends with a trailer like after
+                // any transaction. the first commit's ID is 0, so a new database's
+                // bytes only depend on its file ID
                 try self.commitRoot(.{}, 0);
                 try self.core.sync();
-            } else {
-                self.header = try self.readAndValidateHeader();
+            } else if (has_commit) {
                 _ = try self.committedSize();
             }
 
@@ -590,8 +597,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         /// this database's `ReplicaState`.
         pub fn replicaState(self: *Database(db_kind, HashInt)) !ReplicaState {
-            // a full copy that didn't finish leaves nothing behind (see `applyReplicated`)
-            if (try self.core.length() == 0) return .{ .committed_size = 0, .checksum = 0 };
+            // a full copy that didn't finish has no first commit (see `applyReplicated`)
+            if (try self.readFileSize() == 0) return .{ .committed_size = 0, .checksum = 0 };
             const committed_size = try self.committedSize();
             return .{ .committed_size = committed_size, .checksum = (try self.readRootTrailer(committed_size)).checksum };
         }
@@ -616,7 +623,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         /// making the bytes a complete database by themselves.
         pub fn readCommitted(self: *Database(db_kind, HashInt), start: u64, end: u64, writer: *std.Io.Writer) !void {
             if (start > end or end > try self.committedSize()) return error.InvalidRange;
-            const file_size_start = self.fileSizeStart();
+            const file_size_start = fileSizeStart(self.header.version);
             const data_start = file_size_start + byteSizeOf(u64);
             if (start > 0 and start < data_start) return error.InvalidRange;
             var reader = self.core.reader();
@@ -639,22 +646,34 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         /// `start` is 0, this database is replaced by them; otherwise `start` must
         /// be this database's `committedSize`.
         pub fn applyReplicated(self: *Database(db_kind, HashInt), start: u64, reader: *std.Io.Reader, len: u64) !void {
+            var buffer: [4096]u8 = undefined;
+            var position = start;
             if (start == 0) {
+                // the bytes are a different database, with its own header. its root header
+                // stays empty until the rest has arrived, so a copy that doesn't finish is
+                // a database without a first commit (see `init`), which the next sync replaces.
+                if (len < ROOT_HEADER_START) return error.InvalidRange;
+                const header = try readAndValidateHeader(reader);
+                position = fileSizeStart(header.version) + byteSizeOf(u64);
+                if (len < position) return error.InvalidRange;
                 try self.core.setLength(0);
+                self.header = header;
+                try self.writeHeaders();
+                // sync the headers before the data, which could otherwise reach
+                // the disk without them and leave a file that can't be opened
+                try self.core.sync();
+                // the root header that came with the bytes isn't needed
+                try reader.readSliceAll(buffer[0 .. position - ROOT_HEADER_START]);
             } else if (start == try self.committedSize()) {
                 // discard anything past the committed bytes, such as the remains of an interrupted sync
                 try self.truncate();
             } else return error.InvalidRange;
-            // the old database is gone once a new one starts replacing it. if the new one
-            // doesn't fully arrive, leave nothing behind, so the next sync can replace it again.
-            errdefer if (start == 0) self.core.setLength(0) catch {};
 
             // copy through a buffer, because the core's writer doesn't have
             // one for the reader to stream into
             var writer = self.core.writer();
-            try writer.seekTo(start);
-            var buffer: [4096]u8 = undefined;
-            var remaining = len;
+            try writer.seekTo(position);
+            var remaining = start + len - position;
             while (remaining > 0) {
                 const chunk = buffer[0..@min(buffer.len, remaining)];
                 try reader.readSliceAll(chunk);
@@ -662,12 +681,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 remaining -= chunk.len;
             }
 
-            if (start == 0) {
-                // the bytes are a different database, with its own header
-                try self.core.sync();
-                self.header = try self.readAndValidateHeader();
-                _ = try self.committedSize();
-            } else if (len > 0) {
+            if (len > 0) {
                 // the bytes must end with a trailer. update the root header to match it.
                 _ = try self.readRootTrailer(start + len);
                 try self.core.sync();
@@ -750,15 +764,34 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // private
 
-        fn readAndValidateHeader(self: *Database(db_kind, HashInt)) !DatabaseHeader {
-            var reader = self.core.reader();
-            try reader.seekTo(0);
-            const header = try DatabaseHeader.read(&reader.interface);
+        fn readAndValidateHeader(reader: *std.Io.Reader) !DatabaseHeader {
+            const header = try DatabaseHeader.read(reader);
             try header.validate();
             if (header.hash_size != byteSizeOf(HashInt)) {
                 return error.InvalidHashSize;
             }
             return header;
+        }
+
+        // writes the database header and an empty root header. the database has
+        // no first commit until the root header is given its file size.
+        fn writeHeaders(self: *Database(db_kind, HashInt)) !void {
+            var writer = self.core.writer();
+            try writer.seekTo(0);
+            try self.header.write(&writer.interface);
+            // version 1's root header is the biggest
+            const root_header: [byteSizeOf(Slot) + byteSizeOf(u64)]u8 = @splat(0);
+            try writer.interface.writeAll(root_header[0 .. fileSizeStart(self.header.version) + byteSizeOf(u64) - ROOT_HEADER_START]);
+        }
+
+        // the root header's file size. it is 0 until the first commit or full copy
+        // has finished, including when the file was cut off before it.
+        fn readFileSize(self: *Database(db_kind, HashInt)) !u64 {
+            const file_size_start = fileSizeStart(self.header.version);
+            if (try self.core.length() < file_size_start + byteSizeOf(u64)) return 0;
+            var reader = self.core.reader();
+            try reader.seekTo(file_size_start);
+            return try takeInt(&reader.interface, u64, .big);
         }
 
         // TODO: retain frozen data on rollback to keep its read cursors valid
@@ -777,13 +810,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // where the root header's file size is. the committed data starts after it.
         // version 1 has a copy of the root slot before it, which isn't used or updated.
-        fn fileSizeStart(self: *const Database(db_kind, HashInt)) u64 {
-            return if (self.header.version == 1) ROOT_HEADER_START + byteSizeOf(Slot) else FILE_SIZE_START;
+        fn fileSizeStart(version: u16) u64 {
+            return if (version == 1) ROOT_HEADER_START + byteSizeOf(Slot) else FILE_SIZE_START;
         }
 
         // the file size from the root header, and the root slot from the trailer it points to
         fn readRootHeader(self: *Database(db_kind, HashInt)) !RootHeader {
-            const file_size_start = self.fileSizeStart();
+            const file_size_start = fileSizeStart(self.header.version);
             var reader = self.core.reader();
             try reader.seekTo(file_size_start);
             const file_size = try takeInt(&reader.interface, u64, .big);
@@ -840,7 +873,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn writeRootHeader(self: *Database(db_kind, HashInt)) !void {
             const file_size = try self.core.length();
             var writer = self.core.writer();
-            try writer.seekTo(self.fileSizeStart());
+            try writer.seekTo(fileSizeStart(self.header.version));
             try writer.interface.writeInt(u64, file_size, .big);
         }
 
