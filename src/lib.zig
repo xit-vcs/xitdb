@@ -71,7 +71,28 @@ pub const Tag = enum(u7) {
 };
 
 const MAGIC_NUMBER: u24 = std.mem.readInt(u24, "xit", .big);
-pub const VERSION: u16 = 1;
+
+// the database version. bump for format-breaking changes.
+//
+// version 0:
+//   the design that xitdb had for its first few years of life.
+//   this format was *mostly* append-only, but the top-level
+//   data structure was mutable, making replication impractical.
+//   support has been completely removed because xitdb had
+//   basically one user for the duration of this version.
+// version 1:
+//   introduces the root header, and a trailer at the end of
+//   every commit. the top-level data structure is now fully
+//   immutable, which means the *only* thing mutated is the
+//   root header. this made replication trivial, and as a
+//   side benefit, even top-level hash maps are transactional.
+// version 2:
+//   fixes a small flaw in the version 1 root header that made
+//   tearing possible when reading during a commit. the file
+//   size was at a misaligned offset, which on typical CPUs
+//   meant that it could contain a torn value leading to a
+//   read error. now it is stored at offset 24.
+pub const VERSION: u16 = 2;
 
 const DatabaseHeaderInt = u160;
 pub const DatabaseHeader = packed struct {
@@ -107,7 +128,7 @@ pub const DatabaseHeader = packed struct {
         if (self.magic_number != MAGIC_NUMBER) {
             return error.InvalidDatabase;
         }
-        if (self.version != VERSION) {
+        if (self.version != 1 and self.version != VERSION) {
             return error.InvalidVersion;
         }
     }
@@ -214,19 +235,20 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // the database header is followed by the root header. the top-level data
         // is a root slot of any type, and every write to it is a copy-on-write
         // transaction that appends a trailer holding the new root slot. the root
-        // header only caches the latest trailer, so every other committed byte is
-        // immutable, and a replica stays in sync by copying the bytes it doesn't have.
+        // header only says where the latest trailer ends, so every other committed
+        // byte is immutable, and a replica stays in sync by copying the bytes it
+        // doesn't have.
         const ROOT_HEADER_START = byteSizeOf(DatabaseHeader);
-        const ROOT_HEADER_END = ROOT_HEADER_START + byteSizeOf(RootHeader);
-        const ROOT_HEADER_FILE_SIZE_START = ROOT_HEADER_START + byteSizeOf(Slot);
 
-        // rewritten at every commit, as a cache of the latest trailer.
-        // it is written big endian, so the root slot comes first on disk.
-        // we only read `file_size`, which lets us read the trailer. other xitdb
-        // implementations may read the whole header to avoid that extra read,
-        // but that increases the risk of a concurrent commit tearing it.
-        const RootHeaderInt = u136;
-        const RootHeader = packed struct {
+        // the root header is the size of the committed bytes. a commit rewrites it
+        // in place, and a concurrent read from another `Database` must not see it
+        // half written. so it is written by itself, and it starts at a multiple of
+        // 8 bytes, which lets a CPU read and write it as a single unit. the bytes
+        // before it are padding.
+        const FILE_SIZE_START = std.mem.alignForward(u64, ROOT_HEADER_START, byteSizeOf(u64));
+
+        // the size of the committed bytes, and the root slot from the trailer that ends them
+        const RootHeader = struct {
             file_size: u64,
             root: Slot,
         };
@@ -526,7 +548,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 try self.header.write(&writer.interface);
                 // write the root header and commit an empty root, so the
                 // file ends with a trailer like after any transaction
-                try writer.interface.writeInt(RootHeaderInt, @bitCast(RootHeader{ .file_size = 0, .root = .{} }), .big);
+                const root_header: [FILE_SIZE_START + byteSizeOf(u64) - ROOT_HEADER_START]u8 = @splat(0);
+                try writer.interface.writeAll(&root_header);
                 // the first commit's ID is 0, so a new database's bytes only
                 // depend on its file ID
                 try self.commitRoot(.{}, 0);
@@ -591,15 +614,18 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         /// making the bytes a complete database by themselves.
         pub fn readCommitted(self: *Database(db_kind, HashInt), start: u64, end: u64, writer: *std.Io.Writer) !void {
             if (start > end or end > try self.committedSize()) return error.InvalidRange;
-            if (start > 0 and start < ROOT_HEADER_END) return error.InvalidRange;
+            const file_size_start = self.fileSizeStart();
+            const data_start = file_size_start + byteSizeOf(u64);
+            if (start > 0 and start < data_start) return error.InvalidRange;
             var reader = self.core.reader();
             if (start == 0) {
-                const trailer = try self.readRootTrailer(end);
+                // the bytes must end with a trailer
+                _ = try self.readRootTrailer(end);
                 try reader.seekTo(0);
-                try reader.interface.streamExact64(writer, ROOT_HEADER_START);
-                try writer.writeInt(RootHeaderInt, @bitCast(RootHeader{ .file_size = end, .root = trailer.root }), .big);
-                try reader.seekTo(ROOT_HEADER_END);
-                try reader.interface.streamExact64(writer, end - ROOT_HEADER_END);
+                try reader.interface.streamExact64(writer, file_size_start);
+                try writer.writeInt(u64, end, .big);
+                try reader.seekTo(data_start);
+                try reader.interface.streamExact64(writer, end - data_start);
             } else {
                 try reader.seekTo(start);
                 try reader.interface.streamExact64(writer, end - start);
@@ -629,9 +655,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 _ = try self.committedSize();
             } else if (len > 0) {
                 // the bytes must end with a trailer. update the root header to match it.
-                const trailer = try self.readRootTrailer(start + len);
+                _ = try self.readRootTrailer(start + len);
                 try self.core.sync();
-                try self.writeRootHeader(trailer.root);
+                try self.writeRootHeader();
                 try self.core.sync();
             }
         }
@@ -735,12 +761,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return (try self.readRootHeader()).file_size;
         }
 
+        // where the root header's file size is. the committed data starts after it.
+        // version 1 has a copy of the root slot before it, which isn't used or updated.
+        fn fileSizeStart(self: *const Database(db_kind, HashInt)) u64 {
+            return if (self.header.version == 1) ROOT_HEADER_START + byteSizeOf(Slot) else FILE_SIZE_START;
+        }
+
         // the file size from the root header, and the root slot from the trailer it points to
         fn readRootHeader(self: *Database(db_kind, HashInt)) !RootHeader {
+            const file_size_start = self.fileSizeStart();
             var reader = self.core.reader();
-            try reader.seekTo(ROOT_HEADER_FILE_SIZE_START);
+            try reader.seekTo(file_size_start);
             const file_size = try takeInt(&reader.interface, u64, .big);
-            const minimum_size = ROOT_HEADER_END + byteSizeOf(RootTrailer);
+            const minimum_size = file_size_start + byteSizeOf(u64) + byteSizeOf(RootTrailer);
             if (file_size < minimum_size) return error.InvalidDatabase;
             if (try self.core.length() < file_size) return error.TruncatedDatabase;
             // the committed bytes must end with a trailer
@@ -786,18 +819,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             // never reached disk.
             try self.core.sync();
 
-            try self.writeRootHeader(root);
+            try self.writeRootHeader();
         }
 
-        // points the root header at `root`, which must be in the trailer that
-        // ends the file.
-        fn writeRootHeader(self: *Database(db_kind, HashInt), root: Slot) !void {
+        // points the root header at the trailer that ends the file.
+        fn writeRootHeader(self: *Database(db_kind, HashInt)) !void {
+            const file_size = try self.core.length();
             var writer = self.core.writer();
-            try writer.seekTo(ROOT_HEADER_START);
-            try writer.interface.writeInt(RootHeaderInt, @bitCast(RootHeader{
-                .file_size = try self.core.length(),
-                .root = root,
-            }), .big);
+            try writer.seekTo(self.fileSizeStart());
+            try writer.interface.writeInt(u64, file_size, .big);
         }
 
         // whether this slot pointer is the root of the database

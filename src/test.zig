@@ -3934,11 +3934,11 @@ fn replicate(allocator: std.mem.Allocator, source: anytype, replica: anytype) !v
 }
 
 // checks that no committed byte has changed since `committed` was read,
-// except the root header (the root slot and file size after the database
+// except the root header (the padding and file size after the database
 // header). then replicates and checks that the replica is identical.
 fn expectAppendOnlyAndReplicate(allocator: std.mem.Allocator, source: anytype, replica: anytype, committed: *[]u8) !void {
     const root_header_start = @bitSizeOf(xitdb.DatabaseHeader) / 8;
-    const root_header_end = root_header_start + 17;
+    const root_header_end = root_header_start + 12;
     {
         const current = try readCommittedBytes(allocator, source, 0);
         errdefer allocator.free(current);
@@ -3997,18 +3997,18 @@ fn testReplication(
     // a new database is its header (which ends with its file ID), its root
     // header, and the trailer for its empty root: the slot (9 zero bytes), the commit ID (0 for
     // the first commit), then the CRC-64/XZ of the file ID, the trailer's position
-    // (37), the slot, and the commit ID
+    // (32), the slot, and the commit ID
     {
         const bytes = try readCommittedBytes(allocator, &source, 0);
         defer allocator.free(bytes);
-        try std.testing.expectEqual(62, bytes.len);
+        try std.testing.expectEqual(57, bytes.len);
         try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 }, bytes[12..20]);
         try std.testing.expectEqualSlices(u8, &.{
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0xd6, 0x18, 0x4e, 0x46, 0xb4, 0x7d, 0x29,
-            0x26,
-        }, bytes[37..]);
+            0x00, 0x95, 0xd4, 0x94, 0xc3, 0x4d, 0xf8, 0x07,
+            0xe5,
+        }, bytes[32..]);
     }
 
     // new databases have their own random file IDs, so the
