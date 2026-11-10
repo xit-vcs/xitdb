@@ -3442,7 +3442,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     return .{
                         .value_cursor = .{ .slot_ptr = .{ .position = kvValuePosition(slot_ptr.slot), .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
-                        .key_cursor = .{ .slot_ptr = .{ .position = kvKeyPosition(slot_ptr.slot), .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        // a key-only entry is its own key slot, so its key is where the entry is
+                        .key_cursor = .{ .slot_ptr = .{ .position = kvKeyPosition(slot_ptr.slot) orelse slot_ptr.position, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         .hash = kv_pair.hash,
                     };
                 }
