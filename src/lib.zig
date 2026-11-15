@@ -5235,10 +5235,6 @@ const CoreBufferedFile = struct {
                     parent.memory_pos = w.pos;
                 }
 
-                if (parent.file_len == null) {
-                    parent.file_len = parent.file.length() catch return error.WriteFailed;
-                }
-
                 // write to the in-memory buffer
                 if (w.pos >= parent.memory_pos and w.pos - parent.memory_pos + n <= parent.memory_max_size) {
                     var memory_writer = parent.memory.writer();
@@ -5253,6 +5249,12 @@ const CoreBufferedFile = struct {
                         parent.flush() catch return error.WriteFailed;
                     }
                     parent.writeToFile(w.pos, buf) catch return error.WriteFailed;
+                }
+
+                // cache the file's length only after a successful write. a failed
+                // one may leave nothing to flush, so nothing would clear it.
+                if (parent.file_len == null) {
+                    parent.file_len = parent.file.length() catch return error.WriteFailed;
                 }
 
                 w.pos += n;
