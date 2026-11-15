@@ -2162,6 +2162,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
+                    if (rank > node.num) return error.InvalidBTreeNode;
                     // build the entries with a placeholder spliced in at `rank`.
                     // the placeholder is a `.none` slot marked `full` so that, if the
                     // caller never writes a value (e.g. appendCursor), iteration still
@@ -2296,6 +2297,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
+                    if (rank >= node.num) return error.InvalidBTreeNode;
                     const new_ptr = if (self.btreeReusable(node_ptr, frozen_at)) node_ptr else try self.writeBTreeNode(node);
                     return .{
                         .node_ptr = new_ptr,
@@ -2330,6 +2332,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
+                    if (rank >= node.num) return error.InvalidBTreeNode;
                     const r: usize = @intCast(rank);
                     std.mem.copyForwards(Slot, node.values[r .. node.num - 1], node.values[r + 1 .. node.num]);
                     node.num -= 1;
@@ -2566,6 +2569,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             const node = try self.readBTreeNode(root_ptr);
             switch (node.kind) {
                 .leaf => {
+                    if (rank > node.num) return error.InvalidBTreeNode;
                     const r: usize = @intCast(rank);
                     var left = BTreeNode{ .kind = .leaf, .num = @intCast(r) };
                     @memcpy(left.values[0..r], node.values[0..r]);
@@ -3728,6 +3732,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const position = node_ptr + BTREE_NODE_HEADER_SIZE;
                             switch (node.kind) {
                                 .leaf => {
+                                    if (rem >= node.num) return error.InvalidBTreeNode;
                                     try stack.append(.{ .position = position, .block = node.entries, .index = @intCast(rem) });
                                     return stack;
                                 },
@@ -3797,6 +3802,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             const position = node_ptr + BTREE_NODE_HEADER_SIZE;
                             switch (node.kind) {
                                 .leaf => {
+                                    if (rem >= node.num) return error.InvalidBTreeNode;
                                     try stack.append(.{ .position = position, .block = node.values, .index = @intCast(rem) });
                                     return stack;
                                 },
