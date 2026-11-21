@@ -220,11 +220,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         const HASH_SIZE = byteSizeOf(HashInt);
         const INDEX_BLOCK_SIZE = byteSizeOf(Slot) * SLOT_COUNT;
         const MAX_BRANCH_LENGTH: usize = 16;
+        // a b-tree's height is at most log2 of a u64 size = 64, given the minimum
+        // fan-out of 2
+        const MAX_BTREE_DEPTH = byteSizeOf(u64) * 8;
         // the iterator pushes one stack level per tree level. the deepest
         // iterable structure is the hash trie (HASH_SIZE*8/BIT_COUNT levels) or
-        // a b-tree (height is at most log2 of a u64 size = 64, given the minimum
-        // fan-out of 2); the array list's radix trie is shallower than both.
-        const ITERATOR_STACK_SIZE = @max(HASH_SIZE * 8 / BIT_COUNT, byteSizeOf(u64) * 8);
+        // a b-tree; the array list's radix trie is shallower than both.
+        const ITERATOR_STACK_SIZE = @max(HASH_SIZE * 8 / BIT_COUNT, MAX_BTREE_DEPTH);
 
         const ArrayListHeaderInt = u128;
         const ArrayListHeader = packed struct {
@@ -1188,7 +1190,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr, frozen_at);
                     } else {
                         // path-copy down to the value slot so the write is persistent
-                        const write_slot = try self.btreeGetForWrite(header.root_ptr, rank, frozen_at);
+                        const write_slot = try self.btreeGetForWrite(header.root_ptr, rank, frozen_at, 0);
                         // update the header before callbacks can freeze it
                         if (write_slot.node_ptr != header.root_ptr) {
                             var writer = self.core.writer();
@@ -1208,7 +1210,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(header_ptr);
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    const result = try self.btreeInsert(header.root_ptr, header.size, frozen_at);
+                    const result = try self.btreeInsert(header.root_ptr, header.size, frozen_at, 0);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
                     // update the header before filling in the value, so that a failure
@@ -1238,8 +1240,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     // slice = drop [0, offset) then keep [0, size) of what's left
-                    const after_offset = try self.btreeSplit(header.root_ptr, linked_array_list_slice.offset);
-                    const sliced = try self.btreeSplit(after_offset.right, linked_array_list_slice.size);
+                    const after_offset = try self.btreeSplit(header.root_ptr, linked_array_list_slice.offset, 0);
+                    const sliced = try self.btreeSplit(after_offset.right, linked_array_list_slice.size, 0);
                     const new_root_ptr = sliced.left;
 
                     // update the header before recursing into the rest of the path, so
@@ -1297,7 +1299,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     else
                         @intCast(index);
 
-                    const result = try self.btreeInsert(header.root_ptr, rank, frozen_at);
+                    const result = try self.btreeInsert(header.root_ptr, rank, frozen_at, 0);
                     const new_root_ptr = try self.btreeGrowRoot(result);
 
                     // update the header before filling in the value, so that a failure
@@ -1327,7 +1329,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
 
                     const new_root_ptr = if (header.size == 1) try self.btreeNewRoot() else blk: {
-                        var root = try self.btreeRemove(header.root_ptr, rank, frozen_at);
+                        var root = try self.btreeRemove(header.root_ptr, rank, frozen_at, 0);
                         var root_ptr = try self.btreeWriteNode(root, header.root_ptr, frozen_at);
                         // a root left with one child is replaced by it
                         while (root.kind == .branch and root.num == 1) {
@@ -1534,7 +1536,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     } else {
                         // only a set that is just touching the key can leave out the value
                         const key_only = slot_ptr.slot.tag == .sorted_set and target == .key;
-                        const result = try self.sortedPut(header.root_ptr, key, key_only, frozen_at);
+                        const result = try self.sortedPut(header.root_ptr, key, key_only, frozen_at, 0);
                         const new_root_ptr = try self.sortedGrowRoot(result);
 
                         // update the header before filling in the value, so that a
@@ -1589,7 +1591,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(header_ptr);
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    const result = try self.sortedRemove(header.root_ptr, key, frozen_at);
+                    const result = try self.sortedRemove(header.root_ptr, key, frozen_at, 0);
                     if (!result.found) return error.KeyNotFound;
 
                     var writer = self.core.writer();
@@ -2118,7 +2120,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var reader = self.core.reader();
             var node_ptr = root_ptr;
             var rem = rank;
-            while (true) {
+            for (0..MAX_BTREE_DEPTH) |_| {
                 // a leaf may be at the end of the db, so reading a whole
                 // branch's worth of bytes can come up short
                 var block: [branch_block_size]u8 = undefined;
@@ -2152,13 +2154,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     .leaf => return .{ .position = node_ptr + slot_pos, .slot = slot },
                     .branch => node_ptr = slot.value,
                 }
-            }
+            } else return error.InvalidBTreeNode;
         }
 
         // insert a placeholder slot at `rank` within the subtree at node_ptr,
         // writing new nodes along the path. the caller fills in the value at the
         // returned `value_position`.
-        fn btreeInsert(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeInsertResult {
+        fn btreeInsert(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64, depth: usize) anyerror!BTreeInsertResult {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2213,7 +2216,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
                         rem -= node.counts[i];
                     }
-                    const child = try self.btreeInsert(node.children[i].value, rem, frozen_at);
+                    const child = try self.btreeInsert(node.children[i].value, rem, frozen_at, depth + 1);
 
                     // rebuild this branch with the (possibly split) child
                     var children: [BTREE_SLOT_COUNT + 1]Slot = @splat(.{});
@@ -2293,7 +2296,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // nodes that belong to a past transaction. the element count is unchanged,
         // so when the whole path is already this-transaction nothing is rewritten
         // and the caller writes straight into the existing leaf.
-        fn btreeGetForWrite(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeWriteSlot {
+        fn btreeGetForWrite(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64, depth: usize) anyerror!BTreeWriteSlot {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             const node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2311,7 +2315,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
                         rem -= node.counts[i];
                     }
-                    const child = try self.btreeGetForWrite(node.children[i].value, rem, frozen_at);
+                    const child = try self.btreeGetForWrite(node.children[i].value, rem, frozen_at, depth + 1);
                     // if the child stayed put, this branch is unchanged too
                     if (child.node_ptr == node.children[i].value) {
                         return .{ .node_ptr = node_ptr, .value_position = child.value_position, .slot = child.slot };
@@ -2328,7 +2332,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // the node left behind for the caller to write. an emptied child is
         // dropped and a child left under half full is merged with a neighbor it
         // fits with, so every leaf stays at the same depth.
-        fn btreeRemove(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64) anyerror!BTreeNode {
+        fn btreeRemove(self: *Database(db_kind, HashInt), node_ptr: u64, rank: u64, frozen_at: u64, depth: usize) anyerror!BTreeNode {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             var node = try self.readBTreeNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2345,7 +2350,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         rem -= node.counts[i];
                     }
                     const child_ptr = node.children[i].value;
-                    var child = try self.btreeRemove(child_ptr, rem, frozen_at);
+                    var child = try self.btreeRemove(child_ptr, rem, frozen_at, depth + 1);
                     if (child.num == 0) {
                         btreeDropChild(&node, i);
                         return node;
@@ -2405,12 +2410,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         fn btreeHeight(self: *Database(db_kind, HashInt), root_ptr: u64) !u8 {
             var ptr = root_ptr;
             var height: u8 = 0;
-            while (true) {
+            for (0..MAX_BTREE_DEPTH) |_| {
                 const node = try self.readBTreeNode(ptr);
                 if (node.kind == .leaf) return height;
                 height += 1;
                 ptr = node.children[0].value;
-            }
+            } else return error.InvalidBTreeNode;
         }
 
         fn btreeMakeRoot(self: *Database(db_kind, HashInt), result: BTreeJoinResult) !u64 {
@@ -2565,7 +2570,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return result.node_ptr;
         }
 
-        fn btreeSplit(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64) anyerror!BTreeSplitResult {
+        fn btreeSplit(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64, depth: usize) anyerror!BTreeSplitResult {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             const node = try self.readBTreeNode(root_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2583,7 +2589,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
                         rem -= node.counts[i];
                     }
-                    const child = try self.btreeSplit(node.children[i].value, rem);
+                    const child = try self.btreeSplit(node.children[i].value, rem, depth + 1);
                     const left_sub = try self.btreeSubtree(node.children[0..i], node.counts[0..i]);
                     const right_sub = try self.btreeSubtree(node.children[i + 1 .. node.num], node.counts[i + 1 .. node.num]);
                     return .{
@@ -2801,7 +2807,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // descend by key to the matching leaf entry, or null
         fn sortedGet(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !?Slot {
             var node_ptr = root_ptr;
-            while (true) {
+            for (0..MAX_BTREE_DEPTH) |_| {
                 const node = try self.readSortedNode(node_ptr);
                 switch (node.kind) {
                     .leaf => {
@@ -2814,14 +2820,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         node_ptr = node.children[i].value;
                     },
                 }
-            }
+            } else return error.InvalidBTreeNode;
         }
 
         // number of keys strictly less than `key` (the inverse of getByIndex)
         fn sortedRank(self: *Database(db_kind, HashInt), root_ptr: u64, key: []const u8) !u64 {
             var node_ptr = root_ptr;
             var rank: u64 = 0;
-            while (true) {
+            for (0..MAX_BTREE_DEPTH) |_| {
                 const node = try self.readSortedNode(node_ptr);
                 switch (node.kind) {
                     .leaf => {
@@ -2834,7 +2840,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         node_ptr = node.children[i].value;
                     },
                 }
-            }
+            } else return error.InvalidBTreeNode;
         }
 
         // write a byte key as a short_bytes (inline, <=8 bytes, no interior zero) or
@@ -2864,7 +2870,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // value of the returned entry, unless `key_only` is true. in that case, a new key
         // is stored as a key-only entry, and an existing entry is left alone. otherwise,
         // the returned entry is a key-value pair with a writeable value.
-        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, key_only: bool, frozen_at: u64) anyerror!SortedInsertResult {
+        fn sortedPut(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, key_only: bool, frozen_at: u64, depth: usize) anyerror!SortedInsertResult {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -2926,7 +2933,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 },
                 .branch => {
                     const i = try self.sortedBranchSearch(&node, key);
-                    const child = try self.sortedPut(node.children[i].value, key, key_only, frozen_at);
+                    const child = try self.sortedPut(node.children[i].value, key, key_only, frozen_at, depth + 1);
                     // nothing below changed, so don't copy this node for no reason
                     if (!child.added and child.node_ptr == node.children[i].value) {
                         return .{ .node_ptr = node_ptr, .count = node.subtreeCount(), .entry = child.entry, .added = false, .split = null };
@@ -2991,7 +2998,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
         // remove `key` from the subtree at node_ptr, path-copying nodes and
         // decrementing counts. an emptied leaf is left in place (see SortedRemoveResult).
-        fn sortedRemove(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, frozen_at: u64) anyerror!SortedRemoveResult {
+        fn sortedRemove(self: *Database(db_kind, HashInt), node_ptr: u64, key: []const u8, frozen_at: u64, depth: usize) anyerror!SortedRemoveResult {
+            if (depth >= MAX_BTREE_DEPTH) return error.InvalidBTreeNode;
             const node = try self.readSortedNode(node_ptr);
             switch (node.kind) {
                 .leaf => {
@@ -3007,7 +3015,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 },
                 .branch => {
                     const i = try self.sortedBranchSearch(&node, key);
-                    const child = try self.sortedRemove(node.children[i].value, key, frozen_at);
+                    const child = try self.sortedRemove(node.children[i].value, key, frozen_at, depth + 1);
                     if (!child.found) return .{ .node_ptr = node_ptr, .found = false };
 
                     var branch = node;
