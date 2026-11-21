@@ -3825,12 +3825,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             .none => return null,
                             .array_list => {
                                 if (self.core.index == self.core.size) return null;
-                                self.core.index += 1;
                                 return try self.nextInternal(0);
                             },
                             .linked_array_list, .sorted_map, .sorted_set => {
                                 if (self.core.index == self.core.size) return null;
-                                self.core.index += 1;
                                 // b-tree nodes have a kind+num header before their slots,
                                 // so child pointers are offset by BTREE_NODE_HEADER_SIZE
                                 return try self.nextInternal(BTREE_NODE_HEADER_SIZE);
@@ -3892,6 +3890,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     // have a value, but if it's set to full, then it is actually a valid
                                     // item that should be returned.
                                     if (!next_slot.empty()) {
+                                        // counted only once found, so an error can't
+                                        // leave the index ahead of the stack
+                                        self.core.index += 1;
                                         const position = level.position + (level.index * byteSizeOf(Slot));
                                         return .{
                                             .slot_ptr = .{ .position = position, .slot = next_slot },
